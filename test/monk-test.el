@@ -231,15 +231,83 @@ flapping, and reaches the cap as oscillating instead."
       (should (= 3 (monk-run-passes run)))
       (should-not (monk-run-flapping-p run))
       (should (monk-run-oscillating-p run))
-      (should (string-match-p "did not converge" (monk-run-report-string run))))))
+      (should (string-match-p "did not converge" (monk-run-report-string run))))
+    ;; With room for a fourth pass the chain settles: pass 4 repairs nothing.
+    (dolist (d '("a" "b" "c")) (delete-directory (concat dir d)))
+    (let ((run (monk-test-converge
+                (lambda (_m)
+                  (monk-command "c" "mkdir" :args (list (concat dir "c"))
+                                :creates (concat dir "c")
+                                :only-if (lambda (_m) (file-directory-p (concat dir "b"))))
+                  (monk-command "b" "mkdir" :args (list (concat dir "b"))
+                                :creates (concat dir "b")
+                                :only-if (lambda (_m) (file-directory-p (concat dir "a"))))
+                  (monk-directory (concat dir "a"))))))
+      (should (= 4 (monk-run-passes run)))
+      (should (monk-run-converged-p run)))))
 
 (ert-deftest monk-test-flapping-detection-pure ()
-  "`monk-run-flapping' reads repaired keys per pass, newest pass first."
+  "`monk-run-flapping' reads repaired keys per pass, newest pass first.
+A repeat at any distance counts, not only in adjacent passes."
   (let ((run (monk-run-create :repaired-by-pass '((("m" . "x")) (("m" . "x") ("m" . "y")) (("m" . "y"))))))
     ;; Passes in order: y; x y; x.  y repeats in 1-2, x repeats in 2-3.
     (should (equal '(("m" . "y") ("m" . "x")) (monk-run-flapping run))))
+  ;; Passes in order: a; b; c; a.  Only a repeats, three passes apart.
+  (let ((run (monk-run-create :repaired-by-pass '((("m" . "a")) (("m" . "c")) (("m" . "b")) (("m" . "a"))))))
+    (should (equal '(("m" . "a")) (monk-run-flapping run))))
   (should-not (monk-run-flapping (monk-run-create :repaired-by-pass '((("m" . "x")) (("m" . "y"))))))
   (should-not (monk-run-flapping (monk-run-create :repaired-by-pass '((("m" . "x")))))))
+
+(ert-deftest monk-test-flapping-three-cycle ()
+  "A -> B -> C -> not A: each undoes the next, so A repairs again in pass 4.
+The run stops there and names A, not at the cap."
+  (monk-test-with-tmpdir dir
+    (let* ((a (concat dir "a")) (b (concat dir "b")) (c (concat dir "c"))
+           (run (monk-test-converge
+                 (lambda (_m)
+                   ;; A: file a exists.  Repair creates it and removes b.
+                   (monk-command "A" "sh" :args (list "-c" (format "touch %s; rm -f %s" a b))
+                                 :creates a)
+                   ;; B: file b exists.  Repair creates it and removes c.
+                   (monk-command "B" "sh" :args (list "-c" (format "touch %s; rm -f %s" b c))
+                                 :creates b)
+                   ;; C: file c exists.  Repair creates it and removes a.
+                   (monk-command "C" "sh" :args (list "-c" (format "touch %s; rm -f %s" c a))
+                                 :creates c))
+                 :passes 10)))
+      ;; Pass 1: A B C all repair (a removed by C).  Pass 2: A repairs
+      ;; again, which is already a repeat.  Detection fires at pass 2.
+      (should (monk-run-flapping-p run))
+      (should (member (cons "testbox" "A") (monk-run-flapping run)))
+      (should (< (monk-run-passes run) 10)))))
+
+(ert-deftest monk-test-flapping-long-cycle ()
+  "One repair per pass: A in pass 1, B in 2, C in 3, A again in 4.
+Detection fires at pass 4, three passes after the first repair, and
+names only A.  A cap below 4 misses it and reports did-not-converge."
+  (let* ((pass 0)
+         (needs (lambda (name)
+                  ;; Resource NAME needs repair in the pass whose index
+                  ;; modulo 3 matches it: A in 1 and 4, B in 2, C in 3.
+                  (= (mod (1- pass) 3) (cl-position name '("A" "B" "C") :test #'equal))))
+         (policy (lambda (_m)
+                   (dolist (name '("A" "B" "C"))
+                     (let ((name name))
+                       (monk-command name "true" :creates "/nonexistent"
+                                     :only-if (lambda (_m) (funcall needs name)))))))
+         (monk-progress-functions
+          (list (lambda (event data)
+                  (when (eq event 'run-start) (setq pass 1))
+                  (when (eq event 'pass-end) (setq pass (1+ (plist-get data :pass)))))))
+         (run (monk-test-converge policy :passes 10)))
+    (should (= 4 (monk-run-passes run)))
+    (should (equal (list (cons "testbox" "A")) (monk-run-flapping run)))
+    (should-not (monk-run-converged-p run))
+    (setq pass 0)
+    (let ((short (monk-test-converge policy :passes 3)))
+      (should-not (monk-run-flapping-p short))
+      (should (monk-run-oscillating-p short))
+      (should (string-match-p "did not converge" (monk-run-report-string short))))))
 
 (ert-deftest monk-test-failure-stops-run-unless-ignored ()
   (monk-test-with-tmpdir dir

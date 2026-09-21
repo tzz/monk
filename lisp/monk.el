@@ -98,8 +98,13 @@
         monk-status-failed monk-status-skipped monk-status-would-repair)
   "All statuses a finished result can carry, in display order.")
 
-(defconst monk-max-passes 3
-  "Upper bound on convergence passes in one run.")
+(defcustom monk-max-passes 6
+  "Upper bound on convergence passes in one run.
+A repair that holds costs one extra pass to confirm.  A flapping cycle
+of N resources repeats a resource after N passes, so the bound also
+limits the cycle length Monk can name: with 6 passes a cycle of up to
+5 resources is caught."
+  :type 'natnum)
 
 (defconst monk-tramp-method "ssh"
   "TRAMP method for remote machines.")
@@ -215,20 +220,20 @@ Each is called with two arguments: EVENT, one of `run-start',
   end-time)
 
 (defun monk-run-flapping (run)
-  "Return the keys of resources in RUN that repaired in two consecutive passes.
-A resource that repairs, is checked again, and repairs again did not
-hold: another resource undid it, or its check and repair disagree.
-The classic case is one resource that installs a package and another
-that removes it.  Each key is (MACHINE-NAME . RESOURCE-NAME).  Nil
-means no flapping."
-  (let ((by-pass (reverse (monk-run-repaired-by-pass run)))
+  "Return the keys of resources in RUN that repaired in more than one pass.
+A repair that held is kept in every later pass, so a second repair of
+the same resource means something undid the first.  The passes need
+not be adjacent: with A undoing B, B undoing C, and C undoing A, each
+one repairs every third pass.  The classic two-resource case is one
+that installs a package and one that removes it.  Each key is
+\(MACHINE-NAME . RESOURCE-NAME).  Nil means no flapping."
+  (let ((seen (make-hash-table :test #'equal))
         (flapping nil))
-    (while (cdr by-pass)
-      (dolist (key (cadr by-pass))
-        (when (and (member key (car by-pass))
-                   (not (member key flapping)))
-          (push key flapping)))
-      (setq by-pass (cdr by-pass)))
+    (dolist (keys (reverse (monk-run-repaired-by-pass run)))
+      (dolist (key keys)
+        (when (and (gethash key seen) (not (member key flapping)))
+          (push key flapping))
+        (puthash key t seen)))
     (nreverse flapping)))
 
 (defun monk-run-flapping-p (run)
@@ -1056,8 +1061,8 @@ resolves to kept reads as kept."
             (monk-log 'info "pass %d over %d node(s) repaired %d%s" pass (length ordered)
                       repaired (if (monk-pass-stopped outcome) ", stopped on failure" ""))
             (monk-progress 'pass-end :run run :pass pass :repaired repaired)
-            ;; A resource that repaired in two passes in a row will
-            ;; repair in every pass.  Stop now instead of at the cap.
+            ;; A resource that repaired twice is in a cycle and will
+            ;; repair again.  Stop now instead of at the cap.
             (setq continue (and (not dry-run)
                                 (not (monk-pass-stopped outcome))
                                 (> repaired 0)
