@@ -1045,5 +1045,147 @@ A :degree threshold on a require lets a follower run anyway."
                  (monk-exec-create :exit-code 0 :output "{\"local\": {}}"))))
       (should-error (monk-check r m) :type 'monk-resource-error))))
 
+;;;; Plan and apply
+
+(ert-deftest monk-test-plan-then-apply-as-planned ()
+  "A plan predicts two changes; apply makes them; every verdict is as-planned."
+  (monk-test-with-tmpdir dir
+    (let* ((policy (lambda (_m)
+                     (monk-directory (concat dir "d"))
+                     (monk-file (concat dir "f") :content "x\n")
+                     (monk-directory dir)))
+           (m (monk-test-machine))
+           (monk-log-level nil)
+           (plan (monk-plan m policy))
+           (untouched (not (file-exists-p (concat dir "d"))))
+           (apply (monk-apply plan)))
+      (should (monk-run-dry-run plan))
+      (should (= 2 (monk-run-count plan 'would-repair)))
+      (should (= 1 (monk-run-count plan 'kept)))
+      (should untouched)
+      (should-not (monk-run-dry-run apply))
+      (should (eq plan (monk-run-plan apply)))
+      (should (eq policy (monk-run-policy apply)))
+      (should (= 2 (monk-run-count apply 'repaired)))
+      (should (file-directory-p (concat dir "d")))
+      (should (monk-run-as-planned-p apply))
+      (should (equal '((as-planned . 3))
+                     (monk-run-compare-counts (monk-run-compare plan apply))))
+      (should (string-match-p "against plan: 3 as-planned" (monk-run-report-string apply))))))
+
+(ert-deftest monk-test-plan-apply-detects-drift ()
+  "The machine changes between plan and apply.
+One planned change is already done (unfulfilled), one unplanned
+change appears, and one resource fails."
+  (monk-test-with-tmpdir dir
+    (let* ((policy (lambda (_m)
+                     (monk-directory (concat dir "planned"))
+                     (monk-file (concat dir "stable") :content "same\n")
+                     (monk-line-in-file (concat dir "fragile") "x" :ignore-errors t)))
+           (m (monk-test-machine))
+           (monk-log-level nil))
+      (with-temp-file (concat dir "stable") (insert "same\n"))
+      (with-temp-file (concat dir "fragile") (insert "old\n"))
+      (let ((plan (monk-plan m policy)))
+        ;; Drift: someone creates planned, edits stable, deletes fragile.
+        (make-directory (concat dir "planned"))
+        (with-temp-file (concat dir "stable") (insert "edited\n"))
+        (delete-file (concat dir "fragile"))
+        (let* ((apply (monk-apply plan))
+               (comparison (monk-run-compare plan apply)))
+          (should-not (monk-run-as-planned-p apply))
+          (should (eq 'unfulfilled (alist-get (cons "testbox" (concat dir "planned")) comparison nil nil #'equal)))
+          (should (eq 'unplanned (alist-get (cons "testbox" (concat dir "stable")) comparison nil nil #'equal)))
+          (should (eq 'failed-planned (alist-get (cons "testbox" (concat dir "fragile#x")) comparison nil nil #'equal)))
+          (let ((report (monk-run-report-string apply)))
+            (should (string-match-p "unfulfilled +testbox:" report))
+            (should (string-match-p "unplanned +testbox:" report))))))))
+
+(ert-deftest monk-test-plan-compare-new-and-missing ()
+  "Policies that differ between plan and apply produce new and missing."
+  (let* ((plan (monk-run-create :dry-run t :results
+                                (list (monk-result-create :machine "m" :name "a" :status 'kept)
+                                      (monk-result-create :machine "m" :name "gone" :status 'would-repair))))
+         (apply (monk-run-create :plan plan :results
+                                 (list (monk-result-create :machine "m" :name "a" :status 'kept)
+                                       (monk-result-create :machine "m" :name "extra" :status 'repaired)))))
+    (should (equal '((("m" . "a") . as-planned) (("m" . "extra") . new) (("m" . "gone") . missing))
+                   (monk-run-compare plan apply)))
+    (should-not (monk-run-as-planned-p apply))))
+
+(ert-deftest monk-test-plan-verdict-table ()
+  (let ((kept (monk-result-create :status 'kept))
+        (would (monk-result-create :status 'would-repair))
+        (did (monk-result-create :status 'repaired))
+        (bad (monk-result-create :status 'failed))
+        (part (monk-result-create :status 'partial)))
+    (should (eq 'as-planned (monk--plan-verdict kept kept)))
+    (should (eq 'as-planned (monk--plan-verdict would did)))
+    (should (eq 'unfulfilled (monk--plan-verdict would kept)))
+    (should (eq 'unplanned (monk--plan-verdict kept did)))
+    (should (eq 'failed-planned (monk--plan-verdict would bad)))
+    (should (eq 'failed-planned (monk--plan-verdict kept part)))
+    (should (eq 'as-planned (monk--plan-verdict bad bad)))
+    (should (eq 'as-planned (monk--plan-verdict part bad)))
+    (should (eq 'new (monk--plan-verdict nil did)))
+    (should (eq 'missing (monk--plan-verdict would nil)))))
+
+(ert-deftest monk-test-apply-requires-a-plan ()
+  (let ((real (monk-run-create :dry-run nil)))
+    (should-error (monk-apply real) :type 'monk-policy-error)))
+
+(ert-deftest monk-test-apply-overrides-options-but-records-them ()
+  "Options recorded on the plan repeat on apply; :plan is a link, not an option."
+  (monk-test-with-tmpdir dir
+    (let* ((m (monk-test-machine))
+           (monk-log-level nil)
+           (plan (monk-plan m (lambda (_m) (monk-directory (concat dir "d"))) :passes 2))
+           (apply (monk-apply plan :passes 4)))
+      (should (equal 2 (plist-get (monk-run-options plan) :passes)))
+      (should (eq t (plist-get (monk-run-options plan) :dry-run)))
+      (should (equal 4 (plist-get (monk-run-options apply) :passes)))
+      (should-not (plist-member (monk-run-options apply) :plan))
+      (should (eq plan (monk-run-plan apply))))))
+
+(ert-deftest monk-test-ui-plan-and-apply-views ()
+  "The report buffer shows a Would column for a plan and a Plan column for an apply."
+  (require 'monk-ui)
+  (monk-test-with-tmpdir dir
+    (let* ((policy (lambda (_m) (monk-directory (concat dir "d"))))
+           (m (monk-test-machine))
+           (monk-log-level nil)
+           (monk-ui-style 'text)
+           (monk-ui-unicode nil)
+           (plan (monk-plan m policy)))
+      (with-temp-buffer
+        (monk-ui-mode)
+        (setq monk-ui--run plan)
+        (monk-ui-refresh)
+        (should (equal "Would" (car (aref tabulated-list-format 4))))
+        (should (= 8 (length tabulated-list-format)))
+        (let ((header (substring-no-properties (monk-ui--header-line))))
+          (should (string-match-p "PLAN" header))
+          (should (string-match-p "to apply" header)))
+        (let ((apply (monk-apply plan)))
+          (setq monk-ui--run apply)
+          (monk-ui-refresh)
+          (should (= 9 (length tabulated-list-format)))
+          (should (equal "Plan" (car (aref tabulated-list-format 7))))
+          (let ((row (cadr (car (monk-ui--entries)))))
+            (should (equal "= as planned" (substring-no-properties (aref row 7)))))
+          (let ((header (substring-no-properties (monk-ui--header-line))))
+            (should (string-match-p "APPLY +from plan" header))
+            (should (string-match-p "= 1" header))))))))
+
+(ert-deftest monk-test-ui-plan-cell-names-drift ()
+  (require 'monk-ui)
+  (let ((monk-ui-unicode nil))
+    (should (equal "+ 2 o 1"
+                   (substring-no-properties
+                    (monk-ui--machine-plan-cell
+                     "m" '((("m" . "a") . unplanned) (("m" . "b") . unplanned)
+                           (("m" . "c") . unfulfilled) (("m" . "d") . as-planned)
+                           (("other" . "e") . unplanned))))))))
+
 (provide 'monk-test)
 ;;; monk-test.el ends here

@@ -59,8 +59,11 @@ A command without `:creates` or `:unless` is always kept. With `:watch` it becom
   (when (monk-class-p m 'darwin)
     (monk-brew "tools" '("jq" "ripgrep"))))
 
-;; Local host, dry run.
-(monk-run-report (monk-converge (monk-local-machine) #'my-policy :dry-run t))
+;; Plan, then apply.  The plan is a dry run.  Apply repeats the same
+;; policy on the same machines and compares the outcome with the plan.
+(let ((plan (monk-plan (monk-local-machine) #'my-policy)))
+  (monk-run-report plan)
+  (monk-run-report (monk-apply plan)))
 
 ;; Remote host.
 (monk-run-report (monk-converge (monk-machine :name "pi" :address "pi.local" :user "pi")
@@ -148,9 +151,25 @@ Both parse JSON and map `changed`, `failed`, `result`, `changes`, and `comment` 
 
 A host with no `:address` is the local machine. `self` selects the host whose name matches `system-name`.
 
+## Plan and apply
+
+`monk-plan` is a dry run. It returns a run whose results say `would-repair` where a change is needed and `kept` where none is. Nothing on the machine changes. `monk-apply` takes that run, repeats its policy on its machines for real, and links the plan to the new run. `monk-run-compare` then gives one verdict per resource.
+
+| Verdict | Meaning |
+|---|---|
+| `as-planned` | Plan and apply agree: both changed it, or both left it alone, or both failed on it. |
+| `unfulfilled` | The plan said it would change. Apply found it already in place. Someone or something else made the change between plan and apply. |
+| `unplanned` | The plan said it was kept. Apply changed it. The machine drifted between plan and apply. |
+| `failed-planned` | Apply failed where the plan expected success. |
+| `new`, `missing` | The policy compiled differently between plan and apply, for example because a guard read a fact that changed. |
+
+`monk-run-as-planned-p` is true only when every verdict is `as-planned`. The text report prints the verdict counts and lists every resource that is not as planned.
+
 ## Report
 
-`monk-ui.el` draws the run. Load it and `monk-run-report` shows a `*monk*` buffer with one row per machine: name, state badge, a stacked progress bar, counts, and time. The bar has one layer per status, failures on the left edge. While a run is in progress the row of the current machine shows a spinner and the bar grows as nodes finish. `RET` on a row opens a detail buffer with results grouped by status and with fontified diffs. `t` switches between SVG and text drawing. `g` redraws.
+`monk-ui.el` draws the run. Load it and `monk-run-report` shows a `*monk*` buffer with one row per machine: name, state badge, a stacked progress bar, counts, and time. The bar has one layer per status, failures on the left edge. While a run is in progress the row of the current machine shows a spinner and the bar grows as nodes finish. `RET` on a row opens a detail buffer with results grouped by status and with fontified diffs. `t` switches between SVG and text drawing. `g` redraws. `?` lists the keys.
+
+A plan and an apply look different. A plan has a purple `PLAN` badge in the header, a purple header face, a `Would` column instead of `Changed`, and the hint `a to apply`. Pressing `a` asks for confirmation with the machine names and the number of changes, runs `monk-apply`, and replaces the plan in the buffer with the apply report. An apply from a plan has a blue `APPLY from plan` badge, a `Plan` column with one cell per machine that says `as planned` or lists the verdicts that differ, and a verdict strip in the header. `p` opens the plan an apply came from. The detail buffer of such an apply starts with a `differs from plan` section that pairs each drifted result with what the plan said.
 
 Bars and the spinner are SVG on a graphical display with SVG support, and block glyphs elsewhere. Status glyphs fall back to ASCII on a terminal that cannot show them. Set `monk-ui-style` to `text` to force text and `monk-ui-unicode` to nil for ASCII. All colors come from faces with light and dark variants, so themes apply. In batch mode the report prints as text.
 

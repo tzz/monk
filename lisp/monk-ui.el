@@ -31,6 +31,11 @@
 ;;   machine that updates while the run is in progress, and a detail
 ;;   buffer per machine with diffs.
 ;; - A header line with the run summary bar.
+;; - Plan and apply: a dry run is a plan, shown with its own colors and
+;;   a `would' column.  `a' in a plan buffer applies it.  The apply
+;;   report carries a Plan column that says whether each machine did
+;;   what the plan said, and the detail buffer pairs each result with
+;;   its planned counterpart.
 ;;
 ;; Loading this file sets `monk-report-function' and adds a progress
 ;; display to `monk-progress-functions'.  All drawing degrades to text
@@ -161,6 +166,33 @@
     (t :background "#f6f8fa" :foreground "#24292f" :extend t))
   "Header line of the report.")
 
+(defface monk-ui-plan-header
+  '((((background dark)) :background "#1f1b2e" :foreground "#d2a8ff" :extend t)
+    (t :background "#fbefff" :foreground "#6639ba" :extend t))
+  "Header line of a plan (dry run).  Purple, to differ from an apply.")
+
+(defface monk-ui-plan-badge
+  '((((background dark)) :foreground "#0d1117" :background "#a371f7" :weight bold)
+    (t :foreground "#ffffff" :background "#8250df" :weight bold))
+  "The PLAN word in the header.")
+
+(defface monk-ui-apply-badge
+  '((((background dark)) :foreground "#0d1117" :background "#58a6ff" :weight bold)
+    (t :foreground "#ffffff" :background "#0969da" :weight bold))
+  "The APPLY word in the header.")
+
+(defface monk-ui-as-planned
+  '((t :inherit monk-ui-kept))
+  "Apply matched the plan.")
+
+(defface monk-ui-unplanned
+  '((t :inherit monk-ui-partial :weight bold))
+  "Apply changed something the plan did not predict.")
+
+(defface monk-ui-unfulfilled
+  '((t :inherit monk-ui-would-repair :weight bold))
+  "The plan predicted a change that apply did not make.")
+
 (defface monk-ui-separator
   '((((background dark)) :overline "#30363d" :height 0.4 :extend t)
     (t :overline "#d0d7de" :height 0.4 :extend t))
@@ -176,6 +208,24 @@
     (,monk-status-running . monk-ui-running)
     (,monk-status-pending . monk-ui-pending))
   "Face for each status.")
+
+(defconst monk-ui-plan-faces
+  `((,monk-plan-as-planned . monk-ui-as-planned)
+    (,monk-plan-unplanned . monk-ui-unplanned)
+    (,monk-plan-unfulfilled . monk-ui-unfulfilled)
+    (,monk-plan-failed . monk-ui-failed)
+    (,monk-plan-new . monk-ui-unplanned)
+    (,monk-plan-missing . monk-ui-unfulfilled))
+  "Face for each plan comparison verdict.")
+
+(defconst monk-ui-plan-glyphs
+  `((,monk-plan-as-planned "✓" "=")
+    (,monk-plan-unplanned "⚠" "+")
+    (,monk-plan-unfulfilled "○" "o")
+    (,monk-plan-failed "✗" "!")
+    (,monk-plan-new "?" "?")
+    (,monk-plan-missing "∅" "0"))
+  "Unicode and ASCII glyph for each plan verdict.")
 
 (defconst monk-ui-status-glyphs
   `((,monk-status-kept "✓" "=")
@@ -204,6 +254,16 @@
   (propertize (concat (monk-ui-glyph status) " " (or text (symbol-name status)))
               'face (monk-ui-face status)
               'help-echo (symbol-name status)))
+
+(defun monk-ui-plan-badge (verdict &optional text)
+  "Return a badge for plan VERDICT: glyph, space, then TEXT or the verdict name."
+  (let ((entry (alist-get verdict monk-ui-plan-glyphs)))
+    (propertize (concat (if (and monk-ui-unicode (char-displayable-p (string-to-char (car entry))))
+                            (car entry)
+                          (cadr entry))
+                        " " (or text (symbol-name verdict)))
+                'face (or (alist-get verdict monk-ui-plan-faces) 'default)
+                'help-echo (symbol-name verdict))))
 
 ;;;; Color helpers
 
@@ -540,24 +600,43 @@ merged results of finished passes."
     (define-key map (kbd "d") #'monk-ui-show-machine)
     (define-key map (kbd "g") #'monk-ui-refresh)
     (define-key map (kbd "t") #'monk-ui-toggle-style)
+    (define-key map (kbd "a") #'monk-ui-apply)
+    (define-key map (kbd "p") #'monk-ui-show-plan)
+    (define-key map (kbd "?") #'monk-ui-help)
     map)
   "Keymap for `monk-ui-mode'.")
 
+(defun monk-ui--format ()
+  "Return the `tabulated-list-format' for the run in this buffer.
+A plan says `Would' where an apply says `Changed'.  An apply that has
+a plan gains a Plan column."
+  (let ((run monk-ui--run))
+    (vconcat
+     (list (list "Machine" 18 t)
+           (list "State" 14 t)
+           (list "Progress" (+ 2 monk-ui-bar-width) nil)
+           (list "Kept" 5 nil :right-align t)
+           (list (if (and run (monk-run-dry-run run)) "Would" "Changed") 8 nil :right-align t)
+           (list "Failed" 7 nil :right-align t)
+           (list "Skipped" 8 nil :right-align t))
+     (and run (monk-run-plan run) (not (monk-run-dry-run run))
+          (list (list "Plan" 16 t)))
+     (list (list "Time" 6 nil :right-align t)))))
+
 (define-derived-mode monk-ui-mode tabulated-list-mode "Monk"
-  "Report of a Monk run, one row per machine."
-  (setq tabulated-list-format
-        (vector (list "Machine" 18 t)
-                (list "State" 14 t)
-                (list "Progress" (+ 2 monk-ui-bar-width) nil)
-                (list "Kept" 5 nil :right-align t)
-                (list "Changed" 8 nil :right-align t)
-                (list "Failed" 7 nil :right-align t)
-                (list "Skipped" 8 nil :right-align t)
-                (list "Time" 6 nil :right-align t))
+  "Report of a Monk run, one row per machine.
+\\{monk-ui-mode-map}"
+  (setq tabulated-list-format (monk-ui--format)
         tabulated-list-padding 1)
   (setq-local header-line-format '(:eval (monk-ui--header-line)))
   (add-hook 'window-configuration-change-hook #'monk-ui-reset-cache nil t)
   (tabulated-list-init-header))
+
+(defun monk-ui-help ()
+  "Show the keys of the report buffer."
+  (interactive)
+  (message "%s" (substitute-command-keys
+                 "\\[monk-ui-show-machine] detail  \\[monk-ui-apply] apply plan  \\[monk-ui-show-plan] show plan  \\[monk-ui-toggle-style] svg/text  \\[monk-ui-refresh] refresh")))
 
 (defun monk-ui--machine-names ()
   "Return the machine names of the live or finished run."
@@ -568,30 +647,59 @@ merged results of finished passes."
   "Return the total seconds spent on MACHINE-NAME."
   (apply #'+ (mapcar #'monk-result-duration (monk-ui--results machine-name))))
 
+(defun monk-ui--comparison ()
+  "Return the plan comparison for the run in this buffer, or nil."
+  (let ((run monk-ui--run))
+    (and run (monk-run-plan run) (not (monk-run-dry-run run))
+         (not monk-ui--live-run)
+         (monk-run-compare (monk-run-plan run) run))))
+
+(defun monk-ui--machine-plan-cell (name comparison)
+  "Return the Plan column text for machine NAME from COMPARISON."
+  (let ((counts nil))
+    (dolist (cell comparison)
+      (when (equal (caar cell) name)
+        (cl-incf (alist-get (cdr cell) counts 0))))
+    (if (cl-every (lambda (c) (eq (car c) monk-plan-as-planned)) counts)
+        (monk-ui-plan-badge monk-plan-as-planned "as planned")
+      ;; Verdicts in a fixed order, so two rows read alike.
+      (mapconcat #'identity
+                 (delq nil
+                       (mapcar (lambda (v)
+                                 (let ((n (alist-get v counts 0)))
+                                   (and (> n 0) (not (eq v monk-plan-as-planned))
+                                        (monk-ui-plan-badge v (number-to-string n)))))
+                               monk-plan-verdicts))
+                 " "))))
+
 (defun monk-ui--entries ()
   "Return `tabulated-list-entries' for the current run."
-  (mapcar
-   (lambda (name)
-     (let* ((counts (monk-ui--machine-counts name))
-            (total (monk-ui--machine-total name))
-            (verdict (monk-ui--machine-verdict name counts))
-            (changed (+ (alist-get monk-status-repaired counts 0)
-                        (alist-get monk-status-would-repair counts 0)))
-            (failed (+ (alist-get monk-status-failed counts 0)
-                       (alist-get monk-status-partial counts 0))))
-       (list name
-             (vector (propertize name 'face 'monk-ui-machine)
-                     (if (eq verdict monk-status-running)
-                         (concat (monk-ui-spinner) " "
-                                 (propertize "running" 'face 'monk-ui-running))
-                       (monk-ui-badge verdict))
-                     (monk-ui-bar counts total)
-                     (number-to-string (alist-get monk-status-kept counts 0))
-                     (number-to-string changed)
-                     (number-to-string failed)
-                     (number-to-string (alist-get monk-status-skipped counts 0))
-                     (format "%.1fs" (monk-ui--machine-duration name))))))
-   (monk-ui--machine-names)))
+  (let ((comparison (monk-ui--comparison)))
+    (mapcar
+     (lambda (name)
+       (let* ((counts (monk-ui--machine-counts name))
+              (total (monk-ui--machine-total name))
+              (verdict (monk-ui--machine-verdict name counts))
+              (changed (+ (alist-get monk-status-repaired counts 0)
+                          (alist-get monk-status-would-repair counts 0)))
+              (failed (+ (alist-get monk-status-failed counts 0)
+                         (alist-get monk-status-partial counts 0))))
+         (list name
+               (vconcat
+                (list (propertize name 'face 'monk-ui-machine)
+                      (if (eq verdict monk-status-running)
+                          (concat (monk-ui-spinner) " "
+                                  (propertize "running" 'face 'monk-ui-running))
+                        (monk-ui-badge verdict))
+                      (monk-ui-bar counts total)
+                      (number-to-string (alist-get monk-status-kept counts 0))
+                      (number-to-string changed)
+                      (number-to-string failed)
+                      (number-to-string (alist-get monk-status-skipped counts 0)))
+                (and (= (length tabulated-list-format) 9)
+                     (list (if comparison (monk-ui--machine-plan-cell name comparison) "")))
+                (list (format "%.1fs" (monk-ui--machine-duration name)))))))
+     (monk-ui--machine-names))))
 
 (defun monk-ui--header-line ()
   "Return the header line: run summary and a total bar."
@@ -603,16 +711,23 @@ merged results of finished passes."
       (setq total (+ total (monk-ui--machine-total name)))
       (dolist (cell (monk-ui--machine-counts name))
         (cl-incf (alist-get (car cell) counts 0) (cdr cell))))
-    (let ((done (apply #'+ (mapcar #'cdr counts))))
+    (let* ((done (apply #'+ (mapcar #'cdr counts)))
+           (plan (and run (monk-run-dry-run run)))
+           (comparison (monk-ui--comparison))
+           (header-face (if plan 'monk-ui-plan-header 'monk-ui-header)))
       (concat
-       (propertize " " 'face 'monk-ui-header)
+       (propertize " " 'face header-face)
        (if monk-ui--live-run
            (concat (monk-ui-spinner) " ")
          "")
-       (propertize (format "Monk %s" (cond ((null run) "")
-                                            ((monk-run-dry-run run) "dry run")
-                                            (t "run")))
-                   'face '(monk-ui-header bold))
+       (propertize (if plan " PLAN " " APPLY ")
+                   'face (if plan 'monk-ui-plan-badge 'monk-ui-apply-badge)
+                   'help-echo (if plan
+                                  "Dry run: nothing was changed.  Press a to apply."
+                                "Changes were made."))
+       (if (and run (monk-run-plan run))
+           (propertize " from plan" 'face header-face)
+         "")
        "  "
        (monk-ui-bar counts total (format "%d/%d  pass %d" done total
                                          (if monk-ui--live-run
@@ -620,10 +735,13 @@ merged results of finished passes."
                                            (or (and run (monk-run-passes run)) 0)))
                     (min 40 (max 10 (- (window-width) 40))))
        "  "
-       (mapconcat (lambda (status)
-                    (let ((n (alist-get status counts 0)))
-                      (if (> n 0) (monk-ui-badge status (number-to-string n)) "")))
-                  monk-ui-status-order " ")
+       (mapconcat #'identity
+                  (delq nil
+                        (mapcar (lambda (status)
+                                  (let ((n (alist-get status counts 0)))
+                                    (and (> n 0) (monk-ui-badge status (number-to-string n)))))
+                                monk-ui-status-order))
+                  " ")
        (if (and run (not monk-ui--live-run) (monk-run-flapping-p run))
            (concat "  " (propertize (format "%s flapping %d"
                                             (monk-ui-glyph monk-status-partial)
@@ -632,12 +750,34 @@ merged results of finished passes."
                                     'help-echo (mapconcat
                                                 (lambda (key) (format "%s:%s" (car key) (cdr key)))
                                                 (monk-run-flapping run) "\n")))
+         "")
+       (if comparison
+           (let ((vcounts (monk-run-compare-counts comparison)))
+             (concat "  │ "
+                     (mapconcat #'identity
+                                (delq nil
+                                      (mapcar (lambda (v)
+                                                (let ((n (alist-get v vcounts 0)))
+                                                  (and (> n 0)
+                                                       (monk-ui-plan-badge v (number-to-string n)))))
+                                              monk-plan-verdicts))
+                                " ")))
+         "")
+       (if (and plan (not monk-ui--live-run))
+           (propertize (substitute-command-keys "  \\[monk-ui-apply] to apply")
+                       'face header-face)
          "")))))
 
 (defun monk-ui-refresh ()
-  "Redraw the report buffer."
+  "Redraw the report buffer.
+The column set depends on the run kind, so rebuild the header when it
+changed."
   (interactive)
   (when (derived-mode-p 'monk-ui-mode)
+    (let ((format (monk-ui--format)))
+      (unless (equal format tabulated-list-format)
+        (setq tabulated-list-format format)
+        (tabulated-list-init-header)))
     (setq tabulated-list-entries (monk-ui--entries))
     (tabulated-list-print t)))
 
@@ -671,13 +811,21 @@ here; without it the user sees nothing until the run returns."
 
 ;;;; Detail buffer
 
-(defun monk-ui--insert-result (result)
-  "Insert one RESULT into the detail buffer."
+(defun monk-ui--insert-result (result &optional planned)
+  "Insert one RESULT into the detail buffer.
+With PLANNED, the matching result from the plan, add a plan verdict
+and the planned status when it differs."
   (let ((status (monk-result-status result)))
     (insert (monk-ui-badge status)
             (make-string (max 1 (- 14 (length (symbol-name status)))) ?\s)
             (propertize (format "%-14s" (monk-result-type result)) 'face 'monk-ui-skipped)
             (monk-result-name result))
+    (when planned
+      (let ((verdict (monk--plan-verdict planned result)))
+        (unless (eq verdict monk-plan-as-planned)
+          (insert "  " (monk-ui-plan-badge verdict
+                                           (format "%s (plan said %s)" verdict
+                                                   (monk-result-status planned)))))))
     (when (eq status monk-status-partial)
       (insert " " (monk-ui-bar (list (cons monk-status-kept
                                             (round (* 100 (monk-result-degree result)))))
@@ -712,28 +860,89 @@ here; without it the user sees nothing until the run returns."
       (forward-line 1))))
 
 (defun monk-ui-show-machine (&optional machine-name)
-  "Show the results for MACHINE-NAME, or the machine at point."
+  "Show the results for MACHINE-NAME, or the machine at point.
+In an apply with a plan, results that differ from the plan come first."
   (interactive)
   (let* ((name (or machine-name (tabulated-list-get-id)
                    (user-error "No machine at point")))
          (run (or monk-ui--live-run monk-ui--run))
+         (plan (and run (not monk-ui--live-run) (monk-run-plan run)))
          (results (monk-ui--results name))
+         (header-face (if (and run (monk-run-dry-run run)) 'monk-ui-plan-header 'monk-ui-header))
          (buffer (get-buffer-create (format monk-ui-detail-buffer-format name))))
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (erase-buffer)
         (special-mode)
-        (insert (propertize (format " %s " name) 'face '(monk-ui-header monk-ui-machine))
+        (insert (propertize (if (and run (monk-run-dry-run run)) " PLAN " " APPLY ")
+                            'face (if (and run (monk-run-dry-run run))
+                                      'monk-ui-plan-badge 'monk-ui-apply-badge))
+                (propertize (format " %s " name) 'face (list header-face 'monk-ui-machine))
                 (propertize (format " %s\n" (if run (monk-run-summary run name) ""))
-                            'face 'monk-ui-header))
+                            'face header-face))
         (insert (propertize "\n" 'face 'monk-ui-separator))
+        (when plan
+          (let ((off (seq-remove
+                      (lambda (r) (eq (monk--plan-verdict (monk-run-result plan (monk-result-key r)) r)
+                                      monk-plan-as-planned))
+                      results)))
+            (when off
+              (insert "\n" (monk-ui-plan-badge monk-plan-unplanned
+                                               (format "differs from plan (%d)" (length off)))
+                      "\n")
+              (dolist (r off)
+                (monk-ui--insert-result r (monk-run-result plan (monk-result-key r)))))))
+        ;; The status groups stay complete.  A row already shown in the
+        ;; drift section repeats here without its diff, marked as such.
         (dolist (status monk-ui-status-order)
           (let ((group (seq-filter (lambda (r) (eq (monk-result-status r) status)) results)))
             (when group
               (insert "\n" (monk-ui-badge status (format "%s (%d)" status (length group))) "\n")
-              (mapc #'monk-ui--insert-result group))))
+              (dolist (r group)
+                (let ((planned (and plan (monk-run-result plan (monk-result-key r)))))
+                  (if (and planned (not (eq (monk--plan-verdict planned r) monk-plan-as-planned)))
+                      (insert (monk-ui-badge status)
+                              (make-string (max 1 (- 14 (length (symbol-name status)))) ?\s)
+                              (propertize (format "%-14s" (monk-result-type r)) 'face 'monk-ui-skipped)
+                              (monk-result-name r)
+                              (propertize "  see above" 'face 'monk-ui-skipped)
+                              "\n")
+                    (monk-ui--insert-result r planned)))))))
         (goto-char (point-min))))
     (pop-to-buffer buffer)))
+
+(defun monk-ui-show-plan ()
+  "Show the plan that the apply in this buffer came from."
+  (interactive)
+  (let ((plan (and monk-ui--run (monk-run-plan monk-ui--run))))
+    (unless plan
+      (user-error "This run has no plan"))
+    (let ((buffer (get-buffer-create (format monk-ui-detail-buffer-format "plan"))))
+      (with-current-buffer buffer
+        (monk-ui-mode)
+        (setq monk-ui--run plan)
+        (monk-ui-refresh))
+      (pop-to-buffer buffer))))
+
+(defun monk-ui-apply ()
+  "Apply the plan shown in this buffer after confirmation.
+The confirmation names the machines and the count of changes.  The
+apply report replaces the plan in this buffer and compares against it."
+  (interactive)
+  (let ((plan monk-ui--run))
+    (unless (and plan (monk-run-dry-run plan))
+      (user-error "This buffer does not show a plan"))
+    (when monk-ui--live-run
+      (user-error "A run is in progress"))
+    (let ((would (monk-run-count plan monk-status-would-repair))
+          (failed (+ (monk-run-count plan monk-status-failed)
+                     (monk-run-count plan monk-status-partial)))
+          (names (mapconcat (lambda (m) (oref m name)) (monk-run-machines plan) ", ")))
+      (when (yes-or-no-p
+             (format "Apply %d change%s on %s%s? "
+                     would (if (= would 1) "" "s") names
+                     (if (> failed 0) (format " (%d failed in the plan)" failed) "")))
+        (monk-run-report (monk-apply plan))))))
 
 ;;;; Progress hook and report entry
 
@@ -782,14 +991,29 @@ here; without it the user sees nothing until the run returns."
         (setq monk-ui--run run)
         (monk-ui-refresh))
       (display-buffer buffer)
-      (when (or (not (monk-run-ok-p run)) (not (monk-run-converged-p run)))
+      (cond
+       ((or (not (monk-run-ok-p run)) (not (monk-run-converged-p run)))
         (message "Monk: %s%s"
                  (monk-run-summary run)
                  (cond ((monk-run-flapping-p run)
                         (format " (flapping: %s)"
                                 (mapconcat #'cdr (monk-run-flapping run) ", ")))
                        ((monk-run-oscillating-p run) " (did not converge)")
-                       (t "")))))))
+                       (t ""))))
+       ((and (monk-run-plan run) (not (monk-run-as-planned-p run)))
+        (let ((counts (monk-run-compare-counts (monk-run-compare (monk-run-plan run) run))))
+          (message "Monk: apply differed from plan: %s"
+                   (mapconcat (lambda (v)
+                                (let ((n (alist-get v counts 0)))
+                                  (if (and (> n 0) (not (eq v monk-plan-as-planned)))
+                                      (format "%d %s" n v)
+                                    "")))
+                              monk-plan-verdicts " "))))
+       ((monk-run-plan run)
+        (message "Monk: applied as planned"))
+       ((monk-run-dry-run run)
+        (message "Monk: plan ready, %d would change; press a in *monk* to apply"
+                 (monk-run-count run monk-status-would-repair)))))))
 
 (add-hook 'monk-progress-functions #'monk-ui--progress)
 (setq monk-report-function #'monk-ui-report)

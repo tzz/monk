@@ -214,6 +214,9 @@ Each is called with two arguments: EVENT, one of `run-start',
   results
   passes
   dry-run
+  policy
+  options
+  plan
   (last-pass-repaired 0)
   (repaired-by-pass nil)
   (start-time (current-time))
@@ -243,6 +246,75 @@ that installs a package and one that removes it.  Each key is
 (defun monk-run-machine (run)
   "Return the first machine of RUN.  Single-machine runs have one."
   (car (monk-run-machines run)))
+
+(defun monk-run-result (run key)
+  "Return the result in RUN for KEY, a (MACHINE-NAME . RESOURCE-NAME), or nil."
+  (seq-find (lambda (r) (equal (monk-result-key r) key)) (monk-run-results run)))
+
+;;;; Plan comparison
+
+(defconst monk-plan-as-planned 'as-planned
+  "Apply did what the plan said: both changed, or both left alone.")
+(defconst monk-plan-unplanned 'unplanned
+  "Apply changed a resource the plan said was kept.")
+(defconst monk-plan-unfulfilled 'unfulfilled
+  "The plan said the resource would change; apply left it kept.")
+(defconst monk-plan-failed 'failed-planned
+  "Apply failed on a resource that the plan said would succeed.")
+(defconst monk-plan-new 'new
+  "Apply saw a resource the plan did not have.")
+(defconst monk-plan-missing 'missing
+  "The plan had a resource that apply did not see.")
+
+(defconst monk-plan-verdicts
+  (list monk-plan-as-planned monk-plan-unplanned monk-plan-unfulfilled
+        monk-plan-failed monk-plan-new monk-plan-missing)
+  "All plan comparison verdicts, in display order.")
+
+(defun monk--plan-verdict (planned actual)
+  "Return the verdict for one resource from PLANNED and ACTUAL results."
+  (cond
+   ((null planned) monk-plan-new)
+   ((null actual) monk-plan-missing)
+   ;; A failure the plan already showed is not news.
+   ((and (monk-result-failed-p planned) (monk-result-failed-p actual)) monk-plan-as-planned)
+   ((monk-result-failed-p actual) monk-plan-failed)
+   ((and (monk-result-changed-p planned) (monk-result-changed-p actual)) monk-plan-as-planned)
+   ((monk-result-changed-p planned) monk-plan-unfulfilled)
+   ((monk-result-changed-p actual) monk-plan-unplanned)
+   (t monk-plan-as-planned)))
+
+(defun monk-run-compare (plan apply)
+  "Compare the dry run PLAN with the real run APPLY.
+Return an alist of (KEY . VERDICT) in APPLY order, then plan-only
+keys.  KEY is (MACHINE-NAME . RESOURCE-NAME).  VERDICT is one of
+`monk-plan-verdicts'.  An apply that matches its plan has only
+`as-planned' entries; anything else is worth a look, because the
+machine changed between plan and apply, or a check and its repair
+disagree."
+  (let ((verdicts nil)
+        (seen nil))
+    (dolist (actual (monk-run-results apply))
+      (let ((key (monk-result-key actual)))
+        (push key seen)
+        (push (cons key (monk--plan-verdict (monk-run-result plan key) actual)) verdicts)))
+    (dolist (planned (monk-run-results plan))
+      (unless (member (monk-result-key planned) seen)
+        (push (cons (monk-result-key planned) monk-plan-missing) verdicts)))
+    (nreverse verdicts)))
+
+(defun monk-run-compare-counts (comparison)
+  "Return an alist of (VERDICT . N) for COMPARISON from `monk-run-compare'."
+  (let (counts)
+    (dolist (cell comparison)
+      (cl-incf (alist-get (cdr cell) counts 0)))
+    counts))
+
+(defun monk-run-as-planned-p (apply)
+  "Return non-nil when APPLY has a plan and every verdict is as-planned."
+  (and (monk-run-plan apply)
+       (cl-every (lambda (cell) (eq (cdr cell) monk-plan-as-planned))
+                 (monk-run-compare (monk-run-plan apply) apply))))
 
 (defun monk-run-count (run status &optional machine)
   "Return how many results in RUN have STATUS.
@@ -1036,9 +1108,16 @@ resolves to kept reads as kept."
 
 ;;;; Runs
 
-(defun monk--run-nodes (machines nodes dry-run max-passes)
-  "Run NODES for MACHINES until nothing changes.  Return a `monk-run'."
-  (let ((run (monk-run-create :machines machines :dry-run dry-run :passes 0))
+(defun monk--run-nodes (machines nodes dry-run max-passes policy options)
+  "Run NODES for MACHINES until nothing changes.  Return a `monk-run'.
+POLICY and OPTIONS are recorded on the run so `monk-apply' can repeat it."
+  (let ((run (monk-run-create :machines machines :dry-run dry-run :passes 0
+                              :policy policy
+                              ;; The plan is a link, not an option to repeat.
+                              :options (let ((o (copy-sequence options)))
+                                         (cl-remf o :plan)
+                                         o)
+                              :plan (plist-get options :plan)))
         (ordered (monk-schedule nodes))
         (all-results nil)
         (pass 0)
@@ -1102,18 +1181,41 @@ OPTIONS is a plist.  :dry-run overrides `monk-dry-run'.  :passes
 overrides `monk-max-passes'.  Return a `monk-run'.")
 
 (cl-defmethod monk-converge ((m monk-machine) policy &rest options)
-  (pcase-let ((`(,dry-run . ,max-passes) (monk--run-options options)))
-    (monk-log 'info "%s: converge start%s" (oref m name) (if dry-run " (dry run)" ""))
-    (monk--run-nodes (list m) (monk--nodes-for (list m) policy) dry-run max-passes)))
+  (apply #'monk-orchestrate (list m) policy options))
 
 (defun monk-orchestrate (machines policy &rest options)
   "Apply POLICY to MACHINES as one dependency graph.
 Requisites that point at other machines or groups resolve inside this
-run.  OPTIONS are as for `monk-converge'.  Return a `monk-run'."
+run.  OPTIONS is a plist: :dry-run, :passes, and :plan, an earlier dry
+run to compare against.  Return a `monk-run'."
   (pcase-let ((`(,dry-run . ,max-passes) (monk--run-options options)))
-    (monk-log 'info "orchestrate %d machine(s)%s" (length machines)
+    (monk-log 'info "%s %d machine(s)%s"
+              (if dry-run "plan" "apply") (length machines)
               (if dry-run " (dry run)" ""))
-    (monk--run-nodes machines (monk--nodes-for machines policy) dry-run max-passes)))
+    (monk--run-nodes machines (monk--nodes-for machines policy) dry-run max-passes
+                     policy options)))
+
+(defun monk-plan (machines policy &rest options)
+  "Dry-run POLICY on MACHINES.  Return a `monk-run' with no changes made.
+MACHINES is a machine or a list.  OPTIONS are as for `monk-orchestrate'.
+The result is a plan: give it to `monk-apply' to make the changes and
+compare the outcome with what the plan said."
+  (apply #'monk-orchestrate (if (listp machines) machines (list machines)) policy
+         :dry-run t options))
+
+(defun monk-apply (plan &rest options)
+  "Run the policy of PLAN for real on the same machines.
+PLAN is a `monk-run' from `monk-plan'.  The returned run carries PLAN
+in its plan slot, so `monk-run-compare' can show what differed.
+OPTIONS override those recorded on PLAN, except :dry-run."
+  (unless (monk-run-dry-run plan)
+    (signal 'monk-policy-error (list "monk-apply needs a dry run as its plan")))
+  (let ((merged (copy-sequence (monk-run-options plan))))
+    (while options
+      (setq merged (plist-put merged (pop options) (pop options))))
+    (setq merged (plist-put merged :dry-run nil))
+    (setq merged (plist-put merged :plan plan))
+    (apply #'monk-orchestrate (monk-run-machines plan) (monk-run-policy plan) merged)))
 
 ;;;; Text reporting
 
@@ -1138,6 +1240,16 @@ Without VERBOSE, omit kept and skipped results."
                       (oref m name)
                       (if (monk-run-dry-run run) " (dry run)" "")
                       (monk-run-summary run (oref m name)))))
+    (when (monk-run-plan run)
+      (let ((counts (monk-run-compare-counts
+                     (monk-run-compare (monk-run-plan run) run))))
+        (insert (format "== against plan: %s\n"
+                        (mapconcat (lambda (v)
+                                     (format "%d %s" (alist-get v counts 0) v))
+                                   monk-plan-verdicts ", ")))
+        (dolist (cell (monk-run-compare (monk-run-plan run) run))
+          (unless (eq (cdr cell) monk-plan-as-planned)
+            (insert (format "   %-14s %s:%s\n" (cdr cell) (caar cell) (cdar cell)))))))
     (when (monk-run-flapping-p run)
       (insert (format "!! flapping: %s\n"
                       (mapconcat (lambda (key) (format "%s:%s" (car key) (cdr key)))
