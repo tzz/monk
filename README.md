@@ -71,6 +71,11 @@ A command without `:creates` or `:unless` is always kept. With `:watch` it becom
 
 ;; Several hosts as one graph, so cross-machine requisites resolve.
 (monk-run-report (monk-orchestrate (monk-inventory-select 'home) #'my-policy))
+
+;; Keep it enforced.  Local drift fires within a second; remote hosts
+;; are polled.  Plans show up in *monk*; press a there, or set
+;; monk-watch-mode to autopilot.
+(monk-watch-start (monk-inventory-select 'home) #'my-policy)
 ```
 
 ## Paths
@@ -109,6 +114,8 @@ System resources in `monk-system.el`:
 | `(monk-sysctl NAME VALUE)` | Live value and a line in `/etc/sysctl.d/90-monk.conf`. |
 | `(monk-systemd-unit NAME &key content enabled started user-unit)` | Unit file, enablement, and active state. Supports actions `restart`, `reload`, `stop`, `start`, `daemon-reload`. |
 | `(monk-command NAME PROGRAM &key args creates unless)` | Run a command unless a path exists or a probe command succeeds. Supports action `run`. |
+
+Each resource type declares the paths it owns through `monk-resource-paths`, for the watcher. Directories own their subtree (`monk-resource-owns-subtree-p`). A git checkout owns only its `.git`, so edits inside the tree do not count as drift.
 
 Package and macOS resources in `monk-package.el`:
 
@@ -164,6 +171,18 @@ A host with no `:address` is the local machine. `self` selects the host whose na
 | `new`, `missing` | The policy compiled differently between plan and apply, for example because a guard read a fact that changed. |
 
 `monk-run-as-planned-p` is true only when every verdict is `as-planned`. The text report prints the verdict counts and lists every resource that is not as planned.
+
+## Watching for drift
+
+`monk-watch.el` keeps a policy enforced between runs. `(monk-watch-start MACHINES POLICY)` compiles the policy, asks every resource which paths it owns through `monk-resource-paths`, and waits for changes to them.
+
+Local machines use `filenotify.el`. Monk watches the parent directory of each owned path, because a directory watch sees creates, deletes, and renames, which a file watch misses. An event maps to the resources that own the path, and to the resources that require or watch those, transitively. Monk then runs only that set with `:only`; the rest of the policy compiles so requisites resolve, and is skipped. A burst of events within `monk-watch-debounce` seconds makes one run. Events during a run and for `monk-watch-settle` seconds after are dropped, because Monk's own repairs also touch watched paths.
+
+Remote machines have no notification channel over TRAMP. Monk polls them: every `monk-watch-poll-interval` seconds, default 300, a dry run finds resources that would change, and those count as drift.
+
+`monk-watch-mode` chooses the reaction. `assisted`, the default, plans the affected resources and shows the plan in `*monk*` for you to apply. `autopilot` repairs them. `W` in `*monk*` toggles the mode. The header shows a green `WATCH` or an amber `AUTOPILOT` badge while a watch is active, and a plan or apply that a watch triggered says `drift:` and the path that fired. `w` opens `*monk-watch*`, the event log. `monk-watch-stop` ends the watch.
+
+A compiled-in notification library does not guarantee delivery. Sandboxes and some network filesystems report `inotify` and deliver nothing. `monk-watch-notifications-work-p` writes a probe file and waits for its event; `monk-watch-start` logs a warning when the probe fails, and local drift then goes unseen until the next manual run.
 
 ## Report
 

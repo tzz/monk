@@ -193,6 +193,16 @@
   '((t :inherit monk-ui-would-repair :weight bold))
   "The plan predicted a change that apply did not make.")
 
+(defface monk-ui-watch
+  '((((background dark)) :foreground "#0d1117" :background "#3fb950" :weight bold)
+    (t :foreground "#ffffff" :background "#1a7f37" :weight bold))
+  "The WATCH indicator when a watch is active.")
+
+(defface monk-ui-autopilot
+  '((((background dark)) :foreground "#0d1117" :background "#d29922" :weight bold)
+    (t :foreground "#ffffff" :background "#9a6700" :weight bold))
+  "The WATCH indicator in autopilot mode.")
+
 (defface monk-ui-separator
   '((((background dark)) :overline "#30363d" :height 0.4 :extend t)
     (t :overline "#d0d7de" :height 0.4 :extend t))
@@ -602,6 +612,8 @@ merged results of finished passes."
     (define-key map (kbd "t") #'monk-ui-toggle-style)
     (define-key map (kbd "a") #'monk-ui-apply)
     (define-key map (kbd "p") #'monk-ui-show-plan)
+    (define-key map (kbd "w") #'monk-ui-show-watch-log)
+    (define-key map (kbd "W") #'monk-ui-toggle-watch-mode)
     (define-key map (kbd "?") #'monk-ui-help)
     map)
   "Keymap for `monk-ui-mode'.")
@@ -636,7 +648,40 @@ a plan gains a Plan column."
   "Show the keys of the report buffer."
   (interactive)
   (message "%s" (substitute-command-keys
-                 "\\[monk-ui-show-machine] detail  \\[monk-ui-apply] apply plan  \\[monk-ui-show-plan] show plan  \\[monk-ui-toggle-style] svg/text  \\[monk-ui-refresh] refresh")))
+                 "\\[monk-ui-show-machine] detail  \\[monk-ui-apply] apply plan  \\[monk-ui-show-plan] show plan  \\[monk-ui-show-watch-log] watch log  \\[monk-ui-toggle-watch-mode] watch mode  \\[monk-ui-toggle-style] svg/text  \\[monk-ui-refresh] refresh")))
+
+(declare-function monk-watch-status "monk-watch")
+(declare-function monk-watch-toggle-mode "monk-watch")
+(declare-function monk-watch-active-p "monk-watch")
+(defvar monk-watch-mode)
+(defvar monk-watch-log-buffer-name)
+
+(defun monk-ui--watch-indicator ()
+  "Return the WATCH badge for the header, or an empty string."
+  (if (and (featurep 'monk-watch) (monk-watch-active-p))
+      (concat
+       (propertize (if (eq monk-watch-mode 'autopilot) " AUTOPILOT " " WATCH ")
+                   'face (if (eq monk-watch-mode 'autopilot) 'monk-ui-autopilot 'monk-ui-watch)
+                   'help-echo (concat (monk-watch-status)
+                                      (substitute-command-keys
+                                       "\n\\[monk-ui-show-watch-log] log, \\[monk-ui-toggle-watch-mode] mode")))
+       " ")
+    ""))
+
+(defun monk-ui-show-watch-log ()
+  "Show the watch event log."
+  (interactive)
+  (unless (featurep 'monk-watch)
+    (user-error "Load monk-watch first"))
+  (pop-to-buffer (get-buffer-create monk-watch-log-buffer-name)))
+
+(defun monk-ui-toggle-watch-mode ()
+  "Switch the watch between assisted and autopilot."
+  (interactive)
+  (unless (featurep 'monk-watch)
+    (user-error "Load monk-watch first"))
+  (monk-watch-toggle-mode)
+  (force-mode-line-update t))
 
 (defun monk-ui--machine-names ()
   "Return the machine names of the live or finished run."
@@ -717,6 +762,7 @@ a plan gains a Plan column."
            (header-face (if plan 'monk-ui-plan-header 'monk-ui-header)))
       (concat
        (propertize " " 'face header-face)
+       (monk-ui--watch-indicator)
        (if monk-ui--live-run
            (concat (monk-ui-spinner) " ")
          "")
@@ -727,6 +773,12 @@ a plan gains a Plan column."
                                 "Changes were made."))
        (if (and run (monk-run-plan run))
            (propertize " from plan" 'face header-face)
+         "")
+       (if (and run (monk-run-reasons run))
+           (propertize (format " drift: %s" (mapconcat #'cdr (monk-run-reasons run) ", "))
+                       'face header-face
+                       'help-echo (mapconcat (lambda (c) (format "%s:%s  %s" (caar c) (cdar c) (cdr c)))
+                                             (monk-run-reasons run) "\n"))
          "")
        "  "
        (monk-ui-bar counts total (format "%d/%d  pass %d" done total
@@ -811,15 +863,20 @@ here; without it the user sees nothing until the run returns."
 
 ;;;; Detail buffer
 
-(defun monk-ui--insert-result (result &optional planned)
+(defun monk-ui--insert-result (result &optional planned run)
   "Insert one RESULT into the detail buffer.
 With PLANNED, the matching result from the plan, add a plan verdict
-and the planned status when it differs."
+and the planned status when it differs.  RUN supplies drift reasons."
   (let ((status (monk-result-status result)))
     (insert (monk-ui-badge status)
             (make-string (max 1 (- 14 (length (symbol-name status)))) ?\s)
             (propertize (format "%-14s" (monk-result-type result)) 'face 'monk-ui-skipped)
             (monk-result-name result))
+    (let ((reason (and run
+                       (alist-get (monk-result-key result) (monk-run-reasons run)
+                                  nil nil #'equal))))
+      (when reason
+        (insert "  " (propertize (concat "drift: " reason) 'face 'monk-ui-partial))))
     (when planned
       (let ((verdict (monk--plan-verdict planned result)))
         (unless (eq verdict monk-plan-as-planned)
@@ -891,7 +948,7 @@ In an apply with a plan, results that differ from the plan come first."
                                                (format "differs from plan (%d)" (length off)))
                       "\n")
               (dolist (r off)
-                (monk-ui--insert-result r (monk-run-result plan (monk-result-key r)))))))
+                (monk-ui--insert-result r (monk-run-result plan (monk-result-key r)) run)))))
         ;; The status groups stay complete.  A row already shown in the
         ;; drift section repeats here without its diff, marked as such.
         (dolist (status monk-ui-status-order)
@@ -907,7 +964,7 @@ In an apply with a plan, results that differ from the plan come first."
                               (monk-result-name r)
                               (propertize "  see above" 'face 'monk-ui-skipped)
                               "\n")
-                    (monk-ui--insert-result r planned)))))))
+                    (monk-ui--insert-result r planned run)))))))
         (goto-char (point-min))))
     (pop-to-buffer buffer)))
 

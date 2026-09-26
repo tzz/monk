@@ -1187,5 +1187,247 @@ change appears, and one resource fails."
                            (("m" . "c") . unfulfilled) (("m" . "d") . as-planned)
                            (("other" . "e") . unplanned))))))))
 
+;;;; Resource paths and partial runs
+
+(ert-deftest monk-test-resource-paths ()
+  (let* ((m (monk-test-machine))
+         (resources (monk-compile
+                     m (lambda (_m)
+                         (monk-directory "~/d")
+                         (monk-symlink "~/l" "~/t")
+                         (monk-file "~/f" :content "x")
+                         (monk-line-in-file "~/g" "x")
+                         (monk-absent "~/a")
+                         (monk-cron "c" "* * * * *" "true")
+                         (monk-git "~/repo" "u")
+                         (monk-command "k" "true" :creates "~/made")
+                         (monk-command "bare" "true")))))
+    (should (equal '(("~/d") ("~/l" "~/t") ("~/f") ("~/g") ("~/a") nil ("~/repo/.git") ("~/made") nil)
+                   (mapcar #'monk-resource-paths resources)))))
+
+(ert-deftest monk-test-select-nodes-closes-over-dependents ()
+  "Selecting a resource also selects what watches or requires it, transitively."
+  (let* ((m (monk-test-machine))
+         (nodes (monk--nodes-for
+                 (list m)
+                 (lambda (_m)
+                   (monk-file "/tmp/conf" :content "x")
+                   (monk-command "svc" "true" :watch '("/tmp/conf"))
+                   (monk-command "after-svc" "true" :require '("svc"))
+                   (monk-command "unrelated" "true"))))
+         (selected (monk-select-nodes nodes '(("testbox" . "/tmp/conf")))))
+    (should (equal '("/tmp/conf" "svc" "after-svc")
+                   (mapcar (lambda (n) (oref (monk-node-resource n) name)) selected)))
+    (should-not (monk-node-selected (car (last nodes))))))
+
+(ert-deftest monk-test-orchestrate-only ()
+  "With :only, unselected nodes are skipped and count as satisfied for requires."
+  (monk-test-with-tmpdir dir
+    (let* ((m (monk-test-machine))
+           (monk-log-level nil)
+           (policy (lambda (_m)
+                     (monk-directory (concat dir "base"))
+                     (monk-file (concat dir "conf") :content "x" :require (list (concat dir "base")))
+                     (monk-directory (concat dir "other"))))
+           (run (monk-orchestrate (list m) policy
+                                  :only (list (cons "testbox" (concat dir "conf"))))))
+      (should (eq 'skipped (monk-test-status run (concat dir "base"))))
+      (should (equal monk-skip-not-selected
+                     (monk-result-comment (monk-test-result run (concat dir "base")))))
+      ;; conf requires base; base was not selected, so it counts as fine.
+      (should (eq 'repaired (monk-test-status run (concat dir "conf"))))
+      (should (eq 'skipped (monk-test-status run (concat dir "other"))))
+      (should-not (file-exists-p (concat dir "other")))
+      (should (equal (list (cons "testbox" (concat dir "conf")))
+                     (plist-get (monk-run-options run) :only))))))
+
+;;;; Watch
+
+(require 'monk-watch)
+
+(defmacro monk-test-with-watch (dir-var policy &rest body)
+  "Start a watch over POLICY on a test machine in a temp dir bound to DIR-VAR."
+  (declare (indent 2))
+  `(monk-test-with-tmpdir ,dir-var
+     (let ((monk-log-level nil)
+           (monk-watch-debounce 0.05)
+           (monk-watch-settle 0.0)
+           (monk-watch-mode 'assisted)
+           (monk-report-function #'ignore)
+           (m (monk-test-machine)))
+       (unwind-protect
+           (cl-letf (((symbol-function 'file-notify-add-watch)
+                      (lambda (&rest _) (cl-gensym "desc")))
+                     ((symbol-function 'file-notify-rm-watch) #'ignore)
+                     ((symbol-function 'file-notify-valid-p) (lambda (_) t))
+                     ((symbol-value 'file-notify--library) 'test)
+                     ((symbol-value 'monk-watch--delivery) 'yes))
+             (monk-watch-start m ,policy)
+             ,@body)
+         (monk-watch-stop)))))
+
+(defun monk-test-fire (file &optional action)
+  "Inject a filenotify event for FILE and let the debounce timer run."
+  (monk-watch--on-event (list 'desc (or action 'changed) file))
+  (let ((deadline (+ (float-time) 2)))
+    (while (and (monk-watch-pending monk-watch--current) (< (float-time) deadline))
+      (sit-for 0.02))))
+
+(ert-deftest monk-test-watch-index-and-lookup ()
+  (monk-test-with-watch dir
+      (lambda (_m)
+        (monk-directory (concat dir "d"))
+        (monk-file (concat dir "d/inner") :content "x")
+        (monk-file (concat dir "f") :content "y"))
+    (let ((w monk-watch--current))
+      ;; Two parent directories: dir and dir/d.
+      (should (= 2 (length (monk-watch-path-index w))))
+      (should (equal (list (concat dir "f"))
+                     (mapcar (lambda (n) (oref (monk-node-resource n) name))
+                             (monk-watch--nodes-for-file w (concat dir "f")))))
+      ;; A file inside a managed directory maps to the directory and, when
+      ;; managed itself, to its own resource.
+      (should (equal (list (concat dir "d") (concat dir "d/inner"))
+                     (sort (mapcar (lambda (n) (oref (monk-node-resource n) name))
+                                   (monk-watch--nodes-for-file w (concat dir "d/inner")))
+                           #'string<)))
+      (should-not (monk-watch--nodes-for-file w (concat dir "stranger"))))))
+
+(ert-deftest monk-test-watch-assisted-plans-only-affected ()
+  "Drift on one file yields a dry run restricted to that resource and dependents."
+  (monk-test-with-watch dir
+      (lambda (_m)
+        (monk-file (concat dir "conf") :content "x")
+        (monk-command "handler" "true" :watch (list (concat dir "conf")))
+        (monk-file (concat dir "other") :content "y"))
+    (let (runs)
+      (add-hook 'monk-watch-functions (lambda (e d) (when (eq e 'run) (push (plist-get d :run) runs))))
+      (with-temp-file (concat dir "conf") (insert "drifted"))
+      (monk-test-fire (concat dir "conf"))
+      (should (= 1 (length runs)))
+      (let ((run (car runs)))
+        (should (monk-run-dry-run run))
+        (should (eq 'would-repair (monk-test-status run (concat dir "conf"))))
+        (should (eq 'skipped (monk-test-status run (concat dir "other"))))
+        (should (equal (list (cons "testbox" (concat dir "conf")))
+                       (mapcar #'car (monk-run-reasons run))))
+        (should (string-match-p "changed .*conf" (cdar (monk-run-reasons run))))
+        (should (string-match-p "triggered by drift" (monk-run-report-string run))))
+      ;; Nothing was repaired.
+      (should (equal "drifted" (with-temp-buffer (insert-file-contents (concat dir "conf")) (buffer-string)))))))
+
+(ert-deftest monk-test-watch-autopilot-repairs ()
+  (monk-test-with-watch dir
+      (lambda (_m) (monk-file (concat dir "conf") :content "x"))
+    (setq monk-watch-mode 'autopilot)
+    (with-temp-file (concat dir "conf") (insert "drifted"))
+    (monk-test-fire (concat dir "conf"))
+    (should (equal "x" (with-temp-buffer (insert-file-contents (concat dir "conf")) (buffer-string))))
+    (should (= 1 (monk-watch-runs monk-watch--current)))))
+
+(ert-deftest monk-test-watch-debounce-coalesces ()
+  "A burst of events on several files makes one run with all keys."
+  (monk-test-with-watch dir
+      (lambda (_m)
+        (monk-file (concat dir "a") :content "x")
+        (monk-file (concat dir "b") :content "y"))
+    (let (runs)
+      (add-hook 'monk-watch-functions (lambda (e d) (when (eq e 'run) (push d runs))))
+      (monk-watch--on-event (list 'desc 'changed (concat dir "a")))
+      (monk-watch--on-event (list 'desc 'changed (concat dir "b")))
+      (monk-watch--on-event (list 'desc 'changed (concat dir "a")))
+      (monk-test-fire (concat dir "b"))
+      (should (= 1 (length runs)))
+      (should (= 2 (length (plist-get (car runs) :keys)))))))
+
+(ert-deftest monk-test-watch-suppresses-own-writes ()
+  "Events during a run and within the settle window are dropped."
+  (monk-test-with-watch dir
+      (lambda (_m) (monk-file (concat dir "conf") :content "x"))
+    (let ((monk-watch--running t))
+      (monk-watch--on-event (list 'desc 'changed (concat dir "conf")))
+      (should-not (monk-watch-pending monk-watch--current)))
+    (let ((monk-watch-settle 60))
+      (setf (monk-watch-last-run-end monk-watch--current) (float-time))
+      (monk-watch--on-event (list 'desc 'changed (concat dir "conf")))
+      (should-not (monk-watch-pending monk-watch--current)))))
+
+(ert-deftest monk-test-watch-poll-remote ()
+  "Polling a remote machine turns would-repair into drift keys."
+  (monk-test-with-tmpdir dir
+    (let* ((monk-log-level nil)
+           (monk-watch-settle 0.0)
+           (monk-report-function #'ignore)
+           (remote (monk-machine :name "far" :address "far.example"))
+           (policy (lambda (_m) (monk-file (concat dir "conf") :content "x")))
+           (probe (monk-run-create :dry-run t :results
+                                   (list (monk-result-create :machine "far" :name (concat dir "conf")
+                                                             :status 'would-repair)))))
+      (oset remote facts monk-test-fake-facts)
+      (oset remote classes (monk-hard-classes remote))
+      (cl-letf (((symbol-function 'monk-plan) (lambda (&rest _) probe))
+                ((symbol-function 'run-at-time) (lambda (&rest _) 'timer))
+                ((symbol-function 'cancel-timer) #'ignore)
+                ((symbol-value 'monk-watch--delivery) 'no))
+        (unwind-protect
+            (progn
+              (monk-watch-start remote policy)
+              (should (null (monk-watch-path-index monk-watch--current)))
+              (monk-watch--poll)
+              (should (equal (list (cons "far" (concat dir "conf")))
+                             (monk-watch-pending monk-watch--current)))
+              (should (string-match-p "poll" (cdar (monk-watch-pending-reasons monk-watch--current)))))
+          (monk-watch-stop))))))
+
+(ert-deftest monk-test-watch-stop-clears ()
+  (monk-test-with-watch dir (lambda (_m) (monk-file (concat dir "f") :content "x"))
+    (should (monk-watch-active-p))
+    (should (stringp (monk-watch-status)))
+    (monk-watch-stop)
+    (should-not (monk-watch-active-p))
+    (should-not (monk-watch-status))))
+
+(ert-deftest monk-test-watch-probe ()
+  "The delivery probe returns a boolean, caches it, and cleans up after itself."
+  (let ((before (directory-files temporary-file-directory nil "monk-probe"))
+        (monk-watch--delivery nil)
+        (monk-watch-probe-timeout 0.2))
+    (should (memq (monk-watch-notifications-work-p) '(t nil)))
+    (should (memq monk-watch--delivery '(yes no)))
+    (should (equal before (directory-files temporary-file-directory nil "monk-probe"))))
+  (let ((monk-watch--delivery 'no))
+    (should-not (monk-watch-notifications-work-p)))
+  (let ((monk-watch--delivery 'yes))
+    (should (monk-watch-notifications-work-p))))
+
+(ert-deftest monk-test-watch-live-inotify ()
+  "With delivered notifications, a write to a managed file fires a run.
+Skipped where the kernel delivers no events: the sandbox that runs
+this suite reports inotify and delivers nothing."
+  (skip-unless (let ((monk-watch--delivery nil)
+                     (monk-watch-probe-timeout 0.3))
+                 (monk-watch-notifications-work-p)))
+  (monk-test-with-tmpdir dir
+    (let ((monk-log-level nil)
+          (monk-watch-debounce 0.05)
+          (monk-watch-settle 0.0)
+          (monk-watch-mode 'autopilot)
+          (monk-report-function #'ignore)
+          (m (monk-test-machine))
+          (conf (concat dir "conf")))
+      (with-temp-file conf (insert "x"))
+      (unwind-protect
+          (progn
+            (monk-watch-start m (lambda (_m) (monk-file conf :content "x")))
+            (should (= 1 (length (monk-watch-descriptors monk-watch--current))))
+            (with-temp-file conf (insert "drifted"))
+            (let ((deadline (+ (float-time) 3)))
+              (while (and (< (monk-watch-runs monk-watch--current) 1) (< (float-time) deadline))
+                (accept-process-output nil 0.05)
+                (sit-for 0.02)))
+            (should (= 1 (monk-watch-runs monk-watch--current)))
+            (should (equal "x" (with-temp-buffer (insert-file-contents conf) (buffer-string)))))
+        (monk-watch-stop)))))
+
 (provide 'monk-test)
 ;;; monk-test.el ends here

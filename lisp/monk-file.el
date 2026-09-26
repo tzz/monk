@@ -164,6 +164,12 @@ When SUDO is non-nil, write as root.")
       (push "ownership" notes))
     (string-join (nreverse notes) ", ")))
 
+(cl-defmethod monk-resource-paths ((r monk-directory-resource))
+  (list (oref r name)))
+
+(cl-defmethod monk-resource-owns-subtree-p ((_r monk-directory-resource))
+  t)
+
 (defun monk-directory (path &rest args)
   "Ensure directory PATH exists.  ARGS: :mode :owner :group and common keys."
   (monk-add-resource
@@ -246,6 +252,11 @@ the text verbatim and a literal `~' in a link is dangling."
     (make-symbolic-link target full)
     (format "-> %s" target)))
 
+(cl-defmethod monk-resource-paths ((r monk-symlink-resource))
+  "Return the link of R and its target.
+The watcher wants both, so that a replaced target re-checks the link."
+  (list (oref r name) (oref r target)))
+
 (defun monk-symlink (path target &rest args)
   "Ensure PATH is a symbolic link to TARGET.  ARGS: :force and common keys."
   (monk-add-resource
@@ -327,6 +338,9 @@ the text verbatim and a literal `~' in a link is dangling."
                              (oref r owner) (oref r group) (oref r sudo))
       (push "ownership" notes))
     (string-join (nreverse notes) ", ")))
+
+(cl-defmethod monk-resource-paths ((r monk-file-resource))
+  (list (oref r name)))
 
 (defun monk-file (path &rest args)
   "Ensure PATH has the given content.
@@ -451,6 +465,9 @@ without a match, append at the end."
                      (and (plist-get changes :create) monk-file-default-mode))
     (format "%s line" (if (eq (oref r state) 'absent) "removed" "set"))))
 
+(cl-defmethod monk-resource-paths ((r monk-line-in-file-resource))
+  (list (oref r path)))
+
 (defun monk-line-in-file (path line &rest args)
   "Ensure LINE is present in PATH, or absent when :state is `absent'.
 ARGS: :regexp :state :insert-after :insert-before :create and common
@@ -487,6 +504,9 @@ one file can hold several line resources."
         (delete-directory full t)
       (delete-file full))
     (format "removed %s" (plist-get changes :remove))))
+
+(cl-defmethod monk-resource-paths ((r monk-absent-resource))
+  (list (oref r name)))
 
 (defun monk-absent (path &rest args)
   "Ensure PATH does not exist.  ARGS: common keys."

@@ -217,6 +217,7 @@ Each is called with two arguments: EVENT, one of `run-start',
   policy
   options
   plan
+  reasons               ; alist of (KEY . TEXT): why a watch selected KEY
   (last-pass-repaired 0)
   (repaired-by-pass nil)
   (start-time (current-time))
@@ -698,6 +699,22 @@ Return a comment string.")
           (list (format "%s does not support action %s on %s"
                         (eieio-object-class-name r) action (oref m name)))))
 
+(cl-defgeneric monk-resource-paths (resource)
+  "Return the target-side paths that RESOURCE owns, or nil.
+A watcher uses these to map a filesystem event back to the resource.
+Paths keep a leading `~'; the watcher expands them per machine.")
+
+(cl-defmethod monk-resource-paths ((_r monk-resource))
+  nil)
+
+(cl-defgeneric monk-resource-owns-subtree-p (resource)
+  "Return non-nil when a change under a path of RESOURCE is drift for it.
+True for a directory: a file created inside it can change its mode
+or ownership expectations.  Nil for a file.")
+
+(cl-defmethod monk-resource-owns-subtree-p ((_r monk-resource))
+  nil)
+
 (cl-defgeneric monk-default-watch-action (resource)
   "Return the action RESOURCE performs when a watched ref changed.
 Nil means the resource only re-checks.")
@@ -827,7 +844,34 @@ SPEC is a resource name string, a cons (SCOPE . NAME), or a plist
   machine
   resource
   (index 0)
+  (selected t)
   result)
+
+(defconst monk-skip-not-selected "not selected for this run"
+  "Comment on a node that a partial run left alone.")
+
+(defun monk--node-dependents (node nodes)
+  "Return the nodes in NODES that name NODE in a requisite."
+  (seq-filter (lambda (other)
+                (and (not (eq other node))
+                     (memq node (monk--node-dependencies other nodes))))
+              nodes))
+
+(defun monk-select-nodes (nodes keys)
+  "Mark as selected the nodes in NODES whose key is in KEYS, and their dependents.
+Dependents close transitively: a resource that watches a changed file
+must run, and so must whatever watches it.  Every other node is
+deselected and will be skipped.  Return the selected nodes."
+  (let ((selected nil)
+        (frontier (seq-filter (lambda (n) (member (monk-node-key n) keys)) nodes)))
+    (while frontier
+      (let ((node (pop frontier)))
+        (unless (memq node selected)
+          (push node selected)
+          (setq frontier (append frontier (monk--node-dependents node nodes))))))
+    (dolist (node nodes)
+      (setf (monk-node-selected node) (and (memq node selected) t)))
+    (seq-filter #'monk-node-selected nodes)))
 
 (defun monk-node-key (node)
   "Return (MACHINE-NAME . RESOURCE-NAME) for NODE."
@@ -851,10 +895,14 @@ SPEC is a resource name string, a cons (SCOPE . NAME), or a plist
      nodes)))
 
 (defun monk--result-satisfies-p (result degree)
-  "Return non-nil when RESULT holds to at least DEGREE."
+  "Return non-nil when RESULT holds to at least DEGREE.
+A node left out of a partial run counts as satisfied: the run that
+selected the changed resources did not select this one because
+nothing it owns changed."
   (and result
        (or (memq (monk-result-status result)
                  (list monk-status-kept monk-status-repaired monk-status-would-repair))
+           (equal (monk-result-comment result) monk-skip-not-selected)
            (>= (monk-result-degree result) degree))))
 
 (defun monk--ref-satisfied-p (ref targets)
@@ -980,9 +1028,12 @@ signals `monk-resource-error' with the result."
     (monk-progress 'node-start :node node)
     (condition-case err
         (pcase-let ((`(,verdict . ,detail)
-                     (if (monk-resource-applicable-p resource machine)
-                         (monk--requisite-verdict node nodes)
-                       (cons 'skip "guard or class did not match"))))
+                     (cond
+                      ((not (monk-node-selected node))
+                       (cons 'skip monk-skip-not-selected))
+                      ((monk-resource-applicable-p resource machine)
+                       (monk--requisite-verdict node nodes))
+                      (t (cons 'skip "guard or class did not match")))))
           (if (eq verdict 'skip)
               (setf (monk-result-status result) monk-status-skipped
                     (monk-result-comment result) detail)
@@ -1116,8 +1167,10 @@ POLICY and OPTIONS are recorded on the run so `monk-apply' can repeat it."
                               ;; The plan is a link, not an option to repeat.
                               :options (let ((o (copy-sequence options)))
                                          (cl-remf o :plan)
+                                         (cl-remf o :watch-reasons)
                                          o)
-                              :plan (plist-get options :plan)))
+                              :plan (plist-get options :plan)
+                              :reasons (plist-get options :watch-reasons)))
         (ordered (monk-schedule nodes))
         (all-results nil)
         (pass 0)
@@ -1186,14 +1239,21 @@ overrides `monk-max-passes'.  Return a `monk-run'.")
 (defun monk-orchestrate (machines policy &rest options)
   "Apply POLICY to MACHINES as one dependency graph.
 Requisites that point at other machines or groups resolve inside this
-run.  OPTIONS is a plist: :dry-run, :passes, and :plan, an earlier dry
-run to compare against.  Return a `monk-run'."
-  (pcase-let ((`(,dry-run . ,max-passes) (monk--run-options options)))
-    (monk-log 'info "%s %d machine(s)%s"
+run.  OPTIONS is a plist: :dry-run, :passes, :plan, an earlier dry run
+to compare against, and :only, a list of (MACHINE-NAME . RESOURCE-NAME)
+keys.  With :only, just those resources and their transitive
+dependents run; the rest compile, so requisites resolve, and are
+skipped.  Return a `monk-run'."
+  (pcase-let ((`(,dry-run . ,max-passes) (monk--run-options options))
+              (only (plist-get options :only)))
+    (monk-log 'info "%s %d machine(s)%s%s"
               (if dry-run "plan" "apply") (length machines)
-              (if dry-run " (dry run)" ""))
-    (monk--run-nodes machines (monk--nodes-for machines policy) dry-run max-passes
-                     policy options)))
+              (if dry-run " (dry run)" "")
+              (if only (format ", only %d key(s) and dependents" (length only)) ""))
+    (let ((nodes (monk--nodes-for machines policy)))
+      (when only
+        (monk-select-nodes nodes only))
+      (monk--run-nodes machines nodes dry-run max-passes policy options))))
 
 (defun monk-plan (machines policy &rest options)
   "Dry-run POLICY on MACHINES.  Return a `monk-run' with no changes made.
@@ -1240,6 +1300,10 @@ Without VERBOSE, omit kept and skipped results."
                       (oref m name)
                       (if (monk-run-dry-run run) " (dry run)" "")
                       (monk-run-summary run (oref m name)))))
+    (when (monk-run-reasons run)
+      (insert "== triggered by drift:\n")
+      (dolist (cell (monk-run-reasons run))
+        (insert (format "   %s:%s  %s\n" (caar cell) (cdar cell) (cdr cell)))))
     (when (monk-run-plan run)
       (let ((counts (monk-run-compare-counts
                      (monk-run-compare (monk-run-plan run) run))))

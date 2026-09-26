@@ -204,6 +204,11 @@ and common keys."
             notes))
     (string-join (nreverse notes) ", ")))
 
+(cl-defmethod monk-resource-paths ((r monk-git-resource))
+  "Return the .git directory of R only.
+Watching the whole checkout would fire on every edit inside it."
+  (list (concat (file-name-as-directory (oref r name)) ".git")))
+
 (defun monk-git (path repo &rest args)
   "Ensure a git checkout of REPO at PATH.  ARGS: :branch :update and common keys."
   (monk-add-resource
@@ -272,6 +277,9 @@ and common keys."
                          t monk-file-default-mode))
       (push "persisted" notes))
     (string-join (nreverse notes) ", ")))
+
+(cl-defmethod monk-resource-paths ((_r monk-sysctl-resource))
+  (list monk-sysctl-config-file))
 
 (defun monk-sysctl (name value &rest args)
   "Ensure kernel parameter NAME is VALUE.  ARGS: common keys."
@@ -369,6 +377,9 @@ and common keys."
      "daemon-reload")
     (_ (cl-call-next-method))))
 
+(cl-defmethod monk-resource-paths ((r monk-systemd-unit-resource))
+  (and (oref r content) (list (monk--systemd-unit-path r))))
+
 (defun monk-systemd-unit (name &rest args)
   "Ensure systemd unit NAME.
 ARGS: :content :enabled :started :user-unit and common keys."
@@ -426,6 +437,9 @@ watch action, so `:watch' makes it a handler in the Ansible sense.")
   (pcase action
     ('run (monk-repair r m nil))
     (_ (cl-call-next-method))))
+
+(cl-defmethod monk-resource-paths ((r monk-command-resource))
+  (and (oref r creates) (list (oref r creates))))
 
 (defun monk-command (name program &rest args)
   "Ensure the effect of PROGRAM.  NAME identifies the resource.
