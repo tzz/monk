@@ -1429,5 +1429,387 @@ this suite reports inotify and delivers nothing."
             (should (equal "x" (with-temp-buffer (insert-file-contents conf) (buffer-string)))))
         (monk-watch-stop)))))
 
+;;;; Events and the agent
+
+(require 'monk-event)
+(require 'monk-agent)
+
+(ert-deftest monk-test-event-result-round-trip ()
+  "A result serializes to one JSON line and parses back to the same values."
+  (monk-test-with-tmpdir dir
+    (let* ((run (monk-test-converge
+                 (lambda (_m)
+                   (monk-file (concat dir "f") :content "x\n")
+                   (monk-directory dir))))
+           (events (monk-run-events run))
+           (lines (mapcar #'monk-event-line events)))
+      (should (= 4 (length events)))
+      (should (equal '("run-start" "result" "result" "run-end")
+                     (mapcar (lambda (e) (alist-get 'event e)) events)))
+      (dolist (line lines)
+        (should (string-suffix-p "\n" line))
+        (should-not (string-match-p "\n." line))
+        (should (monk-event-parse line)))
+      (let* ((parsed (mapcar (lambda (l) (monk-event-parse (string-trim l))) lines))
+             (back (monk-events-to-run parsed))
+             (orig (monk-test-result run (concat dir "f")))
+             (copy (monk-test-result back (concat dir "f"))))
+        (should (equal '("testbox") (mapcar (lambda (m) (oref m name)) (monk-run-machines back))))
+        (should (= 2 (length (monk-run-results back))))
+        (should (eq 'repaired (monk-result-status copy)))
+        (should (equal (monk-result-diff orig) (monk-result-diff copy)))
+        (should (equal (monk-result-comment orig) (monk-result-comment copy)))
+        (should (= 1.0 (monk-result-degree copy)))
+        (should (equal '((create . t)) (monk-result-changes copy)))
+        (should (equal (monk-run-passes run) (monk-run-passes back)))
+        (should-not (monk-run-dry-run back))
+        (should (string-match-p "\"status\":\"repaired\"" (nth 1 lines)))
+        (should (string-match-p "\"changed\":true" (nth 1 lines)))
+        (should (string-match-p "\"rgi\":1" (car lines)))))))
+
+(ert-deftest monk-test-event-jsonable ()
+  (should (equal "sym" (monk-event--jsonable 'sym)))
+  (should (equal [1 "a" "(k . v)"] (monk-event--jsonable '(1 a (k . v)))))
+  (should (equal "(k . v)" (monk-event--jsonable '(k . v))))
+  (should (equal '((k . "v") (n . 2)) (monk-event--jsonable '((k . v) (n . 2)))))
+  (should (equal '((create . t) (mode . [420 448]))
+                 (monk-event--plist-to-alist '(:create t :mode (420 448)))))
+  ;; Every event of a real run must serialize without error.
+  (monk-test-with-tmpdir dir
+    (let ((run (monk-test-converge (lambda (_m) (monk-symlink (concat dir "l") "/t")))))
+      (dolist (e (monk-run-events run))
+        (should (stringp (monk-event--json e)))))))
+
+(ert-deftest monk-test-event-run-end-fields ()
+  (monk-test-with-tmpdir dir
+    (let* ((run (monk-test-converge
+                 (lambda (_m)
+                   (monk-file (concat dir "f") :content "hello\n")
+                   (monk-line-in-file (concat dir "f") "world" :create t))
+                 :passes 5))
+           (end (monk-event-run 'run-end run)))
+      (should (eq t (alist-get 'ok end)))
+      (should (eq :false (alist-get 'converged end)))
+      (should (= 2 (length (alist-get 'flapping end))))
+      ;; A parsed run-end serializes again: vectors, not lists, for arrays.
+      (should (stringp (monk-event--json (monk-event-parse (monk-event--json end)))))
+      (should (stringp (alist-get 'summary end))))))
+
+(ert-deftest monk-test-agent-record-appends-ledger ()
+  "The agent report function appends one line per event to the ledger."
+  (monk-test-with-tmpdir dir
+    (let* ((monk-agent-ledger-file (concat dir "state/events.ndjson"))
+           (monk-log-level nil)
+           (run (monk-test-converge (lambda (_m) (monk-directory (concat dir "d"))))))
+      (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) nil)))
+        (monk-agent--report run)
+        (monk-agent--report run))
+      (let ((lines (with-temp-buffer
+                     (insert-file-contents monk-agent-ledger-file)
+                     (split-string (buffer-string) "\n" t))))
+        (should (= 6 (length lines)))
+        (should (cl-every #'monk-event-parse lines))))))
+
+(ert-deftest monk-test-agent-observe-filter-splits-lines ()
+  "Partial chunks are buffered until a newline completes the line."
+  (let* ((seen nil)
+         (monk-agent-observe-functions (list (lambda (e) (push (alist-get 'name e) seen))))
+         (proc (start-process "monk-test-cat" nil "cat")))
+    (unwind-protect
+        (progn
+          (monk-agent--observe-filter proc "{\"event\":\"result\",\"na")
+          (should-not seen)
+          (monk-agent--observe-filter proc "me\":\"a\"}\n{\"event\":\"result\",\"name\":\"b\"}\n{\"ev")
+          (should (equal '("b" "a") seen))
+          (monk-agent--observe-filter proc "ent\":\"result\",\"name\":\"c\"}\n")
+          (should (equal '("c" "b" "a") seen)))
+      (delete-process proc))))
+
+(ert-deftest monk-test-agent-main-runs-and-stops ()
+  "The agent converges on start, then leaves its loop when told to."
+  (monk-test-with-tmpdir dir
+    (let* ((monk-agent-ledger-file (concat dir "events.ndjson"))
+           (monk-log-level nil)
+           (monk-batch-policy (lambda (_m) (monk-directory (concat dir "d"))))
+           (monk-agent-full-interval 3600)
+           (monk-watch--delivery 'no))
+      (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) nil))
+                ((symbol-function 'file-notify-add-watch) (lambda (&rest _) 'd))
+                ((symbol-function 'file-notify-rm-watch) #'ignore)
+                ((symbol-function 'file-notify-valid-p) (lambda (_) t))
+                ((symbol-value 'file-notify--library) 'test)
+                ;; Stop after the first wait.
+                ((symbol-function 'accept-process-output)
+                 (lambda (&rest _) (monk-agent-stop) nil)))
+        (monk-agent-main))
+      (should (file-directory-p (concat dir "d")))
+      (should (file-exists-p monk-agent-ledger-file))
+      (should-not (monk-watch-active-p))
+      (should-not monk-agent--full-timer))))
+
+(ert-deftest monk-test-agent-units-text ()
+  "Unit files carry the right sections, and the socket unit is inetd style."
+  (let ((monk-agent-emacs "/usr/bin/emacs")
+        (monk-agent-load-path "/opt/monk/lisp")
+        (monk-agent-policy-file "/etc/monk/policy.el"))
+    (let ((svc (monk-agent-service-unit)))
+      (should (string-match-p "^ExecStart=/usr/bin/emacs --batch -L /opt/monk/lisp -l /etc/monk/policy.el -f monk-agent-main$" svc))
+      (should (string-match-p "^Restart=on-failure$" svc))
+      (should (string-match-p "^StateDirectory=monk$" svc))
+      (should (string-match-p "^WantedBy=multi-user.target$" svc)))
+    (let ((usvc (monk-agent-service-unit t)))
+      (should-not (string-match-p "StateDirectory" usvc))
+      (should (string-match-p "^WantedBy=default.target$" usvc)))
+    (let ((sock (monk-agent-socket-unit)))
+      (should (string-match-p "^ListenStream=/run/monk/agent.sock$" sock))
+      (should (string-match-p "^Accept=yes$" sock)))
+    (let ((tmpl (monk-agent-template-unit)))
+      (should (string-match-p "^StandardInput=socket$" tmpl))
+      (should (string-match-p "-f monk-agent-serve$" tmpl)))))
+
+(ert-deftest monk-test-agent-units-policy-fragment ()
+  "The policy fragment compiles to three resources with the socket watching its template."
+  (let* ((m (monk-test-machine))
+         (monk-agent-load-path "/opt/monk/lisp")
+         (monk-agent-policy-file "/etc/monk/policy.el")
+         (resources (monk-compile m (lambda (_m) (monk-agent-units)))))
+    (should (equal '("monk-agent.service" "/etc/systemd/system/monk-agent@.service" "monk-agent.socket")
+                   (mapcar (lambda (r) (oref r name)) resources)))
+    (should (equal '("/etc/systemd/system/monk-agent@.service")
+                   (oref (nth 2 resources) watch)))
+    (should (eq 'daemon-reload (oref (nth 2 resources) watch-action)))
+    (should (= 1 (length (monk-compile m (lambda (_m) (monk-agent-units :socket nil))))))))
+
+(ert-deftest monk-test-agent-handle-status-and-tail ()
+  (monk-test-with-tmpdir dir
+    (let* ((monk-agent-ledger-file (concat dir "events.ndjson"))
+           (monk-log-level nil)
+           (run (monk-test-converge (lambda (_m) (monk-directory (concat dir "d"))))))
+      (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) nil)))
+        (monk-agent-record run))
+      (let* ((out (with-output-to-string (monk-agent-handle '((op . "status")))))
+             (resp (monk-event-parse (string-trim out))))
+        (should (eq t (alist-get 'ok resp)))
+        (should (equal "status" (alist-get 'op resp)))
+        (should (equal "run-end" (alist-get 'event (alist-get 'last_run resp))))
+        (should (eq :false (alist-get 'agent_active resp))))
+      (let* ((out (with-output-to-string (monk-agent-handle '((op . "tail") (n . 2)))))
+             (lines (split-string out "\n" t)))
+        ;; two ledger lines plus the ok line
+        (should (= 3 (length lines)))
+        (should (equal "tail" (alist-get 'op (monk-event-parse (car (last lines)))))))
+      (let* ((out (with-output-to-string (monk-agent-handle '((op . "bogus")))))
+             (resp (monk-event-parse (string-trim out))))
+        (should (eq :false (alist-get 'ok resp)))
+        (should (string-match-p "unknown op" (alist-get 'error resp)))))))
+
+(ert-deftest monk-test-agent-handle-plan-streams-events ()
+  "A plan request streams one result line per node and ends with run-end."
+  (monk-test-with-tmpdir dir
+    (let* ((monk-agent-ledger-file (concat dir "events.ndjson"))
+           (monk-log-level nil)
+           (monk-batch-policy (lambda (_m)
+                                (monk-directory (concat dir "a"))
+                                (monk-directory (concat dir "b"))))
+           (fake (monk-test-machine))
+           (out (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) nil))
+                          ((symbol-function 'monk-local-machine) (lambda (&rest _) fake)))
+                  (with-output-to-string (monk-agent-handle '((op . "plan"))))))
+           (events (mapcar #'monk-event-parse (split-string out "\n" t))))
+      (should (equal '("result" "result" "run-end") (mapcar (lambda (e) (alist-get 'event e)) events)))
+      (should (equal "would-repair" (alist-get 'status (car events))))
+      (should-not (file-exists-p (concat dir "a")))
+      ;; The controller side rebuilds a run from exactly these lines.
+      (let ((run (monk-events-to-run events)))
+        (should (monk-run-dry-run run))
+        (should (= 2 (monk-run-count run 'would-repair)))))))
+
+(ert-deftest monk-test-agent-query-parses-socat-output ()
+  (let ((m (monk-test-machine)))
+    (cl-letf (((symbol-function 'monk-exec)
+               (lambda (_m program &rest args)
+                 (should (equal "socat" program))
+                 (should (member "UNIX-CONNECT:/run/monk/agent.sock" args))
+                 (should (string-match-p "\"op\":\"status\"" (cadr (memq :input args))))
+                 (monk-exec-create :exit-code 0
+                                   :output "{\"op\":\"status\",\"ok\":true,\"host\":\"far\"}\n"))))
+      (should (equal "far" (alist-get 'host (monk-agent-status m)))))))
+
+;;;; etcd, against a fake gateway
+
+(require 'monk-etcd)
+
+(defvar monk-test-etcd--store nil "Alist of (KEY . VALUE) in the fake gateway.")
+(defvar monk-test-etcd--leases 0)
+(defvar monk-test-etcd--watchers nil "List of (PROC . PREFIX) streaming watchers.")
+
+(defun monk-test-etcd--b64 (s) (base64-encode-string (encode-coding-string s 'utf-8) t))
+(defun monk-test-etcd--unb64 (s) (decode-coding-string (base64-decode-string s) 'utf-8))
+
+(defun monk-test-etcd--notify (kind key value)
+  "Push a watch frame to every watcher whose prefix covers KEY."
+  (dolist (w monk-test-etcd--watchers)
+    (when (and (process-live-p (car w)) (string-prefix-p (cdr w) key))
+      (process-send-string
+       (car w)
+       (concat (json-serialize
+                `((result . ((events . [((type . ,(if (eq kind 'delete) "DELETE" "PUT"))
+                                          (kv . ((key . ,(monk-test-etcd--b64 key))
+                                                 ,@(and value `((value . ,(monk-test-etcd--b64 value)))))))])))))
+               "\n")))))
+
+(defun monk-test-etcd--handle (path body)
+  "Return the JSON reply alist for PATH with BODY alist."
+  (let* ((key (and (alist-get 'key body) (monk-test-etcd--unb64 (alist-get 'key body))))
+         (end (and (alist-get 'range_end body) (monk-test-etcd--unb64 (alist-get 'range_end body)))))
+    (pcase path
+      ("/v3/kv/put"
+       (let ((value (monk-test-etcd--unb64 (alist-get 'value body))))
+         (setf (alist-get key monk-test-etcd--store nil nil #'equal) value)
+         (monk-test-etcd--notify 'put key value)
+         '((header . ((revision . "1"))))))
+      ("/v3/kv/range"
+       (let ((hits (seq-filter (lambda (c) (if end
+                                               (and (string< (car c) end) (not (string< (car c) key)))
+                                             (equal (car c) key)))
+                               monk-test-etcd--store)))
+         `((kvs . ,(vconcat (mapcar (lambda (c) `((key . ,(monk-test-etcd--b64 (car c)))
+                                                  (value . ,(monk-test-etcd--b64 (cdr c)))))
+                                    (sort (copy-sequence hits) (lambda (a b) (string< (car a) (car b))))))))))
+      ("/v3/kv/deleterange"
+       (let ((before (length monk-test-etcd--store)))
+         (setq monk-test-etcd--store
+               (seq-remove (lambda (c)
+                             (let ((hit (if end (and (string< (car c) end) (not (string< (car c) key)))
+                                          (equal (car c) key))))
+                               (when hit (monk-test-etcd--notify 'delete (car c) nil))
+                               hit))
+                           monk-test-etcd--store))
+         `((deleted . ,(- before (length monk-test-etcd--store))))))
+      ("/v3/lease/grant" `((ID . ,(number-to-string (cl-incf monk-test-etcd--leases))) (TTL . ,(alist-get 'TTL body))))
+      ("/v3/lease/keepalive" `((result . ((ID . ,(alist-get 'ID body)) (TTL . 30)))))
+      (_ nil))))
+
+(defun monk-test-etcd--filter (proc chunk)
+  (let ((buf (concat (or (process-get proc 'partial) "") chunk)))
+    (process-put proc 'partial buf)
+    (when (string-match "\r\n\r\n" buf)
+      (let* ((head (substring buf 0 (match-beginning 0)))
+             (rest (substring buf (match-end 0)))
+             (len (and (string-match "Content-Length: \\([0-9]+\\)" head)
+                       (string-to-number (match-string 1 head))))
+             (path (and (string-match "^POST \\([^ ]+\\)" head) (match-string 1 head))))
+        (when (and len (>= (string-bytes rest) len))
+          (process-put proc 'partial "")
+          (let ((body (json-parse-string rest :object-type 'alist :array-type 'list
+                                         :null-object nil :false-object :false)))
+            (if (equal path "/v3/watch")
+                (progn
+                  (push (cons proc (monk-test-etcd--unb64
+                                    (alist-get 'key (alist-get 'create_request body))))
+                        monk-test-etcd--watchers)
+                  (process-send-string proc "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n")
+                  (process-send-string proc "{\"result\":{\"created\":true}}\n"))
+              (let* ((reply (monk-test-etcd--handle path body))
+                     (text (if reply (json-serialize reply :null-object nil :false-object :false)
+                             "{\"message\":\"no such route\"}")))
+                (process-send-string
+                 proc (format "HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s"
+                              (if reply "200 OK" "404 Not Found") (string-bytes text) text))
+                (delete-process proc)))))))))
+
+(defmacro monk-test-with-fake-etcd (&rest body)
+  "Run BODY with `monk-etcd-url' pointing at a fake gateway on a free port."
+  (declare (indent 0))
+  `(let* ((monk-test-etcd--store nil)
+          (monk-test-etcd--watchers nil)
+          (monk-log-level nil)
+          (server (make-network-process :name "monk-test-etcd" :server t :host "127.0.0.1"
+                                        :service t :family 'ipv4 :noquery t
+                                        :filter #'monk-test-etcd--filter))
+          (monk-etcd-url (format "http://127.0.0.1:%d" (process-contact server :service))))
+     (unwind-protect
+         (progn ,@body)
+       (dolist (w monk-test-etcd--watchers) (when (process-live-p (car w)) (delete-process (car w))))
+       (delete-process server))))
+
+(ert-deftest monk-test-etcd-prefix-end ()
+  (should (equal "/_monk/events0" (monk-etcd--prefix-end "/_monk/events/")))
+  (should (equal "b" (monk-etcd--prefix-end "a"))))
+
+(ert-deftest monk-test-etcd-strings-mgmt-layout ()
+  (monk-test-with-fake-etcd
+    (monk-etcd-str-set "greeting" "hi")
+    (should (equal "hi" (monk-etcd-str-get "greeting")))
+    (should (equal "hi" (cdr (assoc "/_mgmt/strings/greeting" monk-test-etcd--store))))
+    (monk-etcd-strmap-set "load" "a" "0.5")
+    (monk-etcd-strmap-set "load" "b" "0.9")
+    (should (equal '(("a" . "0.5") ("b" . "0.9")) (monk-etcd-strmap-get "load")))
+    (should (equal "0.9" (cdr (assoc "/_mgmt/strings/load/b" monk-test-etcd--store))))
+    (should-not (monk-etcd-get "/nothing"))
+    (should (= 1 (monk-etcd-delete "/_mgmt/strings/greeting")))
+    (should-not (monk-etcd-str-get "greeting"))))
+
+(ert-deftest monk-test-etcd-export-collect ()
+  (monk-test-with-fake-etcd
+    (let* ((m (monk-test-machine))
+           (resources (monk-compile m (lambda (_m)
+                                        (monk-file "/etc/hosts.d/a" :content "1.2.3.4 a\n" :mode #o644)
+                                        (monk-symlink "/x" "/y" :sudo t)))))
+      (monk-etcd-export "a" monk-etcd-any-host (car resources))
+      (monk-etcd-export "a" "b" (cadr resources))
+      (let ((for-b (monk-etcd-collect "b"))
+            (for-c (monk-etcd-collect "c")))
+        (should (= 2 (length for-b)))
+        (should (= 1 (length for-c)))
+        (let ((file (seq-find (lambda (r) (equal (alist-get 'type r) "file")) for-b)))
+          (should (equal "a" (alist-get 'from file)))
+          (should (equal "/etc/hosts.d/a" (alist-get 'name file)))
+          (should (equal "1.2.3.4 a\n" (alist-get 'content (alist-get 'params file))))
+          (should (= 420 (alist-get 'mode (alist-get 'params file))))
+          (should (eq :false (alist-get 'sudo (alist-get 'meta file)))))
+        (should (equal '("symlink") (mapcar (lambda (r) (alist-get 'type r))
+                                            (monk-etcd-collect "b" "symlink"))))))))
+
+(ert-deftest monk-test-etcd-events-and-presence ()
+  (monk-test-with-fake-etcd
+    (monk-test-with-tmpdir dir
+      (let ((run (monk-test-converge (lambda (_m) (monk-directory (concat dir "d"))))))
+        (should (= 3 (monk-etcd-publish-run run)))
+        (should (equal (list (monk-run-id run)) (monk-etcd-runs "testbox")))
+        (let ((back (monk-etcd-run "testbox" (monk-run-id run))))
+          (should (= 1 (monk-run-count back 'repaired))))
+        (let ((lease (monk-etcd-announce "testbox" '((mode . "standalone")))))
+          (should (numberp lease))
+          (should (= 30 (monk-etcd-keepalive lease)))
+          (should (equal "standalone"
+                         (alist-get 'mode (cdr (assoc "testbox" (monk-etcd-agents)))))))))))
+
+(ert-deftest monk-test-etcd-watch-stream ()
+  "A watch delivers puts and deletes under its prefix and nothing outside it."
+  (monk-test-with-fake-etcd
+    (let* ((seen nil)
+           (proc (monk-etcd-watch "/_monk/events/" (lambda (kind key value) (push (list kind key value) seen)))))
+      (unwind-protect
+          (progn
+            (let ((deadline (+ (float-time) 2)))
+              (while (and (null monk-test-etcd--watchers) (< (float-time) deadline))
+                (accept-process-output nil 0.05)))
+            (should monk-test-etcd--watchers)
+            (monk-etcd-put "/_monk/events/h/r/000001" "{\"event\":\"result\"}")
+            (monk-etcd-put "/_mgmt/strings/other" "x")
+            (monk-etcd-delete "/_monk/events/h/r/000001")
+            (let ((deadline (+ (float-time) 2)))
+              (while (and (< (length seen) 2) (< (float-time) deadline))
+                (accept-process-output nil 0.05)))
+            (should (equal '((put "/_monk/events/h/r/000001" "{\"event\":\"result\"}")
+                             (delete "/_monk/events/h/r/000001" nil))
+                           (reverse seen))))
+        (delete-process proc)))))
+
+(ert-deftest monk-test-etcd-http-error-signals ()
+  (monk-test-with-fake-etcd
+    (should-error (monk-etcd--request 'bogus '((x . 1))) :type 'monk-error)))
+
 (provide 'monk-test)
 ;;; monk-test.el ends here

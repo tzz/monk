@@ -184,6 +184,41 @@ Remote machines have no notification channel over TRAMP. Monk polls them: every 
 
 A compiled-in notification library does not guarantee delivery. Sandboxes and some network filesystems report `inotify` and deliver nothing. `monk-watch-notifications-work-p` writes a probe file and waits for its event; `monk-watch-start` logs a warning when the probe fails, and local drift then goes unseen until the next manual run.
 
+## Execution modes
+
+Monk runs in three modes that share one engine and differ in who decides.
+
+| Mode | Runs where | Approves a repair | Report |
+|---|---|---|---|
+| Standalone | `emacs --batch -f monk-agent-main` on the host, from systemd or launchd | nobody: local policy applies on drift and on a timer | ledger file and journald; a central Monk observes by tailing it |
+| Supervised | the central Emacs, over TRAMP | a human, through the plan buffer and `a` | `*monk*` |
+| Autopilot | the central Emacs, over TRAMP, driven by `monk-watch` | nobody | `*monk*` and the watch log |
+
+Supervised and autopilot are `monk-watch-mode`. Standalone is `monk-agent.el`. The agent converges the local policy on start, watches owned paths in autopilot, and converges in full every `monk-agent-full-interval` seconds (3600). It appends every event to `monk-agent-ledger-file` as JSON Lines and mirrors them to journald through `systemd-cat` when present. `(monk-agent-observe MACHINE)` on the central Monk runs `tail -F` on that ledger through TRAMP and dispatches each parsed event to `monk-agent-observe-functions`; there is no port and no daemon beyond SSH. The agent and a controller applying the same policy do not fight: both apply the same policy, and the settle window drops the events the other side produced.
+
+### systemd units
+
+`(monk-agent-units)` inside a policy installs and enables two units on a Linux host. `monk-agent.service` is the long-lived loop; a drift watcher must stay resident, so it is not socket activated. `monk-agent.socket` plus `monk-agent@.service` is an on-demand query endpoint on `/run/monk/agent.sock` with `Accept=yes`: systemd accepts each connection and starts one `emacs --batch -f monk-agent-serve` with the connection on stdin and stdout, inetd style, because Emacs cannot adopt an inherited listening socket but reads and writes stdio well. Idle cost is zero. `:user t` installs user units under `~/.config/systemd/user/` with the socket in `$XDG_RUNTIME_DIR/monk/`. Set `monk-agent-emacs`, `monk-agent-load-path`, and `monk-agent-policy-file` before compiling the policy so the `ExecStart` lines point at the right places on the target.
+
+The endpoint takes one JSON object per line and answers in JSON Lines. `{"op":"status"}` returns liveness and the last `run-end`. `{"op":"tail","n":50}` returns the last ledger lines. `{"op":"plan"}` and `{"op":"run"}` converge now and stream one result event per node, then `run-end`. From the controller, `(monk-agent-status M)`, `(monk-agent-remote-run M DRY-RUN)`, and `(monk-agent-query M REQUEST)` send the request through `socat` over TRAMP; no port is opened.
+
+## etcd
+
+`monk-etcd.el` is a small etcd v3 client over the gRPC gateway (HTTP and JSON with base64 keys), enough for shared state: strings, per-host string maps, exported resources, run events, and agent presence with a lease. Where the value format allows, the key layout is mgmt's, so one etcd can serve both: `/_mgmt/strings/KEY` and `/_mgmt/strings/KEY/HOST` are byte-compatible with mgmt's `world.StrGet` and `StrMapGet`. mgmt's exported resources under `/_mgmt/exported/` are Go `gob` blobs, which Emacs cannot decode, so Monk keeps its own JSON under `/_monk/`: `exported/TO/FROM/TYPE/NAME` for `monk-etcd-export` and `monk-etcd-collect`, `events/HOST/RUN/SEQ` for `monk-etcd-publish-run` and `monk-etcd-run`, `agents/HOST` for `monk-etcd-announce` and `monk-etcd-agents`. `monk-etcd-watch PREFIX CALLBACK` streams puts and deletes over one raw HTTP connection. Set `monk-agent-etcd` to make the standalone agent publish every run and keep a presence key alive. Tested against a fake gateway in the suite; not yet against a real etcd.
+
+## Events
+
+`monk-event.el` serializes results as one JSON object per line. This is the ledger format, and it is the shape every other configuration tool normalizes to.
+
+```json
+{"rgi":1,"event":"result","ts":"2026-09-26T10:00:01.234Z","host":"kamen","run":"r20260926T100001.000",
+ "pass":1,"type":"file","name":"/etc/motd","status":"repaired","changed":true,"degree":1.0,
+ "changes":{"content":true},"diff":"--- a/etc/motd\n+++ b/etc/motd\n...","comment":"content",
+ "duration_ms":4.5,"dry_run":false,"native":{"tool":"monk"}}
+```
+
+`event` is `run-start`, `result`, `run-end`, or `drift`. `status` is Monk's vocabulary plus `unknown`; `native` carries a foreign tool's own status verbatim. Fields are added, never renamed; `rgi` is the format version. `monk-run-events` produces the list for a run, `monk-events-to-run` rebuilds a run from parsed lines. `docs/mgmt-review-and-interop.md` explains why a shared event protocol is realistic, a shared resource graph is realistic for import only, and a shared language is not.
+
 ## Report
 
 `monk-ui.el` draws the run. Load it and `monk-run-report` shows a `*monk*` buffer with one row per machine: name, state badge, a stacked progress bar, counts, and time. The bar has one layer per status, failures on the left edge. While a run is in progress the row of the current machine shows a spinner and the bar grows as nodes finish. `RET` on a row opens a detail buffer with results grouped by status and with fontified diffs. `t` switches between SVG and text drawing. `g` redraws. `?` lists the keys.

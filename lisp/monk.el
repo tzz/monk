@@ -1367,13 +1367,16 @@ VERBOSE passes through to the report function."
 
 ;;;; Batch entry point
 
+(defvar monk-batch-policy nil
+  "The policy function a batch entry point runs.  Set by the policy file.")
+
 (defun monk-batch-converge (policy-file &rest machine-args)
   "Load POLICY-FILE and converge the local machine.
 POLICY-FILE must set `monk-batch-policy' to a policy function.
 MACHINE-ARGS are passed to `monk-local-machine'.  Exit non-zero when
 any resource failed."
   (load policy-file nil t)
-  (let* ((policy (or (bound-and-true-p monk-batch-policy)
+  (let* ((policy (or monk-batch-policy
                      (signal 'monk-policy-error
                              (list "monk-batch-policy is not set by" policy-file))))
          (run (monk-converge (apply #'monk-local-machine machine-args) policy)))
