@@ -192,7 +192,7 @@ ARGS: common keys."
          (want (monk--osx-default-clean
                 (monk--osx-default-normalize (oref r value-type) (oref r value)))))
     (unless (equal current want)
-      (list :write (list current want)))))
+      (list :before (or current 'unset) :after want))))
 
 (cl-defmethod monk-repair ((r monk-osx-default-resource) (m monk-machine) _changes)
   (apply #'monk-exec-string m monk-defaults-program "write"

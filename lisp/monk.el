@@ -49,6 +49,11 @@
 ;;   :only-if FN      run only when (funcall FN machine) is non-nil
 ;;   :not-if  FN      skip when (funcall FN machine) is non-nil
 ;;   :classes LIST    run only when the machine has every class in LIST
+;;   :when GUARD      run only when GUARD is true.  GUARD is a CELL form
+;;                    such as (and (class linux) (= (fact arch) "x86_64"))
+;;                    or a CEL string such as "'linux' in classes".
+;;                    See monk-cell.el.  A skipped resource reports the
+;;                    clause that was false.
 ;;   :require REFS    run after REFS, and only when they succeeded
 ;;   :watch REFS      like :require, then run :watch-action when a REF changed
 ;;   :onchanges REFS  run only when a REF changed in this run
@@ -158,6 +163,13 @@ Each is called with two arguments: EVENT, one of `run-start',
 (define-error 'monk-policy-error "Monk policy error" 'monk-error)
 (define-error 'monk-inventory-error "Monk inventory error" 'monk-error)
 (define-error 'monk-requisite-error "Monk requisite error" 'monk-error)
+(define-error 'monk-guard-error "Monk guard error" 'monk-error)
+(define-error 'monk-cel-error "Monk CEL error" 'monk-guard-error)
+
+;; monk-cell.el evaluates :when guards.  It declares the machine
+;; accessors it needs instead of requiring monk, so the load order is
+;; monk-cell first, then the rest of this file.
+(require 'monk-cell)
 
 ;;;; Logging
 
@@ -643,6 +655,31 @@ merge.  Probes run in list order.")
   (oset m classes (monk-hard-classes m))
   m)
 
+(cl-defmethod monk-machine-describe ((m monk-machine))
+  "Return an alist that shows what guards can see on M.
+Keys are `classes' (list), `groups' (list), `facts' (alist), and
+`vars' (alist).  Facts and vars are sorted by key."
+  (let ((by-key (lambda (a b) (string< (symbol-name (car a)) (symbol-name (car b))))))
+    (list (cons 'classes (oref m classes))
+          (cons 'groups (oref m groups))
+          (cons 'facts (sort (copy-sequence (oref m facts)) by-key))
+          (cons 'vars (sort (copy-sequence (oref m vars)) by-key)))))
+
+(defun monk-machine-describe-string (m &optional indent)
+  "Return `monk-machine-describe' of M as text, each line after INDENT."
+  (let ((indent (or indent ""))
+        (description (monk-machine-describe m)))
+    (with-temp-buffer
+      (insert indent (format "classes: %s\n"
+                             (mapconcat #'symbol-name (alist-get 'classes description) " ")))
+      (insert indent (format "groups:  %s\n"
+                             (mapconcat #'symbol-name (alist-get 'groups description) " ")))
+      (dolist (section '(facts vars))
+        (insert indent (format "%s:\n" section))
+        (dolist (cell (alist-get section description))
+          (insert indent (format "  %-22s %S\n" (car cell) (cdr cell)))))
+      (buffer-string))))
+
 (cl-defmethod monk-class-p ((m monk-machine) class)
   "Return non-nil when M has CLASS."
   (memq class (oref m classes)))
@@ -665,7 +702,12 @@ merge.  Probes run in list order.")
            :documentation "Guard.  Function of the machine.  Skip when non-nil.")
    (classes :initarg :classes
             :initform nil
-            :documentation "Run only when the machine has all these classes.")
+            :documentation "Run only when the machine has all these classes.
+Sugar for a :when guard of (and (class A) (class B) ...).")
+   (when :initarg :when
+         :initform nil
+         :documentation "Guard.  A CELL form or a CEL string.  Run when true.
+See `monk-cell-eval'.  Checked at compile time.")
    (require :initarg :require
             :initform nil
             :documentation "Refs that must succeed before this resource runs.")
@@ -753,11 +795,38 @@ Nil means the resource only re-checks.")
                         (string-remove-prefix monk-resource-class-prefix
                                               (symbol-name (eieio-object-class-name r)))))
 
+(cl-defmethod monk-resource-guard ((r monk-resource))
+  "Return the full CELL guard of R: its :classes and :when combined.
+Nil when R has neither."
+  (let ((parts (append (mapcar (lambda (c) (list 'class c)) (oref r classes))
+                       (and (oref r when) (list (monk-cell-guard (oref r when)))))))
+    (pcase parts
+      ('nil nil)
+      (`(,single) single)
+      (_ (cons 'and parts)))))
+
+(defconst monk-skip-only-if ":only-if returned nil"
+  "Skip comment when the :only-if function said no.")
+
+(defconst monk-skip-not-if ":not-if returned non-nil"
+  "Skip comment when the :not-if function said no.")
+
+(cl-defmethod monk-resource-skip-reason ((r monk-resource) (m monk-machine))
+  "Return nil when R can run on M, else a string that says which guard failed.
+The CELL guard is explained down to the false clause.  The :only-if
+and :not-if functions are opaque, so their reason only names them."
+  (let ((guard (monk-resource-guard r)))
+    (cond
+     ((and guard (not (monk-cell-eval m guard)))
+      (monk-cell-explain m guard))
+     ((and (oref r only-if) (not (funcall (oref r only-if) m)))
+      monk-skip-only-if)
+     ((and (oref r not-if) (funcall (oref r not-if) m))
+      monk-skip-not-if))))
+
 (cl-defmethod monk-resource-applicable-p ((r monk-resource) (m monk-machine))
   "Return non-nil when guards and classes of R allow it to run on M."
-  (and (cl-every (lambda (class) (monk-class-p m class)) (oref r classes))
-       (or (null (oref r only-if)) (funcall (oref r only-if) m))
-       (or (null (oref r not-if)) (not (funcall (oref r not-if) m)))))
+  (null (monk-resource-skip-reason r m)))
 
 ;;;; Compile phase
 
@@ -793,6 +862,15 @@ root."
                             (oref resource name)
                             (monk-resource-type existing)
                             (monk-resource-type resource))))))
+  ;; A bad guard fails the compile, not the run: the policy author sees
+  ;; the error at once, and a CEL string is parsed once, here.
+  (when (oref resource when)
+    (condition-case err
+        (oset resource when (monk-cell-guard (oref resource when)))
+      (monk-guard-error
+       (signal 'monk-policy-error
+               (list (format "Resource %S: bad :when guard: %s"
+                             (oref resource name) (cadr err)))))))
   (push resource monk--compile-resources)
   resource)
 
@@ -804,7 +882,7 @@ root."
     (nreverse monk--compile-resources)))
 
 (defconst monk--common-keys
-  '(:only-if :not-if :classes :require :watch :watch-action :onchanges :onfail
+  '(:only-if :not-if :classes :when :require :watch :watch-action :onchanges :onfail
     :sudo :ignore-errors)
   "Keywords every resource constructor accepts.")
 
@@ -1047,12 +1125,13 @@ signals `monk-resource-error' with the result."
     (monk-progress 'node-start :node node)
     (condition-case err
         (pcase-let ((`(,verdict . ,detail)
-                     (cond
-                      ((not (monk-node-selected node))
-                       (cons 'skip monk-skip-not-selected))
-                      ((monk-resource-applicable-p resource machine)
-                       (monk--requisite-verdict node nodes))
-                      (t (cons 'skip "guard or class did not match")))))
+                     (let ((reason (and (monk-node-selected node)
+                                        (monk-resource-skip-reason resource machine))))
+                       (cond
+                        ((not (monk-node-selected node))
+                         (cons 'skip monk-skip-not-selected))
+                        (reason (cons 'skip reason))
+                        (t (monk--requisite-verdict node nodes))))))
           (if (eq verdict 'skip)
               (setf (monk-result-status result) monk-status-skipped
                     (monk-result-comment result) detail)
@@ -1304,6 +1383,64 @@ OPTIONS override those recorded on PLAN, except :dry-run."
     (setq merged (plist-put merged :plan plan))
     (apply #'monk-orchestrate (monk-run-machines plan) (monk-run-policy plan) merged)))
 
+;;;; Describing changes
+
+(defun monk--describe-value (value)
+  "Return VALUE as short text for a change description."
+  (cond
+   ((eq value 'unset) "unset")
+   ((eq value t) "yes")
+   ((null value) "none")
+   ((stringp value)
+    (if (string-match-p "\n" value)
+        (format "%S" value)
+      value))
+   ((integerp value) (number-to-string value))
+   (t (format "%S" value))))
+
+(defun monk-describe-changes (changes)
+  "Return CHANGES, a plist from `monk-check', as one readable line.
+Known keys read as prose: :before and :after as an arrow, :create,
+:mode as octal, :retarget and :replace, :install as a count.  Keys
+without a rule print as KEY VALUE.  :degree and :diff are omitted;
+the report shows them elsewhere."
+  (let (parts (rest (copy-sequence changes)))
+    (when (or (plist-member rest :before) (plist-member rest :after))
+      (push (format "%s → %s" (monk--describe-value (plist-get rest :before))
+                    (monk--describe-value (plist-get rest :after)))
+            parts)
+      (cl-remf rest :before) (cl-remf rest :after))
+    (while rest
+      (let ((key (pop rest)) (value (pop rest)))
+        (pcase key
+          ((or :degree :diff) nil)
+          (:create (push (if (stringp value) (format "create → %s" value) "create") parts))
+          (:content (push "content differs" parts))
+          (:mode (push (if (and (consp value) (integerp (car value)))
+                           (format "mode %04o → %04o" (logand (car value) #o7777) (cadr value))
+                         "mode")
+                       parts))
+          (:owner (push (format "owner %s → %s" (car value) (cadr value)) parts))
+          (:group (push (format "group %s → %s" (car value) (cadr value)) parts))
+          (:retarget (push (format "%s → %s" (car value) (cadr value)) parts))
+          (:replace (push (format "replace %s with link → %s" (car value) (cadr value)) parts))
+          (:remove (push (format "remove %s" value) parts))
+          (:install (push (format "install %d: %s" (length value)
+                                  (truncate-string-to-width (string-join value " ") 60 nil nil "…"))
+                          parts))
+          (:clone (push (format "clone %s (%s)" (car value) (cadr value)) parts))
+          (:checkout (push (format "checkout %s → %s" (car value) (cadr value)) parts))
+          (:behind (push (format "fast-forward to %s" (if (stringp value) (substring value 0 (min 8 (length value))) value)) parts))
+          (:enabled (push (format "%s → %s" (car value) (if (cadr value) "enabled" "disabled")) parts))
+          (:started (push (format "%s → %s" (car value) (if (cadr value) "started" "stopped")) parts))
+          (:live (push (format "live %s → %s" (car value) (cadr value)) parts))
+          (:persist (push (format "persist %s" value) parts))
+          (:run (push (format "run %s" (string-join (mapcar (lambda (a) (format "%s" a)) value) " ")) parts))
+          (_ (push (format "%s %s" (string-remove-prefix ":" (symbol-name key))
+                           (monk--describe-value value))
+                   parts)))))
+    (string-join (nreverse parts) ", ")))
+
 ;;;; Text reporting
 
 (defun monk-run-summary (run &optional machine)
@@ -1326,7 +1463,9 @@ Without VERBOSE, omit kept and skipped results."
       (insert (format "== %s%s: %s\n"
                       (oref m name)
                       (if (monk-run-dry-run run) " (dry run)" "")
-                      (monk-run-summary run (oref m name)))))
+                      (monk-run-summary run (oref m name))))
+      (when verbose
+        (insert (monk-machine-describe-string m "   "))))
     (when (monk-run-reasons run)
       (insert "== triggered by drift:\n")
       (dolist (cell (monk-run-reasons run))
@@ -1363,7 +1502,7 @@ Without VERBOSE, omit kept and skipped results."
               (insert ": " (monk-result-comment result)))
             (insert "\n")
             (when (and (monk-result-changes result) (not (monk-result-diff result)))
-              (insert (format "              %S\n" (monk-result-changes result))))
+              (insert (format "              %s\n" (monk-describe-changes (monk-result-changes result)))))
             (when (monk-result-diff result)
               (insert (monk-result-diff result))
               (unless (string-suffix-p "\n" (monk-result-diff result))

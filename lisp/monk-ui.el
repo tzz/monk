@@ -64,6 +64,15 @@
 (defconst monk-ui-detail-buffer-format "*monk: %s*"
   "Format for per-machine detail buffers.")
 
+(defconst monk-ui-query-buffer-name "*monk-query*"
+  "Buffer that shows which machines a CEL or CELL guard matches.")
+
+(defconst monk-ui-fold-indicator-open "▾"
+  "Marker before an unfolded section heading.")
+
+(defconst monk-ui-fold-indicator-closed "▸"
+  "Marker before a folded section heading.")
+
 (defconst monk-ui-bar-width 24
   "Width of a progress bar in character cells.")
 
@@ -104,6 +113,13 @@
 (defcustom monk-ui-unicode t
   "When non-nil, status glyphs use Unicode.  Nil uses ASCII."
   :type 'boolean)
+
+(defcustom monk-ui-select-window 'command
+  "When to move point into the report buffer after a run.
+`command' selects the window when the run came from an interactive
+command, so `a' and `RET' work at once.  Watch-triggered runs do not
+steal focus.  t always selects.  nil only displays."
+  :type '(choice (const command) (const t) (const nil)))
 
 ;;;; Faces
 
@@ -207,6 +223,29 @@
   '((((background dark)) :overline "#30363d" :height 0.4 :extend t)
     (t :overline "#d0d7de" :height 0.4 :extend t))
   "Hairline between sections.")
+
+(defface monk-ui-fold
+  '((((background dark)) :foreground "#8b949e" :weight bold)
+    (t :foreground "#57606a" :weight bold))
+  "Heading of a section that TAB folds and unfolds.")
+
+(defface monk-ui-key
+  '((((background dark)) :foreground "#79c0ff")
+    (t :foreground "#0550ae"))
+  "A fact or variable name in the machine inspector.")
+
+(defface monk-ui-class
+  '((((background dark)) :foreground "#0d1117" :background "#8b949e")
+    (t :foreground "#ffffff" :background "#6e7781"))
+  "One class in the machine inspector.")
+
+(defface monk-ui-match
+  '((t :inherit monk-ui-kept :weight bold))
+  "A machine that a query matched.")
+
+(defface monk-ui-no-match
+  '((t :inherit monk-ui-skipped))
+  "A machine that a query did not match.")
 
 (defconst monk-ui-status-faces
   `((,monk-status-kept . monk-ui-kept)
@@ -902,7 +941,7 @@ and the planned status when it differs.  RUN supplies drift reasons."
       (insert (propertize (concat "  " (monk-result-comment result)) 'face 'monk-ui-skipped)))
     (insert "\n")
     (when (and (monk-result-changes result) (not (monk-result-diff result)))
-      (insert (propertize (format "    %S\n" (monk-result-changes result))
+      (insert (propertize (format "    %s\n" (monk-describe-changes (monk-result-changes result)))
                           'face 'monk-ui-skipped)))
     (when (monk-result-diff result)
       (let ((start (point)))
@@ -1057,12 +1096,23 @@ Works in batch too, for tests and drives that read the buffer."
       (monk-ui-refresh))
     buffer))
 
+(defun monk-ui-select-window-p (run)
+  "Return non-nil when the report for RUN must take the selected window.
+See `monk-ui-select-window'.  A run with watch reasons came from a
+watch, not from a command."
+  (pcase monk-ui-select-window
+    ('command (null (monk-run-reasons run)))
+    ('nil nil)
+    (_ t)))
+
 (defun monk-ui-report (run &optional _verbose)
   "Show RUN in the report buffer.  In batch mode, print text instead."
   (if noninteractive
       (monk-run-report-text run)
-    (let ((buffer (monk-ui-show run)))
-      (display-buffer buffer)
+    (let* ((buffer (monk-ui-show run))
+           (window (display-buffer buffer)))
+      (when (and (window-live-p window) (monk-ui-select-window-p run))
+        (select-window window))
       (cond
        ((or (not (monk-run-ok-p run)) (not (monk-run-converged-p run)))
         (message "Monk: %s%s"

@@ -951,6 +951,19 @@ A :degree threshold on a require lets a follower run anyway."
   (should (equal "#808080" (monk-ui--blend "#ffffff" "#000000" 0.5)))
   (should (equal "#ff0000" (monk-ui--blend "#ff0000" "#000000" 1.0))))
 
+(ert-deftest monk-test-ui-select-window-rule ()
+  "Command runs take focus, watch runs do not, and t/nil override."
+  (require 'monk-ui)
+  (let ((command (monk-run-create))
+        (watch (monk-run-create :reasons '((("m" . "x") . "changed")))))
+    (let ((monk-ui-select-window 'command))
+      (should (monk-ui-select-window-p command))
+      (should-not (monk-ui-select-window-p watch)))
+    (let ((monk-ui-select-window t))
+      (should (monk-ui-select-window-p watch)))
+    (let ((monk-ui-select-window nil))
+      (should-not (monk-ui-select-window-p command)))))
+
 (ert-deftest monk-test-ui-report-buffer-in-batch ()
   "The report function prints text in batch and the entries build."
   (require 'monk-ui)
@@ -2072,6 +2085,32 @@ refuses to run from a side window."
           (should (= 1 (length (window-list))))
           (should (equal monk-ui-buffer-name (buffer-name (window-buffer (selected-window))))))
       (kill-buffer "*monk-side-test*"))))
+
+(ert-deftest monk-test-describe-changes ()
+  (should (equal "unset → 512" (monk-describe-changes '(:before unset :after "512"))))
+  (should (equal "0 → 1" (monk-describe-changes '(:before "0" :after "1"))))
+  (should (equal "create → /t" (monk-describe-changes '(:create "/t"))))
+  (should (equal "create" (monk-describe-changes '(:create t))))
+  (should (equal "/old → /new" (monk-describe-changes '(:retarget ("/old" "/new")))))
+  (should (equal "mode 0755 → 0700" (monk-describe-changes '(:mode (33261 448)))))
+  (should (equal "install 2: a b" (monk-describe-changes '(:install ("a" "b") :degree 0.5))))
+  (should (equal "content differs, mode 0644 → 0600"
+                 (monk-describe-changes '(:content t :mode (420 384)))))
+  (should (equal "clone u (main)" (monk-describe-changes '(:clone ("u" "main")))))
+  (should (equal "crontab yes" (monk-describe-changes '(:crontab t)))))
+
+(ert-deftest monk-test-osx-default-reports-before-after ()
+  (let ((m (monk-test-machine))
+        (r (monk-osx-default-resource :name "d:k" :domain "d" :key "k" :value 512 :value-type 'int)))
+    (cl-letf (((symbol-function 'monk-exec)
+               (lambda (&rest _) (monk-exec-create :exit-code 1 :output "does not exist"))))
+      (should (equal '(:before unset :after "512") (monk-check r m))))
+    (cl-letf (((symbol-function 'monk-exec)
+               (lambda (&rest _) (monk-exec-create :exit-code 0 :output "256\n"))))
+      (should (equal '(:before "256" :after "512") (monk-check r m))))
+    (cl-letf (((symbol-function 'monk-exec)
+               (lambda (&rest _) (monk-exec-create :exit-code 0 :output "512\n"))))
+      (should-not (monk-check r m)))))
 
 (provide 'monk-test)
 ;;; monk-test.el ends here
