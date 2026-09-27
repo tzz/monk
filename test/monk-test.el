@@ -72,7 +72,7 @@
         (remote (monk-machine :name "r" :address "host.example" :user "u" :port 2222))
         (plain (monk-machine :name "p" :address "host.example")))
     (should (equal "" (monk-machine-remote-prefix local)))
-    (should (equal "/sudo::" (monk-machine-remote-prefix local t)))
+    (should (equal "/sudo:root@localhost:" (monk-machine-remote-prefix local t)))
     (should (equal "/ssh:u@host.example#2222:" (monk-machine-remote-prefix remote)))
     (should (equal "/ssh:u@host.example#2222|sudo::" (monk-machine-remote-prefix remote t)))
     (should (equal "/ssh:host.example:" (monk-machine-remote-prefix plain)))
@@ -700,6 +700,10 @@ names only A.  A cap below 4 misses it and reports did-not-converge."
   (should-error (monk-inventory-select 'nobody) :type 'monk-inventory-error)
   (cl-letf (((symbol-function 'system-name) (lambda () "kamen.local")))
     (should (equal "kamen" (oref (car (monk-inventory-select 'self)) name))))
+  ;; macOS reports the host name in upper case.
+  (cl-letf (((symbol-function 'system-name) (lambda () "KAMEN.local")))
+    (should (equal "kamen" (oref (car (monk-inventory-select 'self)) name))))
+  (should (equal "foxy" (oref (monk-inventory-find "FOXY") name)))
   (cl-letf (((symbol-function 'system-name) (lambda () "stranger")))
     (should-error (monk-inventory-select 'self) :type 'monk-inventory-error)))
 

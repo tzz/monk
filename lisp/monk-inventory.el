@@ -98,9 +98,11 @@ Signal `monk-inventory-error' on duplicate host names."
     (setq monk-inventory (nreverse machines))))
 
 (defun monk-inventory-find (name)
-  "Return the machine named NAME, a string or symbol, or nil."
+  "Return the machine named NAME, a string or symbol, or nil.
+The match ignores case: macOS reports its host name in upper case
+while inventories are written in lower case."
   (let ((name (format "%s" name)))
-    (seq-find (lambda (m) (equal (oref m name) name)) monk-inventory)))
+    (seq-find (lambda (m) (string-equal-ignore-case (oref m name) name)) monk-inventory)))
 
 (defun monk-inventory-select (selector)
   "Return the machines that SELECTOR matches.
@@ -115,7 +117,8 @@ SELECTOR is a host name, a group symbol, `self', or a list of those."
            (found (monk-inventory-find host)))
       (unless found
         (signal 'monk-inventory-error
-                (list (format "Local host %s is not in the inventory" host))))
+                (list (format "Local host %s is not in the inventory; add it, or pass a machine"
+                              host))))
       (list found)))
    (t
     (let* ((name (format "%s" selector))

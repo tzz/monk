@@ -112,6 +112,13 @@ limits the cycle length Monk can name: with 6 passes a cycle of up to
 (defconst monk-tramp-sudo-method "sudo"
   "TRAMP method used as the second hop for privileged operations.")
 
+(defconst monk-tramp-sudo-local-host "root@localhost"
+  "User and host for a sudo hop on the local machine.
+Written out rather than left empty: `/sudo::' makes TRAMP fill in the
+system name, and when that name is not lower case, as on macOS, the
+default-host match fails and TRAMP opens an ssh connection to the
+local machine.  Seen as \"Opening connection for BOSMEJ... using ssh\".")
+
 (defconst monk-log-buffer-name "*monk-log*"
   "Buffer that receives log lines.")
 
@@ -393,7 +400,7 @@ SUDO, return the empty string."
   (cond
    ((and (monk-machine-local-p m) (not sudo)) "")
    ((monk-machine-local-p m)
-    (format "/%s::" monk-tramp-sudo-method))
+    (format "/%s:%s:" monk-tramp-sudo-method monk-tramp-sudo-local-host))
    (t
     (let ((host (concat (and (oref m user) (concat (oref m user) "@"))
                         (oref m address)
