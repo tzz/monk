@@ -640,9 +640,15 @@ a plan gains a Plan column."
 \\{monk-ui-mode-map}"
   (setq tabulated-list-format (monk-ui--format)
         tabulated-list-padding 1)
-  (setq-local header-line-format '(:eval (monk-ui--header-line)))
+  ;; The header line carries Monk's summary: the PLAN or APPLY badge,
+  ;; the total bar, the badges, the flapping and watch indicators.
+  ;; tabulated-list would overwrite it with the column names, so tell
+  ;; it to draw those as the first body line instead.  Found on the
+  ;; first live tour: no header line was ever visible.
+  (setq-local tabulated-list-use-header-line nil)
   (add-hook 'window-configuration-change-hook #'monk-ui-reset-cache nil t)
-  (tabulated-list-init-header))
+  (tabulated-list-init-header)
+  (setq-local header-line-format '(:eval (monk-ui--header-line))))
 
 (defun monk-ui-help ()
   "Show the keys of the report buffer."
@@ -831,7 +837,10 @@ changed."
         (setq tabulated-list-format format)
         (tabulated-list-init-header)))
     (setq tabulated-list-entries (monk-ui--entries))
-    (tabulated-list-print t)))
+    (tabulated-list-print t)
+    ;; `tabulated-list-init-header' with the header line off does not
+    ;; touch `header-line-format', but be sure nothing else did either.
+    (setq header-line-format '(:eval (monk-ui--header-line)))))
 
 (defun monk-ui--refresh-live ()
   "Redraw every visible report buffer during a live run.
@@ -1039,14 +1048,20 @@ apply report replaces the plan in this buffer and compares against it."
          (monk-ui-refresh)
          (force-mode-line-update))))))
 
+(defun monk-ui-show (run)
+  "Fill the report buffer with RUN and return the buffer.
+Works in batch too, for tests and drives that read the buffer."
+  (let ((buffer (monk-ui--buffer)))
+    (with-current-buffer buffer
+      (setq monk-ui--run run)
+      (monk-ui-refresh))
+    buffer))
+
 (defun monk-ui-report (run &optional _verbose)
   "Show RUN in the report buffer.  In batch mode, print text instead."
   (if noninteractive
       (monk-run-report-text run)
-    (let ((buffer (monk-ui--buffer)))
-      (with-current-buffer buffer
-        (setq monk-ui--run run)
-        (monk-ui-refresh))
+    (let ((buffer (monk-ui-show run)))
       (display-buffer buffer)
       (cond
        ((or (not (monk-run-ok-p run)) (not (monk-run-converged-p run)))

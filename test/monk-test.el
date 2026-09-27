@@ -956,11 +956,17 @@ A :degree threshold on a require lets a follower run anyway."
       (with-temp-buffer
         (monk-ui-mode)
         (setq monk-ui--run run)
+        (monk-ui-refresh)
         (let ((entries (monk-ui--entries)))
           (should (= 1 (length entries)))
           (should (equal "testbox" (caar entries)))
           (should (equal "1" (aref (cadr (car entries)) 4))))
-        (should (string-match-p "1/1" (substring-no-properties (monk-ui--header-line))))))))
+        (should (string-match-p "1/1" (substring-no-properties (monk-ui--header-line))))
+        ;; The summary owns the header line; the column names are in the body.
+        (should (equal '(:eval (monk-ui--header-line)) header-line-format))
+        (should-not tabulated-list-use-header-line)
+        (should (string-match-p "\\` ?Machine +State" (buffer-substring-no-properties
+                                                         (point-min) (line-end-position))))))))
 
 ;;;; Bridge parsing
 
@@ -1810,6 +1816,258 @@ this suite reports inotify and delivers nothing."
 (ert-deftest monk-test-etcd-http-error-signals ()
   (monk-test-with-fake-etcd
     (should-error (monk-etcd--request 'bogus '((x . 1))) :type 'monk-error)))
+
+;;;; Test drive and tutorial
+
+(require 'monk-testdrive)
+(require 'monk-tutorial)
+
+(ert-deftest monk-test-testdrive-step-records-outcomes ()
+  "The step macro records PASS, FAIL with note, SKIP, and turns errors into FAIL."
+  (let ((monk-testdrive--results nil)
+        (monk-testdrive--layout nil))
+    (with-current-buffer (monk-testdrive--buf)
+      (let ((inhibit-read-only t)) (erase-buffer)))
+    (monk-testdrive--step "s" "passes" 'PASS)
+    (monk-testdrive--step "s" "fails" (cons 'FAIL "because"))
+    (monk-testdrive--step "s" "skips" 'SKIP)
+    (monk-testdrive--step "s" "errors" (error "boom"))
+    (should (equal '(PASS FAIL SKIP FAIL)
+                   (mapcar #'caddr (reverse monk-testdrive--results))))
+    (should (equal "because" (nth 3 (nth 2 monk-testdrive--results))))
+    (should (string-match-p "error: boom" (nth 3 (car monk-testdrive--results))))
+    (with-current-buffer (monk-testdrive--buf)
+      (should (string-match-p "^FAIL fails" (buffer-string)))
+      (goto-char (point-min))
+      (re-search-forward "^FAIL")
+      (should (eq 'monk-testdrive-fail (get-text-property (match-beginning 0) 'face))))))
+
+(ert-deftest monk-test-testdrive-checks-helper ()
+  (should (eq 'PASS (monk-testdrive--checks '(t . "a") '(t . "b"))))
+  (should (equal '(FAIL . "b") (monk-testdrive--checks '(t . "a") '(nil . "b") '(nil . "c")))))
+
+(ert-deftest monk-test-testdrive-full-run-in-batch ()
+  "The whole drive runs headless, cleans up its home, and reports no FAIL.
+The live-notification step may SKIP where the kernel delivers nothing."
+  (let ((home nil)
+        (monk-report-function #'ignore))
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+      (monk-testdrive))
+    (setq home monk-testdrive--home)
+    (should (null home))
+    (let ((fails (seq-filter (lambda (r) (eq (caddr r) 'FAIL)) monk-testdrive--results)))
+      (should (null fails)))
+    (should (>= (cl-count 'PASS monk-testdrive--results :key #'caddr) 18))
+    (with-current-buffer (monk-testdrive--buf)
+      (should (string-match-p "\\`Monk test drive\n" (buffer-string)))
+      (should (string-match-p "^[0-9]+ PASS, 0 FAIL" (buffer-string))))))
+
+(ert-deftest monk-test-tutorial-forms-parse-and-run ()
+  "Every lesson form reads and evaluates against a fresh sandbox."
+  (let ((forms (monk-tutorial-forms)))
+    (should (> (length forms) 20))
+    (should (null (monk-tutorial-check)))
+    (should (null monk-tutorial--home))))
+
+(ert-deftest monk-test-tutorial-lessons-match-doc ()
+  "docs/tutorial.md has the same ten lesson headings as the buffer."
+  (let* ((doc (expand-file-name "../docs/tutorial.md"
+                                (file-name-directory (locate-library "monk-tutorial"))))
+         (headings (lambda (text prefix)
+                     (let (out (start 0))
+                       (while (string-match (concat "^" prefix "\\([0-9]+\\)\\. \\(.*\\)$") text start)
+                         (push (cons (string-to-number (match-string 1 text))
+                                     (string-trim (match-string 2 text)))
+                               out)
+                         (setq start (match-end 0)))
+                       (nreverse out)))))
+    (skip-unless (file-exists-p doc))
+    (should (equal (funcall headings monk-tutorial--text ";;; \\* ")
+                   (funcall headings (with-temp-buffer (insert-file-contents doc) (buffer-string))
+                            "## ")))))
+
+;;;; Reload
+
+(require 'monk-reload)
+
+(ert-deftest monk-test-reload-features-order-and-filter ()
+  "Monk features come back oldest first; the reloader itself is left out."
+  (let ((feats (monk-reload-features)))
+    (should (memq 'monk feats))
+    (should (memq 'monk-ui feats))
+    (should-not (memq 'monk-reload feats))
+    (should-not (memq 'monk-test feats))
+    (should (< (cl-position 'monk feats) (cl-position 'monk-ui feats)))
+    (should (cl-every (lambda (f) (string-prefix-p "monk" (symbol-name f))) feats))))
+
+(ert-deftest monk-test-reload-runs-and-rekeys ()
+  "A reload loads every feature, rebuilds keymaps, and re-installs them in live buffers."
+  (let* ((old-map monk-ui-mode-map)
+         (buf (generate-new-buffer "*monk-reload-test*"))
+         (monk-log-level nil)
+         (monk-watch--delivery 'no))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (monk-ui-mode))
+          (let ((n (let ((inhibit-message t)) (monk-reload))))
+            (should (null monk-reload-last-failures))
+            (should (= n (length (monk-reload-features)))))
+          (should-not (eq old-map monk-ui-mode-map))
+          (with-current-buffer buf
+            (should (eq (current-local-map) monk-ui-mode-map)))
+          (should (null monk-watch--delivery)))
+      (kill-buffer buf))))
+
+(ert-deftest monk-test-reload-restarts-watch ()
+  "An active watch survives a reload with the same policy and mode."
+  (monk-test-with-watch dir (lambda (_m) (monk-file (concat dir "f") :content "x"))
+    (setq monk-watch-mode 'autopilot)
+    (let ((policy (monk-watch-policy monk-watch--current))
+          (inhibit-message t))
+      (monk-reload)
+      (should (monk-watch-active-p))
+      (should (eq policy (monk-watch-policy monk-watch--current)))
+      (should (eq 'autopilot monk-watch-mode)))))
+
+;;;; kqueue-style watching
+
+(ert-deftest monk-test-watch-kqueue-adds-file-watches ()
+  "Where a directory watch misses writes, existing owned files are watched too,
+and a file that appears later is adopted on its directory event."
+  (monk-test-with-tmpdir dir
+    (with-temp-file (concat dir "present") (insert "x"))
+    (let ((monk-log-level nil)
+          (monk-watch-debounce 0.05)
+          (monk-watch-settle 0.0)
+          (monk-report-function #'ignore)
+          (added nil)
+          (m (monk-test-machine)))
+      (unwind-protect
+          (cl-letf (((symbol-function 'file-notify-add-watch)
+                     (lambda (path &rest _) (push path added) (cl-gensym "desc")))
+                    ((symbol-function 'file-notify-rm-watch) #'ignore)
+                    ((symbol-function 'file-notify-valid-p) (lambda (_) t))
+                    ((symbol-value 'file-notify--library) 'kqueue)
+                    ((symbol-value 'monk-watch--delivery) 'yes))
+            (monk-watch-start m (lambda (_m)
+                                  (monk-file (concat dir "present") :content "x")
+                                  (monk-file (concat dir "later") :content "y")))
+            ;; The directory and the existing file; not the absent one.
+            (should (member (directory-file-name dir) (mapcar #'directory-file-name added)))
+            (should (member (concat dir "present") added))
+            (should-not (member (concat dir "later") added))
+            ;; The absent file appears: its create event on the directory adopts it.
+            (with-temp-file (concat dir "later") (insert "y"))
+            (monk-watch--on-event (list 'desc 'created (concat dir "later")))
+            (should (member (concat dir "later") added))
+            (should (assoc (concat dir "later") (monk-watch-watched monk-watch--current))))
+        (monk-watch-stop)))))
+
+(ert-deftest monk-test-watch-inotify-does-not-add-file-watches ()
+  (monk-test-with-tmpdir dir
+    (with-temp-file (concat dir "present") (insert "x"))
+    (let ((monk-log-level nil) (added nil) (m (monk-test-machine)))
+      (unwind-protect
+          (cl-letf (((symbol-function 'file-notify-add-watch)
+                     (lambda (path &rest _) (push path added) (cl-gensym "desc")))
+                    ((symbol-function 'file-notify-rm-watch) #'ignore)
+                    ((symbol-function 'file-notify-valid-p) (lambda (_) t))
+                    ((symbol-value 'file-notify--library) 'inotify)
+                    ((symbol-value 'monk-watch--delivery) 'yes))
+            (monk-watch-start m (lambda (_m) (monk-file (concat dir "present") :content "x")))
+            (should (= 1 (length added)))
+            (should-not (member (concat dir "present") added)))
+        (monk-watch-stop)))))
+
+;;;; fswatch backend
+
+(ert-deftest monk-test-watch-choose-backend ()
+  (cl-letf (((symbol-value 'file-notify--library) 'inotify))
+    (let ((monk-watch-backend 'auto) (system-type 'gnu/linux))
+      (should (eq 'filenotify (monk-watch--choose-backend))))
+    (let ((monk-watch-backend 'auto) (system-type 'darwin))
+      (cl-letf (((symbol-function 'executable-find) (lambda (p &rest _) (equal p "fswatch"))))
+        (should (eq 'fswatch (monk-watch--choose-backend))))
+      (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) nil)))
+        (should (eq 'filenotify (monk-watch--choose-backend)))))
+    (let ((monk-watch-backend nil))
+      (should-not (monk-watch--choose-backend)))
+    (let ((monk-watch-backend 'fswatch))
+      (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) nil)))
+        (should-error (monk-watch--choose-backend) :type 'monk-error))))
+  (cl-letf (((symbol-value 'file-notify--library) nil))
+    (let ((monk-watch-backend 'auto) (system-type 'gnu/linux))
+      (should-not (monk-watch--choose-backend)))
+    (let ((monk-watch-backend 'filenotify))
+      (should-error (monk-watch--choose-backend) :type 'monk-error))))
+
+(ert-deftest monk-test-watch-fswatch-filter-splits-on-nul ()
+  "Paths arrive NUL-separated, possibly split across chunks."
+  (let* ((seen nil)
+         (proc (start-process "monk-test-cat" nil "cat")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'monk-watch--on-event)
+                   (lambda (e) (push (nth 2 e) seen))))
+          (monk-watch--fswatch-filter proc "/a/one\0/a/tw")
+          (should (equal '("/a/one") seen))
+          (monk-watch--fswatch-filter proc "o\0\0/a/three\0")
+          (should (equal '("/a/three" "/a/two" "/a/one") seen)))
+      (delete-process proc))))
+
+(ert-deftest monk-test-watch-fswatch-end-to-end ()
+  "A fake fswatch that prints one path fires an autopilot run through the real process filter."
+  (monk-test-with-tmpdir dir
+    (let* ((bin (concat dir "bin/"))
+           (conf (concat dir "conf"))
+           (fake (concat bin "fswatch"))
+           (monk-log-level nil)
+           (monk-watch-debounce 0.05)
+           (monk-watch-settle 0.0)
+           (monk-watch-mode 'autopilot)
+           (monk-watch-backend 'fswatch)
+           (monk-report-function #'ignore)
+           (m (monk-test-machine)))
+      (make-directory bin)
+      (with-temp-file conf (insert "x"))
+      ;; The fake ignores its arguments, waits a moment, prints the
+      ;; conf path NUL-terminated, then stays alive like fswatch does.
+      (with-temp-file fake
+        (insert "#!/bin/sh\nsleep 0.2\nprintf '%s\\0' " (shell-quote-argument conf) "\nsleep 30\n"))
+      (set-file-modes fake #o755)
+      (let ((exec-path (cons (directory-file-name bin) exec-path)))
+        (unwind-protect
+            (progn
+              (monk-watch-start m (lambda (_m) (monk-file conf :content "x")))
+              (should (eq 'fswatch (monk-watch-backend monk-watch--current)))
+              (should (process-live-p (monk-watch-process monk-watch--current)))
+              (with-temp-file conf (insert "drifted"))
+              (let ((deadline (+ (float-time) 5)))
+                (while (and (< (monk-watch-runs monk-watch--current) 1) (< (float-time) deadline))
+                  (accept-process-output nil 0.05) (sit-for 0.02)))
+              (should (= 1 (monk-watch-runs monk-watch--current)))
+              (should (equal "x" (with-temp-buffer (insert-file-contents conf) (buffer-string)))))
+          (let ((proc (and monk-watch--current (monk-watch-process monk-watch--current))))
+            (monk-watch-stop)
+            (should-not (and proc (process-live-p proc)))))))))
+
+(ert-deftest monk-test-testdrive-focus-from-side-window ()
+  "The tour can take the frame even when a side window is selected.
+That is where the report leaves point, and `delete-other-windows'
+refuses to run from a side window."
+  ;; Split the main area first: `window-main-window' is then a parent,
+  ;; which is what broke the tour on a real frame.
+  (split-window-right)
+  (let ((side (display-buffer (get-buffer-create "*monk-side-test*")
+                              '(display-buffer-in-side-window (side . right)))))
+    (unwind-protect
+        (progn
+          (select-window side)
+          (should-not (window-live-p (window-main-window)))
+          (should (window-parameter (selected-window) 'window-side))
+          (monk-testdrive--focus-monk)
+          (should (= 1 (length (window-list))))
+          (should (equal monk-ui-buffer-name (buffer-name (window-buffer (selected-window))))))
+      (kill-buffer "*monk-side-test*"))))
 
 (provide 'monk-test)
 ;;; monk-test.el ends here

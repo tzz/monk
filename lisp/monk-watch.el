@@ -26,9 +26,19 @@
 ;;
 ;; Local machines use `file-notify-add-watch' on the parent directory
 ;; of each owned path.  A directory watch sees creates, deletes, and
-;; renames, which a file watch misses.  Events map back to the nodes
-;; whose paths match, then to a run restricted to those nodes and
-;; their dependents (`:only').
+;; renames, which a file watch misses.  On kqueue (macOS, BSD) a
+;; directory watch does not see writes to the files inside it, so
+;; every owned path that exists is watched as well; a file created
+;; later is picked up by the directory watch and then watched itself.
+;; Events map back to the nodes whose paths match, then to a run
+;; restricted to those nodes and their dependents (`:only').
+;;
+;; On macOS, `fswatch' (Homebrew) is preferred when installed.  It
+;; uses FSEvents, which is recursive and reports writes, so one process
+;; covers every watched directory, and a file created later needs no
+;; new watch.  It prints one changed path per line; Monk reads that
+;; stream through a process filter and maps paths the same way as
+;; filenotify events.  `monk-watch-backend' picks.
 ;;
 ;; Remote machines have no notification channel over TRAMP, so they
 ;; are polled: every `monk-watch-poll-interval' a dry run finds the
@@ -70,7 +80,29 @@
 (defconst monk-watch-probe-timeout 1.0
   "Seconds `monk-watch-notifications-work-p' waits for its own event.")
 
+(defconst monk-watch-fswatch-program "fswatch"
+  "The fswatch binary.")
+
+(defconst monk-watch-fswatch-args
+  '("--recursive" "--latency" "0.2" "--event" "Created" "--event" "Updated"
+    "--event" "Removed" "--event" "Renamed" "--event" "AttributeModified"
+    "--print0")
+  "Arguments for fswatch.
+Recursive, the events Monk cares about, NUL-separated paths because a
+path can hold a newline.  `--latency' is the FSEvents coalescing
+window, kept below `monk-watch-debounce'.")
+
+(defconst monk-watch-fswatch-excludes '("/\\.git/" "/\\.Trash/" "/Library/Caches/")
+  "Regexps fswatch drops before Monk sees them.  Noise that no policy owns.")
+
 ;;;; Customization
+
+(defcustom monk-watch-backend 'auto
+  "How local filesystem changes are observed.
+`auto' uses fswatch when `monk-watch-fswatch-program' is on the path
+and the system is Darwin, else `filenotify'.  `fswatch' or `filenotify'
+force one.  nil watches nothing locally; remote polling still runs."
+  :type '(choice (const auto) (const fswatch) (const filenotify) (const nil)))
 
 (defcustom monk-watch-mode 'assisted
   "What to do when a watched path changes.
@@ -106,6 +138,9 @@ Each check is a dry run over TRAMP, so keep this in minutes."
   options
   nodes                 ; all compiled nodes
   (descriptors nil)     ; file-notify descriptors for local directories
+  (watched nil)         ; alist of (PATH . DESCRIPTOR) actually watched
+  (backend nil)         ; `fswatch', `filenotify', or nil
+  (process nil)         ; the fswatch process, when that backend runs
   (path-index nil)      ; alist of (EXPANDED-DIR . ((FILE . NODE) ...))
   (pending nil)         ; keys collected since the last reaction
   (pending-reasons nil) ; alist of (KEY . PATH) for the log
@@ -150,24 +185,50 @@ for the event.  Later calls return the cached answer."
     (_ (setq monk-watch--delivery (if (monk-watch--probe directory) 'yes 'no))
        (eq monk-watch--delivery 'yes))))
 
+(defun monk-watch--choose-backend ()
+  "Return the local backend to use now: `fswatch', `filenotify', or nil.
+Decided by the option `monk-watch-backend'."
+  (pcase monk-watch-backend
+    ('auto (cond
+            ((and (eq system-type 'darwin) (executable-find monk-watch-fswatch-program)) 'fswatch)
+            (file-notify--library 'filenotify)
+            (t nil)))
+    ('fswatch (if (executable-find monk-watch-fswatch-program) 'fswatch
+                (signal 'monk-error (list "fswatch is not on the path"))))
+    ('filenotify (if file-notify--library 'filenotify
+                   (signal 'monk-error (list "This Emacs has no file notification support"))))
+    (_ nil)))
+
+(defun monk-watch-file-watch-needed-p ()
+  "Return non-nil when a directory watch misses writes to files inside it.
+True for kqueue: `filenotify.el' watches the named file only, so a
+change to a file's content under a watched directory is not reported."
+  (eq file-notify--library 'kqueue))
+
 (defun monk-watch--probe (directory)
-  "Create a file under DIRECTORY and return non-nil when its event arrives."
+  "Create a file under DIRECTORY and return non-nil when its event arrives.
+The probe does what the watch does: it watches the directory, and on
+kqueue the file too, then writes the file and waits."
   (when file-notify--library
     (let* ((temporary-file-directory (or directory temporary-file-directory))
            (dir (file-name-as-directory (make-temp-file "monk-probe" t)))
+           (file (concat dir "probe"))
            (seen nil)
-           (desc nil))
+           (descs nil))
       (unwind-protect
           (condition-case nil
               (progn
-                (setq desc (file-notify-add-watch dir '(change) (lambda (_) (setq seen t))))
-                (with-temp-file (concat dir "probe") (insert "x"))
+                (with-temp-file file (insert "x"))
+                (push (file-notify-add-watch dir '(change) (lambda (_) (setq seen t))) descs)
+                (when (monk-watch-file-watch-needed-p)
+                  (push (file-notify-add-watch file '(change) (lambda (_) (setq seen t))) descs))
+                (with-temp-file file (insert "y"))
                 (let ((deadline (+ (float-time) monk-watch-probe-timeout)))
                   (while (and (not seen) (< (float-time) deadline))
                     (accept-process-output nil 0.05)))
                 seen)
             (file-notify-error nil))
-        (when desc (file-notify-rm-watch desc))
+        (dolist (d descs) (ignore-errors (file-notify-rm-watch d)))
         (delete-directory dir t)))))
 
 ;;;; Logging
@@ -236,6 +297,7 @@ Only machines without an address are indexed; remote ones poll."
           nil)
          (t
           (dolist (f (cons file rest))
+            (monk-watch--adopt-new-file watch f)
             (dolist (node (monk-watch--nodes-for-file watch f))
               (monk-watch--queue watch (monk-node-key node) f action)))))))))
 
@@ -309,10 +371,62 @@ REASONS is an alist of (KEY . TEXT) for the log."
               (dolist (key drifted)
                 (monk-watch--queue watch key (cdr key) monk-watch-remote-poll-comment)))))))))
 
+;;;; fswatch backend
+
+(defun monk-watch--fswatch-filter (proc chunk)
+  "Split CHUNK from PROC on NUL and feed each path to the event handler.
+A partial path at the end of a chunk waits for the next one."
+  (let ((buffer (concat (or (process-get proc 'monk-partial) "") chunk))
+        (paths nil))
+    (while (string-match "\0" buffer)
+      (push (substring buffer 0 (match-beginning 0)) paths)
+      (setq buffer (substring buffer (match-end 0))))
+    (process-put proc 'monk-partial buffer)
+    (dolist (path (nreverse paths))
+      (unless (string-empty-p path)
+        ;; fswatch says which event only with --event-flags; Monk does
+        ;; not need the kind, the check decides what to do.
+        (monk-watch--on-event (list proc 'changed path))))))
+
+(defun monk-watch--fswatch-sentinel (proc event)
+  "Log the end of PROC with EVENT; a dead watcher is worth noticing."
+  (unless (process-live-p proc)
+    (monk-watch--log "fswatch exited: %s" (string-trim event))))
+
+(defun monk-watch--fswatch-start (watch)
+  "Start one fswatch over every indexed directory of WATCH that exists."
+  (let ((dirs (seq-filter #'file-directory-p (mapcar #'car (monk-watch-path-index watch)))))
+    (when dirs
+      (let ((proc (apply #'start-process "monk-fswatch" nil monk-watch-fswatch-program
+                         (append monk-watch-fswatch-args
+                                 (mapcan (lambda (re) (list "--exclude" re))
+                                         monk-watch-fswatch-excludes)
+                                 dirs))))
+        (set-process-filter proc #'monk-watch--fswatch-filter)
+        (set-process-sentinel proc #'monk-watch--fswatch-sentinel)
+        (set-process-query-on-exit-flag proc nil)
+        (setf (monk-watch-process watch) proc)
+        (dolist (d dirs) (push (cons d proc) (monk-watch-watched watch)))
+        proc))))
+
 ;;;; Start and stop
 
+(defun monk-watch--add-one (watch path)
+  "Add a filenotify watch on PATH to WATCH.  Return the descriptor or nil."
+  (condition-case err
+      (let ((desc (file-notify-add-watch path monk-watch-notify-flags #'monk-watch--on-event)))
+        (push desc (monk-watch-descriptors watch))
+        (push (cons path desc) (monk-watch-watched watch))
+        desc)
+    (file-notify-error
+     (monk-watch--log "cannot watch %s: %s" path (error-message-string err))
+     nil)))
+
 (defun monk-watch--add-watches (watch)
-  "Create filenotify watches for every directory in the index of WATCH."
+  "Create filenotify watches for the index of WATCH.
+Every parent directory that exists is watched.  Where a directory
+watch misses file writes, every owned file that exists is watched
+too."
   (dolist (entry (monk-watch-path-index watch))
     (let ((dir (car entry)))
       (if (not (file-directory-p dir))
@@ -320,11 +434,22 @@ REASONS is an alist of (KEY . TEXT) for the log."
           ;; it is in the index too, so a run will make it, and the
           ;; next start picks it up.
           (monk-watch--log "no watch on %s: directory absent" dir)
-        (condition-case err
-            (push (file-notify-add-watch dir monk-watch-notify-flags #'monk-watch--on-event)
-                  (monk-watch-descriptors watch))
-          (file-notify-error
-           (monk-watch--log "cannot watch %s: %s" dir (error-message-string err))))))))
+        (monk-watch--add-one watch dir)
+        (when (monk-watch-file-watch-needed-p)
+          (dolist (cell (cdr entry))
+            (let ((path (car cell)))
+              (when (and (file-exists-p path) (not (file-directory-p path)))
+                (monk-watch--add-one watch path)))))))))
+
+(defun monk-watch--adopt-new-file (watch file)
+  "On kqueue, add FILE to WATCH when it is an owned path that just appeared."
+  (when (and (eq (monk-watch-backend watch) 'filenotify)
+             (monk-watch-file-watch-needed-p)
+             (file-exists-p file)
+             (not (file-directory-p file))
+             (not (assoc file (monk-watch-watched watch)))
+             (monk-watch--nodes-for-file watch file))
+    (monk-watch--add-one watch file)))
 
 ;;;###autoload
 (defun monk-watch-start (machines policy &rest options)
@@ -334,23 +459,32 @@ machines get filesystem notifications; remote ones are polled every
 `monk-watch-poll-interval' seconds.  Return the watch."
   (when monk-watch--current
     (monk-watch-stop))
-  (let ((local (seq-some #'monk-machine-local-p (if (listp machines) machines (list machines)))))
-    (when (and local (not file-notify--library))
-      (signal 'monk-error (list "This Emacs has no file notification support")))
-    (when (and local (not (monk-watch-notifications-work-p)))
-      (monk-watch--log "warning: file notifications are not delivered here; local drift will not be seen")))
   (let* ((machines (if (listp machines) machines (list machines)))
+         (local (seq-some #'monk-machine-local-p machines))
+         (backend (and local (monk-watch--choose-backend)))
          (nodes (monk--nodes-for machines policy))
          (watch (monk-watch-create :machines machines :policy policy :options options
-                                   :nodes nodes
+                                   :nodes nodes :backend backend
                                    :path-index (monk-watch--build-index nodes))))
+    (when (and local (null backend))
+      (monk-watch--log "warning: no local backend; local drift will not be seen"))
+    (when (and (eq backend 'filenotify) (not (monk-watch-notifications-work-p)))
+      (monk-watch--log "warning: file notifications are not delivered here; local drift will not be seen"))
     (setq monk-watch--current watch)
-    (monk-watch--add-watches watch)
+    (pcase backend
+      ('fswatch (monk-watch--fswatch-start watch))
+      ('filenotify (monk-watch--add-watches watch)))
     (when (seq-remove #'monk-machine-local-p machines)
       (setf (monk-watch-poll-timer watch)
             (run-at-time monk-watch-poll-interval monk-watch-poll-interval #'monk-watch--poll)))
-    (monk-watch--log "started: %d machine(s), %d directories, %d remote polled every %ds, mode %s"
-                     (length machines) (length (monk-watch-descriptors watch))
+    (monk-watch--log "started: %d machine(s), %s, %d remote polled every %ds, mode %s"
+                     (length machines)
+                     (pcase backend
+                       ('fswatch (format "fswatch over %d dir(s)" (length (monk-watch-watched watch))))
+                       ('filenotify (format "%d filenotify watch(es)%s"
+                                            (length (monk-watch-descriptors watch))
+                                            (if (monk-watch-file-watch-needed-p) " (dirs and files, kqueue)" "")))
+                       (_ "no local backend"))
                      (length (seq-remove #'monk-machine-local-p machines))
                      monk-watch-poll-interval monk-watch-mode)
     (run-hook-with-args 'monk-watch-functions 'started (list :watch watch))
@@ -365,6 +499,9 @@ machines get filesystem notifications; remote ones are polled every
       (dolist (desc (monk-watch-descriptors watch))
         (when (file-notify-valid-p desc)
           (file-notify-rm-watch desc)))
+      (when (process-live-p (monk-watch-process watch))
+        (set-process-sentinel (monk-watch-process watch) nil)
+        (delete-process (monk-watch-process watch)))
       (when (monk-watch-debounce-timer watch)
         (cancel-timer (monk-watch-debounce-timer watch)))
       (when (monk-watch-poll-timer watch)
@@ -386,8 +523,9 @@ machines get filesystem notifications; remote ones are polled every
   "Return a one-line description of the active watch, or nil."
   (when monk-watch--current
     (let ((w monk-watch--current))
-      (format "%s, %d dir(s), %d event(s), %d run(s), up %s"
-              monk-watch-mode (length (monk-watch-descriptors w))
+      (format "%s, %s, %d dir(s), %d event(s), %d run(s), up %s"
+              monk-watch-mode (or (monk-watch-backend w) "no local backend")
+              (length (monk-watch-watched w))
               (monk-watch-events w) (monk-watch-runs w)
               (format-seconds "%hh%mm%ss" (float-time (time-since (monk-watch-started w))))))))
 

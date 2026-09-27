@@ -146,6 +146,7 @@ failed etcd call is logged and does not fail the run."
   "Send LINE to journald when `systemd-cat' is on the path."
   (when (executable-find monk-agent-journal-program)
     (with-temp-buffer
+      (setq default-directory (file-name-as-directory (expand-file-name temporary-file-directory)))
       (insert line)
       (call-process-region (point-min) (point-max) monk-agent-journal-program
                            nil nil nil "-t" monk-agent-journal-identifier))))
@@ -336,9 +337,10 @@ endpoint, and common keys.  Call inside a policy."
 
 (defun monk-agent--service-active-p ()
   "Return non-nil when monk-agent.service is active, per systemctl."
-  (and (executable-find "systemctl")
-       (zerop (call-process "systemctl" nil nil nil "is-active" "--quiet"
-                            monk-agent-service-name))))
+  (let ((default-directory (file-name-as-directory (expand-file-name temporary-file-directory))))
+    (and (executable-find "systemctl")
+         (zerop (call-process "systemctl" nil nil nil "is-active" "--quiet"
+                              monk-agent-service-name)))))
 
 (defun monk-agent-handle (request)
   "Handle REQUEST, an alist from one JSON line.  Write the response to stdout."

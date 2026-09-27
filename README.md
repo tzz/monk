@@ -176,7 +176,7 @@ A host with no `:address` is the local machine. `self` selects the host whose na
 
 `monk-watch.el` keeps a policy enforced between runs. `(monk-watch-start MACHINES POLICY)` compiles the policy, asks every resource which paths it owns through `monk-resource-paths`, and waits for changes to them.
 
-Local machines use `filenotify.el`. Monk watches the parent directory of each owned path, because a directory watch sees creates, deletes, and renames, which a file watch misses. An event maps to the resources that own the path, and to the resources that require or watch those, transitively. Monk then runs only that set with `:only`; the rest of the policy compiles so requisites resolve, and is skipped. A burst of events within `monk-watch-debounce` seconds makes one run. Events during a run and for `monk-watch-settle` seconds after are dropped, because Monk's own repairs also touch watched paths.
+Local machines have two backends, chosen by `monk-watch-backend`. On macOS with `fswatch` installed (`brew install fswatch`), Monk runs one `fswatch --recursive --print0` over every parent directory of an owned path and reads the NUL-separated paths through a process filter. FSEvents is recursive and reports writes, so one process covers everything and a file created later needs no new watch. Elsewhere, and on macOS without `fswatch`, Monk uses `filenotify.el` on the parent directory of each owned path, because a directory watch sees creates, deletes, and renames, which a file watch misses. On kqueue a directory watch does not report writes to the files inside it, so Monk also watches every owned file that exists and adopts a file the moment its directory reports it created. `fswatch` is the better choice on a Mac: kqueue costs one file descriptor per watched file. An event maps to the resources that own the path, and to the resources that require or watch those, transitively. Monk then runs only that set with `:only`; the rest of the policy compiles so requisites resolve, and is skipped. A burst of events within `monk-watch-debounce` seconds makes one run. Events during a run and for `monk-watch-settle` seconds after are dropped, because Monk's own repairs also touch watched paths.
 
 Remote machines have no notification channel over TRAMP. Monk polls them: every `monk-watch-poll-interval` seconds, default 300, a dry run finds resources that would change, and those count as drift.
 
@@ -241,6 +241,12 @@ A set resource, one that manages several members, returns `:degree` in its chang
 
 `monk-gather-facts` runs the probes in `monk-fact-probes`. The default probes give `kernel`, `arch`, `nodename`, `hostname`, `os-family`, `distribution`, `distribution-release`, `distribution-version`, `home`, and `user`. Register a probe with `monk-register-fact-probe`.
 
+## Test drive, tour, tutorial
+
+`M-x monk-testdrive` runs every feature against a throwaway home and reports in `*monk-testdrive*`: converge, plan and apply, requisites, flapping, drift watching, the agent ledger and query handler, the report buffers. Every check is done by code that reads files, run results, and the text and properties of the `*monk*` buffers; nothing asks you anything while it runs. `C-u` runs one section. `M-x monk-testdrive-tour` is for your eyes: it sets up one thing at a time with nothing running underneath and asks whether it looked right, for the plan header and bars, the diff in the detail buffer, the apply comparison, the flapping badge, the watch badge, and the text fallback.
+
+`M-x monk-tutorial` opens ten lessons beside a sandbox home. `C-c C-c` runs the form at point against the sandbox and shows the result in `*monk*`. The lessons cover the same ground as the drive, one feature at a time, and end with writing a resource of your own. `docs/tutorial.md` is the same content as prose. The test suite evaluates every lesson form, so the lessons cannot rot.
+
 ## Development
 
 ```sh
@@ -248,6 +254,8 @@ make compile   # byte-compile with warnings as errors
 make test      # run ERT tests
 make check     # checkdoc
 ```
+
+`M-x monk-reload` reloads every loaded `monk-*` library from source in first-load order and fixes what a plain `load` leaves behind: keymap variables are unbound first and re-installed in live `*monk*` and tutorial buffers, an active watch is stopped and started again on the new code with the same policy and mode, the image cache is cleared, and the notification probe is reset. EIEIO classes redefine in place. A run already stored in `*monk*` keeps its old struct layout; the summary line says so, and rerunning refreshes it. `monk-reload-last-failures` holds any file that did not load.
 
 Tests run against a temporary directory on the local host. Package, sudo, and bridge resources are tested through their pure helpers and a faked exec layer. Cross-machine tests use several local machine objects with different names.
 

@@ -404,11 +404,15 @@ SUDO, return the empty string."
 
 (cl-defmethod monk-machine-path ((m monk-machine) path &optional sudo)
   "Return PATH as seen from the controller for machine M.
-Expand `~' on the target, not on the controller."
+Expand `~' on the target, not on the controller.  On the local host
+without SUDO, a leading `~/' expands to the home fact when it is set,
+so a policy can run against another home; otherwise to $HOME."
   (let ((prefix (monk-machine-remote-prefix m sudo)))
-    (if (string-empty-p prefix)
-        (expand-file-name path)
-      (concat prefix path))))
+    (cond
+     ((not (string-empty-p prefix)) (concat prefix path))
+     ((and (string-prefix-p "~/" path) (monk-machine-fact m 'home))
+      (expand-file-name (substring path 2) (monk-machine-fact m 'home)))
+     (t (expand-file-name path)))))
 
 (defun monk-machine-local-path (full)
   "Return FULL without its TRAMP prefix, as the target machine sees it."
@@ -421,7 +425,9 @@ Expand `~' on the target, not on the controller."
 When SUDO is non-nil, root it in the home of root."
   (let ((prefix (monk-machine-remote-prefix m sudo)))
     (if (string-empty-p prefix)
-        (expand-file-name "~/")
+        ;; The home fact, when known, beats $HOME: a test drive or an
+        ;; agent may run the local machine under a different home.
+        (file-name-as-directory (or (monk-machine-fact m 'home) (expand-file-name "~")))
       (concat prefix "~/"))))
 
 (cl-defmethod monk-machine-expand ((m monk-machine) path &optional sudo)
@@ -482,9 +488,15 @@ Signal `monk-exec-error' on non-zero exit.")
           (:input (setq input value))
           (:directory (setq directory value))
           (_ (signal 'monk-exec-error (list "Unknown keyword" key))))))
-    (let ((default-directory (if directory
-                                 (monk-machine-path m (file-name-as-directory directory) sudo)
-                               (monk-machine-default-directory m sudo)))
+    (let ((default-directory (cond
+                              (directory
+                               (monk-machine-path m (file-name-as-directory directory) sudo))
+                              ;; A local command needs a directory that
+                              ;; exists; the machine's home may not yet.
+                              ((and (monk-machine-local-p m) (not sudo)
+                                    (not (file-directory-p (monk-machine-default-directory m))))
+                               (file-name-as-directory (expand-file-name temporary-file-directory)))
+                              (t (monk-machine-default-directory m sudo))))
           (process-file-side-effects t))
       (monk-log 'debug "%s: exec %s %s" (oref m name) program
                 (mapconcat #'shell-quote-argument args " "))
@@ -1162,7 +1174,15 @@ resolves to kept reads as kept."
 (defun monk--run-nodes (machines nodes dry-run max-passes policy options)
   "Run NODES for MACHINES until nothing changes.  Return a `monk-run'.
 POLICY and OPTIONS are recorded on the run so `monk-apply' can repeat it."
-  (let ((run (monk-run-create :machines machines :dry-run dry-run :passes 0
+  ;; An abbreviated `default-directory' such as ~/x is re-expanded with
+  ;; $HOME at each file primitive.  A caller that rebinds HOME for the
+  ;; run, as the test drive and the agent do, then points every
+  ;; relative operation at a directory that does not exist.  Expand it
+  ;; once now, while $HOME still means what the caller meant.
+  (let ((default-directory (if (file-remote-p default-directory)
+                               default-directory
+                             (file-name-as-directory (expand-file-name default-directory))))
+        (run (monk-run-create :machines machines :dry-run dry-run :passes 0
                               :policy policy
                               ;; The plan is a link, not an option to repeat.
                               :options (let ((o (copy-sequence options)))

@@ -89,7 +89,12 @@ When SUDO is non-nil, write as root.")
 (defun monk--unified-diff (old new label)
   "Return a unified diff between strings OLD and NEW labeled LABEL."
   (let ((old-file (make-temp-file "monk-old"))
-        (new-file (make-temp-file "monk-new")))
+        (new-file (make-temp-file "monk-new"))
+        ;; `call-process' needs a directory that exists on the controller.
+        ;; The caller's `default-directory' can be a remote path or a `~'
+        ;; that HOME no longer resolves; the temp dir always exists.
+        (default-directory (file-name-as-directory
+                            (expand-file-name temporary-file-directory))))
     (unwind-protect
         (progn
           (with-temp-file old-file (insert (or old "")))
