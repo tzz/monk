@@ -643,62 +643,70 @@ This is the Salt execution model.  Only dependents skip."
                                    :output "jq installed\ncurl installed\nnope installed\n"))))
       (should-not (monk-check r m)))))
 
-(defun monk-test-brew-info-json (&rest formulae)
-  "Return brew info --json=v2 text for FORMULAE, each (NAME FULL ALIASES)."
+(defun monk-test-brew-info-json (formulae &optional casks)
+  "Return brew info --json=v2 text.
+FORMULAE are (NAME FULL ALIASES), CASKS are (TOKEN FULL OLD-TOKENS)."
   (json-serialize
    (list :formulae
          (vconcat (mapcar (lambda (f)
                             (list :name (nth 0 f) :full_name (nth 1 f)
                                   :aliases (vconcat (nth 2 f)) :oldnames []))
                           formulae))
-         :casks [])))
+         :casks
+         (vconcat (mapcar (lambda (c)
+                            (list :token (nth 0 c) :full_token (nth 1 c)
+                                  :old_tokens (vconcat (nth 2 c))))
+                          casks)))))
+
+(defun monk-test-brew-fake-info (formulae &optional casks)
+  "Return a fake `monk-exec' that answers brew info --installed from FORMULAE and CASKS."
+  (lambda (_m _p &rest args)
+    (should (equal '("info" "--json=v2" "--installed") args))
+    (monk-exec-create :command args :exit-code 0
+                      :output (monk-test-brew-info-json formulae casks))))
 
 (ert-deftest monk-test-brew-check-handles-tapped-names ()
   (let ((m (monk-test-machine))
         (r (monk-brew-resource :name "b" :packages '("jq" "DimitarPetrov/stegify/stegify"))))
-    (cl-letf (((symbol-function 'monk-exec-lines)
-               (lambda (&rest _) '("jq" "stegify"))))
+    (cl-letf (((symbol-function 'monk-exec)
+               (monk-test-brew-fake-info '(("jq" "jq" ()) ("stegify" "dimitarpetrov/stegify/stegify" ())))))
       (should-not (monk-check r m)))
-    (cl-letf (((symbol-function 'monk-exec-lines)
-               (lambda (&rest _) '("jq")))
-              ((symbol-function 'monk-exec)
-               (lambda (_m _p &rest args)
-                 (monk-exec-create :command args :exit-code 0
-                                   :output (monk-test-brew-info-json
-                                            '("stegify" "dimitarpetrov/stegify/stegify" ()))))))
+    (cl-letf (((symbol-function 'monk-exec)
+               (monk-test-brew-fake-info '(("jq" "jq" ())))))
       (should (equal '(:install ("DimitarPetrov/stegify/stegify") :degree 0.5)
                      (monk-check r m))))))
 
-(ert-deftest monk-test-brew-check-resolves-aliases ()
-  "rg lists as ripgrep: an installed alias is not missing.
-Found live: `brew install rg' on every pass reported flapping."
+(ert-deftest monk-test-brew-check-resolves-aliases-and-casks ()
+  "rg is ripgrep, gpg1 is gnupg@1.4, swiftbar is a cask: none is missing.
+Found live: all three installed on every pass and the run flapped."
   (let ((m (monk-test-machine))
-        (r (monk-brew-resource :name "b" :packages '("rg" "jq" "gone")))
-        (info-calls nil))
-    (cl-letf (((symbol-function 'monk-exec-lines)
-               (lambda (&rest _) '("ripgrep" "jq")))
-              ((symbol-function 'monk-exec)
+        (r (monk-brew-resource :name "b" :packages '("rg" "gpg1" "swiftbar" "jq" "gone"))))
+    (cl-letf (((symbol-function 'monk-exec)
+               (monk-test-brew-fake-info '(("ripgrep" "ripgrep" ("rg"))
+                                           ("gnupg@1.4" "gnupg@1.4" ("gpg1"))
+                                           ("jq" "jq" ()))
+                                         '(("swiftbar" "swiftbar" ())))))
+      (let ((changes (monk-check r m)))
+        (should (equal '("gone") (plist-get changes :install)))
+        (should (< (abs (- (plist-get changes :degree) 0.8)) 1e-9))))
+    ;; the cask resource reads the same list
+    (let ((c (monk-brew-resource :name "c" :packages '("swiftbar" "nocask") :cask t)))
+      (cl-letf (((symbol-function 'monk-exec)
+                 (monk-test-brew-fake-info nil '(("swiftbar" "swiftbar" ())))))
+        (should (equal '("nocask") (plist-get (monk-check c m) :install)))))))
+
+(ert-deftest monk-test-brew-check-falls-back-to-list ()
+  "When brew info fails, brew list decides, without aliases."
+  (let ((m (monk-test-machine))
+        (r (monk-brew-resource :name "b" :packages '("rg" "jq")))
+        (monk-log-level nil))
+    (cl-letf (((symbol-function 'monk-exec)
                (lambda (_m _p &rest args)
-                 (push args info-calls)
-                 (monk-exec-create :command args :exit-code 0
-                                   :output (monk-test-brew-info-json
-                                            '("ripgrep" "ripgrep" ("rg")))))))
-      (should (equal '(:install ("gone") :degree (/ 2.0 3))
-                     (let ((c (monk-check r m)))
-                       (list :install (plist-get c :install)
-                             :degree (if (< (abs (- (plist-get c :degree) (/ 2.0 3))) 1e-9)
-                                         '(/ 2.0 3)
-                                       (plist-get c :degree))))))
-      ;; One info call, only for the names that looked missing.
-      (should (= 1 (length info-calls)))
-      (should (equal '("info" "--json=v2" "--formula" "rg" "gone") (car info-calls))))
-    ;; brew info failing (unknown name) falls back to the literal name.
-    (cl-letf (((symbol-function 'monk-exec-lines)
-               (lambda (&rest _) '("jq")))
-              ((symbol-function 'monk-exec)
+                 (monk-exec-create :command args :exit-code 1 :output "Error: boom")))
+              ((symbol-function 'monk-exec-lines)
                (lambda (_m _p &rest args)
-                 (monk-exec-create :command args :exit-code 1 :output "Error: No formulae"))))
-      (should (equal '("rg" "gone") (plist-get (monk-check r m) :install))))))
+                 (if (member "--formula" args) '("ripgrep" "jq") nil))))
+      (should (equal '("rg") (plist-get (monk-check r m) :install))))))
 
 (ert-deftest monk-test-fact-probe-order ()
   "A new probe runs after the existing ones; re-registering keeps the slot."
@@ -2497,6 +2505,38 @@ refuses to run from a side window."
       (should (string-match-p "kernel +\"Linux\"" verbose))
       (should-not (string-match-p "classes: " terse)))))
 
+(ert-deftest monk-test-ui-apply-from-detail-buffer ()
+  "a in a plan's detail buffer applies the plan and redraws the detail."
+  (require 'monk-ui)
+  (monk-test-with-tmpdir dir
+    (let* ((policy (lambda (_m) (monk-directory (concat dir "d"))))
+           (m (monk-test-machine))
+           (monk-log-level nil)
+           (plan (monk-plan m policy))
+           (detail (format monk-ui-detail-buffer-format "testbox")))
+      (with-current-buffer (monk-ui--buffer)
+        (monk-ui-mode)
+        (setq monk-ui--run plan)
+        (monk-ui-refresh)
+        (save-window-excursion (monk-ui-show-machine "testbox")))
+      (with-current-buffer detail
+        (should (eq (key-binding "a") 'monk-ui-apply))
+        (should (eq monk-ui--run plan))
+        (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+          (save-window-excursion (monk-ui-apply))))
+      (should (file-directory-p (concat dir "d")))
+      ;; *monk* now shows the apply, and the detail buffer followed it
+      (with-current-buffer (monk-ui--buffer)
+        (should-not (monk-run-dry-run monk-ui--run))
+        (should (eq plan (monk-run-plan monk-ui--run))))
+      (with-current-buffer detail
+        (should-not (monk-run-dry-run monk-ui--run))
+        (goto-char (point-min))
+        (should (search-forward " APPLY " nil t))
+        (should (search-forward "repaired" nil t)))
+      (kill-buffer detail)
+      (kill-buffer (monk-ui--buffer)))))
+
 ;;;; Origins and jump to source
 
 (ert-deftest monk-test-resource-origin-from-file ()
@@ -2666,7 +2706,7 @@ refuses to run from a side window."
           (monk-ui-show-machine "testbox"))
         (with-current-buffer (format monk-ui-detail-buffer-format "testbox")
           (should (derived-mode-p 'monk-ui-detail-mode))
-          (should (eq (key-binding "q") 'quit-window))
+          (should (eq (key-binding "q") 'monk-ui-quit))
           (goto-char (point-min))
           (should (search-forward "testbox: " nil t))
           (should (search-forward "\"Linux\"" nil t))
@@ -2697,7 +2737,7 @@ refuses to run from a side window."
       (monk-ui-query "'darwin' in classes && facts.arch == 'arm64'" machines))
     (with-current-buffer monk-ui-query-buffer-name
       (should (derived-mode-p 'monk-ui-query-mode))
-      (should (eq (key-binding "q") 'quit-window))
+      (should (eq (key-binding "q") 'monk-ui-quit))
       (goto-char (point-min))
       (should (search-forward "1 of 3 machines match" nil t))
       (should (search-forward "✓ foxy" nil t))

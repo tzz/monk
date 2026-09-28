@@ -572,6 +572,9 @@ SVG when possible, else a Braille or ASCII glyph."
 (defvar monk-ui--live-pass 0
   "Pass number of the run in progress.")
 
+(defvar-local monk-ui--detail-machine nil
+  "Machine name a detail buffer shows, so a rerun can redraw it.")
+
 (defvar-local monk-ui--run nil
   "The run this report buffer shows.")
 
@@ -643,8 +646,16 @@ merged results of finished passes."
 
 ;;;; Report buffer
 
+(defun monk-ui-quit ()
+  "Bury this Monk buffer.
+The window shows its previous buffer again, or closes when it was
+made for this one.  The buffer stays, so the next report reuses it."
+  (interactive)
+  (quit-window))
+
 (defvar monk-ui-mode-map
   (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "q") #'monk-ui-quit)
     (define-key map (kbd "RET") #'monk-ui-show-machine)
     (define-key map (kbd "d") #'monk-ui-show-machine)
     (define-key map (kbd "g") #'monk-ui-rerun)
@@ -655,11 +666,12 @@ merged results of finished passes."
     (define-key map (kbd "W") #'monk-ui-toggle-watch-mode)
     (define-key map (kbd "i") #'monk-ui-inspect-machine)
     (define-key map (kbd "/") #'monk-ui-query)
+    (define-key map (kbd "h") #'monk-ui-history)
     (define-key map (kbd ".") #'monk-ui-find-definition)
     (define-key map (kbd "M-.") #'monk-ui-find-definition)
     (define-key map (kbd "?") #'monk-ui-help)
     map)
-  "Keymap for `monk-ui-mode'.  `q' comes from `tabulated-list-mode'.")
+  "Keymap for `monk-ui-mode'.")
 
 (defun monk-ui--format ()
   "Return the `tabulated-list-format' for the run in this buffer.
@@ -697,7 +709,7 @@ a plan gains a Plan column."
   "Show the keys of the report buffer."
   (interactive)
   (message "%s" (substitute-command-keys
-                 "\\[monk-ui-show-machine] detail  \\[monk-ui-inspect-machine] facts  \\[monk-ui-find-definition] source  \\[monk-ui-query] query  \\[monk-ui-apply] apply plan  \\[monk-ui-show-plan] show plan  \\[monk-ui-show-watch-log] watch log  \\[monk-ui-toggle-watch-mode] watch mode  \\[monk-ui-toggle-style] svg/text  \\[monk-ui-rerun] rerun (C-u: redraw only)  \\[quit-window] quit")))
+                 "\\[monk-ui-show-machine] detail  \\[monk-ui-inspect-machine] facts  \\[monk-ui-find-definition] source  \\[monk-ui-query] query  \\[monk-ui-history] history  \\[monk-ui-apply] apply plan  \\[monk-ui-show-plan] show plan  \\[monk-ui-show-watch-log] watch log  \\[monk-ui-toggle-watch-mode] watch mode  \\[monk-ui-toggle-style] svg/text  \\[monk-ui-rerun] rerun (C-u: redraw only)  \\[monk-ui-quit] quit")))
 
 (declare-function monk-watch-status "monk-watch")
 (declare-function monk-watch-toggle-mode "monk-watch")
@@ -887,7 +899,7 @@ only redraw the buffer from the stored run."
            (options (copy-sequence (monk-run-options run))))
       (when (monk-run-plan run)
         (setq options (plist-put options :plan (monk-run-plan run))))
-      (monk-run-report
+      (monk-ui--show-follow-up
        (apply #'monk-orchestrate (monk-run-machines run) (monk-run-policy run)
               :dry-run (monk-run-dry-run run) options))))))
 
@@ -1085,12 +1097,23 @@ the prefix argument, show the file in another window.  `M-,' returns."
 (defvar monk-ui-detail-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
+    (define-key map (kbd "q") #'monk-ui-quit)
     (define-key map (kbd "TAB") #'monk-ui-toggle-fold)
     (define-key map (kbd "<tab>") #'monk-ui-toggle-fold)
     (define-key map (kbd ".") #'monk-ui-find-definition)
     (define-key map (kbd "M-.") #'monk-ui-find-definition)
+    (define-key map (kbd "a") #'monk-ui-apply)
+    (define-key map (kbd "g") #'monk-ui-rerun)
+    (define-key map (kbd "p") #'monk-ui-show-plan)
+    (define-key map (kbd "?") #'monk-ui-detail-help)
     map)
-  "Keymap for `monk-ui-detail-mode'.  `q' comes from `special-mode'.")
+  "Keymap for `monk-ui-detail-mode'.")
+
+(defun monk-ui-detail-help ()
+  "Show the keys of a detail buffer."
+  (interactive)
+  (message "%s" (substitute-command-keys
+                 "\\[monk-ui-toggle-fold] fold  \\[monk-ui-find-definition] source  \\[monk-ui-apply] apply plan  \\[monk-ui-rerun] rerun  \\[monk-ui-show-plan] show plan  \\[monk-ui-quit] quit")))
 
 (define-derived-mode monk-ui-detail-mode special-mode "Monk-Detail"
   "Per-machine results, or the machine inspector.
@@ -1221,6 +1244,7 @@ GATHER passes to `monk-cell-matches'."
 (defvar monk-ui-query-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
+    (define-key map (kbd "q") #'monk-ui-quit)
     (define-key map (kbd "e") #'monk-ui-query-edit)
     (define-key map (kbd "g") #'monk-ui-query-gather)
     (define-key map (kbd "TAB") #'monk-ui-toggle-fold)
@@ -1280,6 +1304,10 @@ In an apply with a plan, results that differ from the plan come first."
       (let ((inhibit-read-only t))
         (erase-buffer)
         (monk-ui-detail-mode)
+        ;; The detail buffer knows its run, so a, g, and p work here
+        ;; as they do in *monk*.
+        (setq monk-ui--run run
+              monk-ui--detail-machine name)
         (insert (propertize (if (and run (monk-run-dry-run run)) " PLAN " " APPLY ")
                             'face (if (and run (monk-run-dry-run run))
                                       'monk-ui-plan-badge 'monk-ui-apply-badge))
@@ -1352,7 +1380,198 @@ apply report replaces the plan in this buffer and compares against it."
              (format "Apply %d change%s on %s%s? "
                      would (if (= would 1) "" "s") names
                      (if (> failed 0) (format " (%d failed in the plan)" failed) "")))
-        (monk-run-report (monk-apply plan))))))
+        (monk-ui--show-follow-up (monk-apply plan))))))
+
+(defun monk-ui--show-follow-up (run)
+  "Report RUN, then redraw a detail buffer that asked for it.
+From `*monk*' the report replaces the buffer.  From a detail buffer
+the report goes to `*monk*' as usual and the detail buffer shows the
+same machine in the new run, so the eye stays where it was."
+  (let ((machine monk-ui--detail-machine))
+    (monk-run-report run)
+    (when machine
+      ;; In batch the report is text; fill *monk* anyway so the detail
+      ;; buffer reads the new run from it.
+      (with-current-buffer (monk-ui-show run)
+        (monk-ui-show-machine machine)))))
+
+;;;; History
+
+(defconst monk-ui-history-buffer-name "*monk-history*"
+  "Buffer that lists past runs.")
+
+(defconst monk-ui-history-limit 200
+  "How many runs the history list shows at most.")
+
+(declare-function monk-history-runs "monk-history")
+(declare-function monk-history-results "monk-history")
+(declare-function monk-history-repairs "monk-history")
+(declare-function monk-history-run "monk-history")
+(declare-function monk-history-run-count "monk-history")
+(declare-function monk-history-path "monk-history")
+
+(defvar-local monk-ui--history-filters nil
+  "Filters the history buffer was built with.")
+
+(defvar monk-ui-history-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "q") #'monk-ui-quit)
+    (define-key map (kbd "RET") #'monk-ui-history-open-run)
+    (define-key map (kbd "r") #'monk-ui-history-resource)
+    (define-key map (kbd "c") #'monk-ui-history-changes)
+    (define-key map (kbd "f") #'monk-ui-history-filter-host)
+    (define-key map (kbd "g") #'monk-ui-history-refresh)
+    (define-key map (kbd "?") #'monk-ui-history-help)
+    map)
+  "Keymap for `monk-ui-history-mode'.")
+
+(define-derived-mode monk-ui-history-mode tabulated-list-mode "Monk-History"
+  "Past Monk runs, newest first.
+\\{monk-ui-history-mode-map}"
+  (setq tabulated-list-format
+        [("Started" 20 t) ("Kind" 6 t) ("Hosts" 18 t) ("Kept" 5 nil :right-align t)
+         ("Changed" 8 nil :right-align t) ("Failed" 7 nil :right-align t)
+         ("Skipped" 8 nil :right-align t) ("Passes" 7 nil :right-align t) ("Note" 20 nil)]
+        tabulated-list-padding 1)
+  (tabulated-list-init-header))
+
+(defun monk-ui-history-help ()
+  "Show the keys of the history buffer."
+  (interactive)
+  (message "%s" (substitute-command-keys
+                 "\\[monk-ui-history-open-run] open run  \\[monk-ui-history-changes] changes in run  \\[monk-ui-history-resource] resource timeline  \\[monk-ui-history-filter-host] filter host  \\[monk-ui-history-refresh] refresh  \\[monk-ui-quit] quit")))
+
+(defun monk-ui--history-entry (row)
+  "Return a `tabulated-list' entry for history ROW."
+  (let* ((get (lambda (k) (alist-get k row)))
+         (dry (eq 1 (funcall get 'dry_run)))
+         (changed (+ (or (funcall get 'repaired) 0) (or (funcall get 'would_repair) 0)))
+         (failed (+ (or (funcall get 'failed) 0) (or (funcall get 'partial) 0)))
+         (note (cond ((funcall get 'flapping)
+                      (propertize (concat "flapping " (funcall get 'flapping)) 'face 'monk-ui-partial))
+                     ((funcall get 'reasons)
+                      (propertize "watch" 'face 'monk-ui-watch))
+                     ((funcall get 'plan_id)
+                      (propertize "from plan" 'face 'monk-ui-as-planned))
+                     (t ""))))
+    (list (funcall get 'id)
+          (vector (replace-regexp-in-string "T" " " (substring (funcall get 'started) 0 19))
+                  (if dry
+                      (propertize "plan" 'face 'monk-ui-plan-badge)
+                    (propertize "apply" 'face 'monk-ui-apply-badge))
+                  (propertize (funcall get 'hosts) 'face 'monk-ui-machine)
+                  (number-to-string (or (funcall get 'kept) 0))
+                  (propertize (number-to-string changed)
+                              'face (if (> changed 0)
+                                        (if dry 'monk-ui-would-repair 'monk-ui-repaired)
+                                      'default))
+                  (propertize (number-to-string failed)
+                              'face (if (> failed 0) 'monk-ui-failed 'default))
+                  (number-to-string (or (funcall get 'skipped) 0))
+                  (number-to-string (or (funcall get 'passes) 0))
+                  note))))
+
+(defun monk-ui-history (&rest filters)
+  "Show past runs in `monk-ui-history-buffer-name'.
+FILTERS as for `monk-history-runs'.  Interactively, show everything."
+  (interactive)
+  (require 'monk-history)
+  (let ((buffer (get-buffer-create monk-ui-history-buffer-name)))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'monk-ui-history-mode)
+        (monk-ui-history-mode))
+      (setq monk-ui--history-filters filters)
+      (monk-ui-history-refresh))
+    (pop-to-buffer buffer)))
+
+(defun monk-ui-history-refresh ()
+  "Reread the history list from the database."
+  (interactive)
+  (let* ((filters monk-ui--history-filters)
+         (rows (apply #'monk-history-runs :limit monk-ui-history-limit filters))
+         (total (apply #'monk-history-run-count filters)))
+    (setq tabulated-list-entries (mapcar #'monk-ui--history-entry rows))
+    (tabulated-list-print t)
+    (setq header-line-format
+          (concat (propertize " HISTORY " 'face 'monk-ui-apply-badge)
+                  (propertize (format " %d run%s%s in %s"
+                                      total (if (= total 1) "" "s")
+                                      (if (plist-get filters :host)
+                                          (format " on %s" (plist-get filters :host))
+                                        "")
+                                      (abbreviate-file-name (monk-history-path)))
+                              'face 'monk-ui-header)))))
+
+(defun monk-ui-history-filter-host (host)
+  "Show only runs that include HOST.  Empty HOST shows all."
+  (interactive
+   (list (completing-read "Host (empty for all): "
+                          (delete-dups
+                           (mapcan (lambda (row) (split-string (alist-get 'hosts row) " " t))
+                                   (monk-history-runs :limit monk-ui-history-limit))))))
+  (setq monk-ui--history-filters
+        (if (string-empty-p host) nil (list :host host)))
+  (monk-ui-history-refresh))
+
+(defun monk-ui-history-open-run ()
+  "Open the run at point in the report view."
+  (interactive)
+  (let* ((id (or (tabulated-list-get-id) (user-error "No run at point")))
+         (run (or (monk-history-run id) (user-error "Run %s is gone" id)))
+         (buffer (get-buffer-create (format monk-ui-detail-buffer-format id))))
+    (with-current-buffer buffer
+      (monk-ui-mode)
+      (setq monk-ui--run run)
+      (monk-ui-refresh))
+    (pop-to-buffer buffer)))
+
+(defun monk-ui-history-changes ()
+  "List what changed in the run at point."
+  (interactive)
+  (let* ((id (or (tabulated-list-get-id) (user-error "No run at point")))
+         (rows (monk-history-results :run id :changed t)))
+    (monk-ui--history-results-buffer (format "changes in %s" id) rows)))
+
+(defun monk-ui-history-resource (host name)
+  "Show every time resource NAME on HOST changed, newest first.
+Interactively, complete over resources seen in history."
+  (interactive
+   (let* ((rows (monk-history-results :changed t :limit 2000))
+          (keys (delete-dups (mapcar (lambda (r) (format "%s %s" (alist-get 'host r) (alist-get 'name r)))
+                                     rows)))
+          (choice (completing-read "Host and resource: " keys nil t)))
+     (split-string choice " " t nil)))
+  (let ((name (if (listp name) (string-join name " ") name)))
+    (monk-ui--history-results-buffer
+     (format "%s on %s" name host)
+     (monk-history-repairs host name :limit 500))))
+
+(defun monk-ui--history-results-buffer (title rows)
+  "Show history result ROWS under TITLE in a detail buffer."
+  (let ((buffer (get-buffer-create (format monk-ui-detail-buffer-format title))))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (monk-ui-detail-mode)
+        (insert (propertize " HISTORY " 'face 'monk-ui-apply-badge)
+                (propertize (format " %s: %d change%s\n" title (length rows)
+                                    (if (= 1 (length rows)) "" "s"))
+                            'face 'monk-ui-header))
+        (insert (propertize "\n" 'face 'monk-ui-separator))
+        (if (null rows)
+            (insert (propertize "\n  nothing changed\n" 'face 'monk-ui-skipped))
+          (dolist (row rows)
+            (let ((result (monk-history-result-to-result row)))
+              (insert (propertize
+                       (format "%s  " (replace-regexp-in-string "T" " " (substring (alist-get 'started row) 0 19)))
+                       'face 'monk-ui-skipped))
+              (when (eq 1 (alist-get 'dry_run row))
+                (insert (propertize " plan " 'face 'monk-ui-plan-badge) " "))
+              (monk-ui--insert-result result))))
+        (goto-char (point-min))))
+    (pop-to-buffer buffer)))
+
+(declare-function monk-history-result-to-result "monk-history")
 
 ;;;; Progress hook and report entry
 

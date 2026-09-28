@@ -49,6 +49,9 @@
 ;; The endpoint speaks one JSON object per line.  Requests:
 ;;   {"op":"status"}            -> last run-end event, agent liveness
 ;;   {"op":"tail","n":50}       -> last N ledger lines
+;;   {"op":"history-runs","since":"7d","limit":20}
+;;   {"op":"history-results","name":"~/.zshrc","changed":true}
+;;                              -> rows from the history database
 ;;   {"op":"plan"}              -> dry run now, events streamed back
 ;;   {"op":"run"}               -> converge now, events streamed back
 ;; Every response line is a `monk-event' record or {"op":..., "ok":...}.
@@ -103,7 +106,7 @@ packages, cron, services, and paths whose parent did not exist yet."
 (defconst monk-agent-socket-name "monk-agent.socket")
 (defconst monk-agent-template-name "monk-agent@.service")
 
-(defconst monk-agent-ops '("status" "tail" "plan" "run")
+(defconst monk-agent-ops '("status" "tail" "plan" "run" "history-runs" "history-results")
   "Operations the query endpoint accepts.")
 
 (defconst monk-agent-tail-default 50
@@ -357,6 +360,15 @@ endpoint, and common keys.  Call inside a policy."
        (dolist (line (monk-agent--ledger-tail (or (alist-get 'n request) monk-agent-tail-default)))
          (princ line) (princ "\n"))
        (monk-agent--respond `((op . "tail") (ok . t))))
+      ((or "history-runs" "history-results")
+       (require 'monk-history)
+       (let* ((filters (monk-history-filters-from-json request))
+              (rows (if (equal op "history-runs")
+                        (apply #'monk-history-runs filters)
+                      (apply #'monk-history-results filters))))
+         (monk-agent--respond `((op . ,op) (ok . t)
+                                (count . ,(length rows))
+                                (rows . ,(monk-history-rows-json rows))))))
       ((or "plan" "run")
        (let* ((policy (or monk-batch-policy
                           (signal 'monk-policy-error (list "monk-batch-policy is not set"))))
@@ -452,6 +464,26 @@ With USER, ask the user instance."
     (unless (eq t (alist-get 'ok response))
       (signal 'monk-error (list "agent status failed" response)))
     response))
+
+(declare-function monk-history-runs "monk-history")
+(declare-function monk-history-results "monk-history")
+(declare-function monk-history-filters-from-json "monk-history")
+(declare-function monk-history-rows-json "monk-history")
+
+(cl-defmethod monk-agent-history ((m monk-machine) what &optional filters user)
+  "Return history rows from the agent on M.
+WHAT is `runs' or `results'.  FILTERS is a plist as for
+`monk-history-runs', sent as JSON with underscores.  With USER, ask
+the user instance.  Each row is an alist with symbol keys."
+  (let* ((request (append `((op . ,(format "history-%s" what)))
+                          (cl-loop for (key value) on filters by #'cddr
+                                   collect (cons (intern (string-replace
+                                                          "-" "_" (substring (symbol-name key) 1)))
+                                                 (if (null value) :false value)))))
+         (response (car (last (monk-agent-query m request user)))))
+    (unless (eq t (alist-get 'ok response))
+      (signal 'monk-error (list "agent history failed" response)))
+    (append (alist-get 'rows response) nil)))
 
 (cl-defmethod monk-agent-remote-run ((m monk-machine) &optional dry-run user)
   "Ask the agent on M to converge, or to plan with DRY-RUN.  Return a `monk-run'.

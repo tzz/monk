@@ -53,62 +53,47 @@
          :documentation "Treat the names as casks."))
   "A set of Homebrew formulae or casks that must be installed.")
 
-(cl-defmethod monk--brew-installed ((r monk-brew-resource) (m monk-machine))
-  "Return the installed formula or cask names on M, per the cask slot of R."
-  (apply #'monk-exec-lines m monk-brew-program "list" "-1"
-         (if (oref r cask) '("--cask") '("--formula"))))
-
 (defun monk--brew-json-names (entry cask)
   "Return every name that brew ENTRY, a parsed JSON object, answers to.
 For a formula: name, full_name, aliases, oldnames.  For a CASK:
-token, full_token, old_tokens."
-  (let ((get (lambda (key) (gethash key entry))))
-    (delq nil
-          (if cask
-              (append (list (funcall get "token") (funcall get "full_token"))
-                      (append (funcall get "old_tokens") nil))
-            (append (list (funcall get "name") (funcall get "full_name"))
-                    (append (funcall get "aliases") nil)
-                    (append (funcall get "oldnames") nil))))))
+token, full_token, old_tokens.  Each also under its short name."
+  (let* ((get (lambda (key) (gethash key entry)))
+         (names (delq nil
+                      (if cask
+                          (append (list (funcall get "token") (funcall get "full_token"))
+                                  (append (funcall get "old_tokens") nil))
+                        (append (list (funcall get "name") (funcall get "full_name"))
+                                (append (funcall get "aliases") nil)
+                                (append (funcall get "oldnames") nil))))))
+    (delete-dups (append names (mapcar #'file-name-nondirectory names)))))
 
-(cl-defmethod monk--brew-canonical ((r monk-brew-resource) (m monk-machine) names)
-  "Return an alist (NAME . INSTALLED-NAME) for NAMES of R on M.
-INSTALLED-NAME is what `brew list' shows for NAME: the formula name
-for an alias such as rg for ripgrep, the short name for a tapped
-formula.  A name brew does not know maps to itself.  This runs one
-`brew info --json=v2' call, and only for names that look missing."
-  (let* ((exec (apply #'monk-exec m monk-brew-program "info" "--json=v2"
-                      (if (oref r cask) "--cask" "--formula") names))
-         (entries (and (monk-exec-ok-p exec)
-                       (condition-case nil
-                           (let ((parsed (json-parse-string (monk-exec-output exec))))
-                             (append (gethash (if (oref r cask) "casks" "formulae") parsed) nil))
-                         (error nil)))))
-    (mapcar (lambda (name)
-              (let ((entry (seq-find (lambda (e)
-                                       (member name (monk--brew-json-names e (oref r cask))))
-                                     entries)))
-                (cons name
-                      (if entry
-                          (file-name-nondirectory
-                           (gethash (if (oref r cask) "token" "name") entry))
-                        (file-name-nondirectory name)))))
-            names)))
+(defun monk--brew-installed-names (m)
+  "Return every name an installed formula or cask on M answers to.
+One `brew info --json=v2 --installed' call.  Aliases count: rg is
+installed when ripgrep is.  Casks count for a formula resource too,
+because `brew install NAME' installs a cask of that name.  When the
+call fails, fall back to `brew list', which knows no aliases."
+  (let ((exec (monk-exec m monk-brew-program "info" "--json=v2" "--installed")))
+    (if (monk-exec-ok-p exec)
+        (let ((parsed (json-parse-string (monk-exec-output exec))))
+          (append (mapcan (lambda (e) (monk--brew-json-names e nil))
+                          (append (gethash "formulae" parsed) nil))
+                  (mapcan (lambda (e) (monk--brew-json-names e t))
+                          (append (gethash "casks" parsed) nil))))
+      (monk-log 'warn "%s: brew info --installed failed, aliases unknown: %s"
+                (oref m name) (string-trim (monk-exec-output exec)))
+      (append (monk-exec-lines m monk-brew-program "list" "-1" "--formula")
+              (monk-exec-lines m monk-brew-program "list" "-1" "--cask")))))
 
 (cl-defmethod monk-check ((r monk-brew-resource) (m monk-machine))
-  (let* ((installed (monk--brew-installed r m))
+  (let* ((installed (monk--brew-installed-names m))
          (missing (seq-remove
                    (lambda (name)
-                     ;; Tapped formulae list under their short name.
-                     (member (file-name-nondirectory name) installed))
+                     (or (member name installed)
+                         ;; A tapped name such as user/tap/formula is
+                         ;; installed under its short name.
+                         (member (file-name-nondirectory name) installed)))
                    (oref r packages))))
-    ;; An alias such as rg lists as ripgrep.  Without this step the
-    ;; resource installs rg on every pass and reports flapping.
-    (when missing
-      (let ((canonical (monk--brew-canonical r m missing)))
-        (setq missing (seq-remove
-                       (lambda (name) (member (cdr (assoc name canonical)) installed))
-                       missing))))
     (when missing
       (list :install missing
             :degree (monk-set-degree (length (oref r packages)) (length missing))))))
