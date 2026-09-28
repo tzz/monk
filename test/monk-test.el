@@ -1635,7 +1635,8 @@ this suite reports inotify and delivers nothing."
         (should (equal (monk-result-diff orig) (monk-result-diff copy)))
         (should (equal (monk-result-comment orig) (monk-result-comment copy)))
         (should (= 1.0 (monk-result-degree copy)))
-        (should (equal '((create . t)) (monk-result-changes copy)))
+        ;; changes come back as the plist every consumer expects
+        (should (equal '(:create t) (monk-result-changes copy)))
         (should (equal (monk-run-passes run) (monk-run-passes back)))
         (should-not (monk-run-dry-run back))
         (should (string-match-p "\"status\":\"repaired\"" (nth 1 lines)))
@@ -2537,6 +2538,178 @@ refuses to run from a side window."
       (kill-buffer detail)
       (kill-buffer (monk-ui--buffer)))))
 
+;;;; History
+
+(defmacro monk-test-with-history (&rest body)
+  "Run BODY with a fresh history database in a temporary MONK_HOME."
+  (declare (indent 0))
+  `(monk-test-with-tmpdir home
+     (require 'monk-history)
+     (let ((old-home (getenv "MONK_HOME")))
+       (unwind-protect
+           (progn
+             (setenv "MONK_HOME" home)
+             (monk-history-close)
+             (let ((monk-history-file nil))
+               ,@body))
+         (monk-history-close)
+         (setenv "MONK_HOME" old-home)))))
+
+(ert-deftest monk-test-history-location ()
+  "MONK_HOME wins; root goes to /etc/monk; others to XDG."
+  (let ((old (getenv "MONK_HOME")))
+    (unwind-protect
+        (progn
+          (setenv "MONK_HOME" "/tmp/mh")
+          (should (equal "/tmp/mh/" (monk-home-directory)))
+          (setenv "MONK_HOME" nil)
+          (cl-letf (((symbol-function 'user-uid) (lambda () 0)))
+            (should (equal "/etc/monk/" (monk-home-directory))))
+          (cl-letf (((symbol-function 'user-uid) (lambda () 1000)))
+            (should (string-suffix-p "/monk/" (monk-home-directory)))
+            (should (string-match-p "\\.local/share/monk/$\\|XDG" (monk-home-directory)))))
+      (setenv "MONK_HOME" old))))
+
+(ert-deftest monk-test-history-records-runs ()
+  "Every finished run lands in the database with its results."
+  (monk-test-with-history
+    (monk-test-with-tmpdir dir
+      (let* ((policy (lambda (_m)
+                       (monk-directory (concat dir "d"))
+                       (monk-line-in-file (concat dir "missing") "x")))
+             (m (monk-test-machine))
+             (monk-log-level nil)
+             (plan (monk-plan m policy))
+             (apply (monk-apply plan))
+             (runs (monk-history-runs)))
+        (should (= 2 (length runs)))
+        ;; newest first
+        (should (equal (monk-run-id apply) (alist-get 'id (car runs))))
+        (should (equal (monk-run-id plan) (alist-get 'plan_id (car runs))))
+        (should (eq 0 (alist-get 'dry_run (car runs))))
+        (should (eq 1 (alist-get 'dry_run (cadr runs))))
+        (should (eq 1 (alist-get 'repaired (car runs))))
+        (should (eq 1 (alist-get 'failed (car runs))))
+        (should (equal "testbox" (alist-get 'hosts (car runs))))
+        (should (= 2 (monk-history-run-count)))
+        (should (= 1 (monk-history-run-count :dry-run t)))
+        (let ((results (monk-history-results :run (monk-run-id apply))))
+          (should (= 2 (length results)))
+          (should (member "repaired" (mapcar (lambda (r) (alist-get 'status r)) results)))
+          (should (member "failed" (mapcar (lambda (r) (alist-get 'status r)) results))))
+        ;; filters
+        ;; the plan fails the same check, so two failed rows exist
+        (should (= 2 (length (monk-history-results :status 'failed))))
+        (should (= 1 (length (monk-history-results :status 'failed :dry-run nil))))
+        (should (= 2 (length (monk-history-results :name (concat dir "d")))))
+        (should (= 1 (length (monk-history-results :name (concat dir "d") :changed t :dry-run nil))))
+        (should (= 1 (length (monk-history-repairs "testbox" (concat dir "d")))))
+        (should (null (monk-history-runs :host "nobody")))
+        (should (= 2 (length (monk-history-runs :host "testbox"))))
+        (should (= 2 (length (monk-history-runs :since "1h"))))
+        (should (null (monk-history-runs :until "1h")))
+        (should (= 1 (length (monk-history-runs :limit 1))))
+        (should-error (monk-history-runs :bogus 1) :type 'monk-error)
+        ;; recording twice does not duplicate
+        (monk-history-record apply)
+        (should (= 2 (monk-history-run-count)))
+        (should (= 2 (length (monk-history-results :run (monk-run-id apply)))))))))
+
+(ert-deftest monk-test-history-run-roundtrip ()
+  "A run read back from history has the same results and summary."
+  (monk-test-with-history
+    (monk-test-with-tmpdir dir
+      (let* ((m (monk-test-machine))
+             (monk-log-level nil)
+             (run (monk-converge m (lambda (_m) (monk-file (concat dir "f") :content "hi\n"))))
+             (back (monk-history-run (monk-run-id run))))
+        (should back)
+        (should (equal (monk-run-summary run) (monk-run-summary back)))
+        (let ((r (car (monk-run-results back))))
+          (should (eq monk-status-repaired (monk-result-status r)))
+          (should (equal "file" (monk-result-type r)))
+          ;; changes come back as a plist that the describer accepts
+          (should (keywordp (car (monk-result-changes r))))
+          (should (stringp (monk-describe-changes (monk-result-changes r))))
+          (should (monk-result-diff r))
+          (should (equal (monk-run-id run) (monk-run-id back))))
+        (should (null (monk-history-run "nope")))))))
+
+(ert-deftest monk-test-history-mode-off-records-nothing ()
+  (monk-test-with-history
+    (monk-test-with-tmpdir dir
+      (monk-history-mode -1)
+      (unwind-protect
+          (progn
+            (monk-test-converge (lambda (_m) (monk-directory (concat dir "d"))))
+            (should (= 0 (monk-history-run-count))))
+        (monk-history-mode 1)))))
+
+(ert-deftest monk-test-history-delete-before ()
+  (monk-test-with-history
+    (monk-test-with-tmpdir dir
+      (monk-test-converge (lambda (_m) (monk-directory (concat dir "d"))))
+      (should (= 1 (monk-history-run-count)))
+      (should (= 0 (monk-history-delete-before "1h")))
+      (should (= 1 (monk-history-delete-before (current-time))))
+      (should (= 0 (monk-history-run-count)))
+      (should (null (monk-history-results))))))
+
+(ert-deftest monk-test-history-agent-ops ()
+  "history-runs and history-results answer over the agent handler with filters."
+  (require 'monk-agent)
+  (monk-test-with-history
+    (monk-test-with-tmpdir dir
+      (let ((monk-log-level nil))
+        (monk-test-converge (lambda (_m) (monk-directory (concat dir "d"))))
+        (monk-plan (monk-test-machine) (lambda (_m) (monk-directory (concat dir "e")))))
+      (let* ((out (with-output-to-string
+                    (monk-agent-handle '((op . "history-runs") (dry_run . :false)))))
+             (response (monk-event-parse (string-trim out))))
+        (should (eq t (alist-get 'ok response)))
+        (should (= 1 (alist-get 'count response)))
+        (should (equal "testbox" (alist-get 'hosts (aref (alist-get 'rows response) 0)))))
+      (let* ((out (with-output-to-string
+                    (monk-agent-handle `((op . "history-results") (changed . t) (limit . 10)))))
+             (response (monk-event-parse (string-trim out))))
+        (should (= 2 (alist-get 'count response)))
+        (should (member (alist-get 'status (aref (alist-get 'rows response) 0))
+                        '("repaired" "would-repair"))))
+      ;; filters plist from JSON keeps underscores mapped
+      (should (equal '(:host "h" :dry-run nil :limit 5)
+                     (monk-history-filters-from-json '((host . "h") (dry_run . :false) (limit . 5))))))))
+
+(ert-deftest monk-test-ui-history-buffer ()
+  "h lists runs; RET opens one; c lists its changes; r shows a timeline."
+  (require 'monk-ui)
+  (monk-test-with-history
+    (monk-test-with-tmpdir dir
+      (let* ((m (monk-test-machine))
+             (monk-log-level nil)
+             (run (monk-converge m (lambda (_m) (monk-directory (concat dir "d"))))))
+        (save-window-excursion (monk-ui-history))
+        (with-current-buffer monk-ui-history-buffer-name
+          (should (derived-mode-p 'monk-ui-history-mode))
+          (should (eq (key-binding "q") 'monk-ui-quit))
+          (should (= 1 (length tabulated-list-entries)))
+          (should (equal (monk-run-id run) (tabulated-list-get-id (point-min))))
+          (goto-char (point-min))
+          (save-window-excursion
+            (monk-ui-history-open-run)
+            (should (derived-mode-p 'monk-ui-mode))
+            (should (equal (monk-run-summary run) (monk-run-summary monk-ui--run))))
+          (save-window-excursion
+            (monk-ui-history-changes)
+            (goto-char (point-min))
+            (should (search-forward "1 change" nil t))
+            (should (search-forward (concat dir "d") nil t)))
+          (save-window-excursion
+            (monk-ui-history-resource "testbox" (concat dir "d"))
+            (goto-char (point-min))
+            (should (search-forward "repaired" nil t))))
+        (dolist (b (buffer-list))
+          (when (string-prefix-p "*monk" (buffer-name b)) (kill-buffer b)))))))
+
 ;;;; Origins and jump to source
 
 (ert-deftest monk-test-resource-origin-from-file ()
@@ -2591,14 +2764,20 @@ refuses to run from a side window."
   (monk-test-with-tmpdir dir
     (let ((file (concat dir "inventory.el")))
       (with-temp-file file
-        (insert "(monk-inventory-define '(world :hosts ((alpha) (beta :address \"b\"))))\n"))
+        (insert ";; inventory\n"
+                "(monk-inventory-define\n"
+                " '(world :hosts ((alpha)\n"
+                "                 (beta :address \"b\")\n"
+                "                 (betamax))))\n"))
       (let ((monk-inventory nil))
         (load file nil t)
         (should (equal (cons file "alpha") (oref (monk-inventory-find 'alpha) origin)))
         (save-window-excursion
           (monk-machine-find-definition (monk-inventory-find 'beta))
           (should (equal (buffer-file-name) file))
-          (should (looking-at ".*beta")))
+          ;; on the line of (beta ...), not the first line and not betamax
+          (should (= 4 (line-number-at-pos)))
+          (should (looking-at " *(beta :address")))
         (kill-buffer (get-file-buffer file))))))
 
 (ert-deftest monk-test-event-carries-source ()

@@ -65,6 +65,18 @@ Values that JSON cannot carry become their printed representation."
         (push (cons key (monk-event--jsonable value)) out)))
     (nreverse out)))
 
+(defun monk-event-alist-to-plist (alist)
+  "Return ALIST, as `monk-event--plist-to-alist' made it, as a changes plist.
+Keys become keywords.  Vectors from JSON become lists.  Anything that
+is not an alist returns unchanged."
+  (if (and (listp alist) (consp (car-safe alist)) (symbolp (caar alist)))
+      (let (out)
+        (dolist (cell alist)
+          (setq out (plist-put out (intern (concat ":" (symbol-name (car cell))))
+                               (if (vectorp (cdr cell)) (append (cdr cell) nil) (cdr cell)))))
+        out)
+    alist))
+
 (defun monk-event--jsonable (value)
   "Return VALUE in a form `json-serialize' accepts."
   (cond
@@ -137,6 +149,21 @@ Values that JSON cannot carry become their printed representation."
   "Return a stable identifier for RUN: its start time to the millisecond."
   (format-time-string "r%Y%m%dT%H%M%S.%3N" (monk-run-start-time run) t))
 
+(defun monk-run-id-time (id)
+  "Return the start time that run ID encodes, as a time value."
+  (unless (string-match "\\`r\\([0-9]\\{8\\}\\)T\\([0-9]\\{6\\}\\)\\.\\([0-9]\\{3\\}\\)\\'" id)
+    (signal 'monk-error (list "Not a run id" id)))
+  (let* ((millis (string-to-number (match-string 3 id)))
+         (seconds (time-convert
+                   (parse-iso8601-time-string
+                    (format "%s-%s-%sT%s:%s:%sZ"
+                            (substring id 1 5) (substring id 5 7) (substring id 7 9)
+                            (substring id 10 12) (substring id 12 14) (substring id 14 16)))
+                   'integer)))
+    ;; An exact (TICKS . HZ) pair: a float here loses the last digit
+    ;; when the id is printed again.
+    (time-convert (cons (+ (* seconds 1000) millis) 1000) t)))
+
 (defun monk-run-events (run)
   "Return all events of RUN as a list of alists: start, results, end."
   (append (list (monk-event-run 'run-start run))
@@ -171,7 +198,7 @@ Arrays become vectors, so a parsed event can be serialized again:
    :type (alist-get 'type event)
    :status (intern (or (alist-get 'status event) "unknown"))
    :degree (or (alist-get 'degree event) 0.0)
-   :changes (alist-get 'changes event)
+   :changes (monk-event-alist-to-plist (alist-get 'changes event))
    :comment (alist-get 'comment event)
    :diff (alist-get 'diff event)
    :duration (/ (or (alist-get 'duration_ms event) 0) 1000.0)

@@ -30,6 +30,7 @@
 ;;; Code:
 
 (require 'monk)
+(require 'diff)
 
 (defconst monk-file-default-mode #o644
   "Mode for files when the policy gives none.")
@@ -37,14 +38,8 @@
 (defconst monk-directory-default-mode #o755
   "Mode for directories when the policy gives none.")
 
-(defconst monk-diff-program "diff"
-  "Program used to produce unified diffs.")
-
-(defconst monk-stat-owner-args-gnu '("-c" "%U %G")
-  "Arguments that make GNU stat print owner and group.")
-
-(defconst monk-stat-owner-args-bsd '("-f" "%Su %Sg")
-  "Arguments that make BSD and macOS stat print owner and group.")
+(defconst monk-diff-switches "-u"
+  "Switches for `diff-no-select' when Monk renders a content diff.")
 
 ;;;; Shared helpers
 
@@ -87,24 +82,43 @@ When SUDO is non-nil, write as root.")
     full))
 
 (defun monk--unified-diff (old new label)
-  "Return a unified diff between strings OLD and NEW labeled LABEL."
+  "Return a unified diff between strings OLD and NEW labeled LABEL.
+Uses the `diff' library, so `diff-command' and the user's settings
+apply.  The two header lines name a/LABEL and b/LABEL instead of the
+temporary files."
   (let ((old-file (make-temp-file "monk-old"))
         (new-file (make-temp-file "monk-new"))
-        ;; `call-process' needs a directory that exists on the controller.
-        ;; The caller's `default-directory' can be a remote path or a `~'
-        ;; that HOME no longer resolves; the temp dir always exists.
+        ;; The diff process needs a directory that exists on the
+        ;; controller.  The caller's `default-directory' can be a remote
+        ;; path or a `~' that HOME no longer resolves.
         (default-directory (file-name-as-directory
                             (expand-file-name temporary-file-directory))))
     (unwind-protect
         (progn
           (with-temp-file old-file (insert (or old "")))
           (with-temp-file new-file (insert new))
-          (with-temp-buffer
-            (call-process monk-diff-program nil t nil "-u"
-                          "--label" (concat "a/" label)
-                          "--label" (concat "b/" label)
-                          old-file new-file)
-            (buffer-string)))
+          (let ((buffer (diff-no-select old-file new-file monk-diff-switches t
+                                        (generate-new-buffer " *monk-diff*"))))
+            (unwind-protect
+                (with-current-buffer buffer
+                  (goto-char (point-min))
+                  ;; Keep the hunks only: drop the command line at the
+                  ;; top and the "Diff finished" trailer.
+                  (let ((start (or (and (re-search-forward "^--- " nil t) (line-beginning-position))
+                                   (point-max)))
+                        (end (or (and (goto-char (point-max))
+                                      (re-search-backward "^\\(Diff finished\\|diff .* finished\\)" nil t)
+                                      (line-beginning-position))
+                                 (point-max))))
+                    (let ((text (buffer-substring-no-properties start end)))
+                      (setq text (replace-regexp-in-string
+                                  (concat "\\`--- " (regexp-quote old-file) "[^\n]*")
+                                  (concat "--- a/" label) text t t))
+                      (setq text (replace-regexp-in-string
+                                  (concat "^\\+\\+\\+ " (regexp-quote new-file) "[^\n]*")
+                                  (concat "+++ b/" label) text t t))
+                      (string-trim-right text "\n+"))))
+              (kill-buffer buffer))))
       (delete-file old-file)
       (delete-file new-file))))
 
@@ -187,23 +201,26 @@ When SUDO is non-nil, write as root.")
 
 ;;;; ownership helpers
 
-(cl-defmethod monk--ownership-changes ((m monk-machine) full owner group sudo)
+(cl-defmethod monk--ownership-changes ((_m monk-machine) full owner group _sudo)
+  "Return :owner and :group changes for FULL against OWNER and GROUP.
+Reads names through `file-attributes', which TRAMP answers for remote
+and sudo paths, so no `stat' runs and BSD/GNU differences vanish."
   (when (or owner group)
-    (let* ((stat-args (if (monk-class-p m 'darwin)
-                          monk-stat-owner-args-bsd
-                        monk-stat-owner-args-gnu))
-           (current (split-string (apply #'monk-exec-string m "stat"
-                                         (append stat-args
-                                                 (list (monk-machine-local-path full)
-                                                       :sudo sudo)))))
+    (let* ((attributes (file-attributes full 'string))
+           (current-owner (file-attribute-user-id attributes))
+           (current-group (file-attribute-group-id attributes))
            (changes nil))
-      (when (and owner (not (equal owner (car current))))
-        (setq changes (plist-put changes :owner (list (car current) owner))))
-      (when (and group (not (equal group (cadr current))))
-        (setq changes (plist-put changes :group (list (cadr current) group))))
+      (when (and owner (not (equal owner current-owner)))
+        (setq changes (plist-put changes :owner (list current-owner owner))))
+      (when (and group (not (equal group current-group)))
+        (setq changes (plist-put changes :group (list current-group group))))
       changes)))
 
 (cl-defmethod monk--apply-ownership ((m monk-machine) path owner group sudo)
+  "Set OWNER and GROUP on PATH of M.  SUDO runs it as root.
+Emacs has `tramp-set-file-uid-gid', but it takes numeric ids and the
+policy names users; resolving a name to an id needs a process on the
+target anyway, so this stays one `chown' call."
   (monk-exec-string m "chown"
                     (concat (or owner "") (and group (concat ":" group)))
                     path :sudo sudo))

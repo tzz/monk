@@ -59,6 +59,13 @@
 (require 'monk-event)
 (require 'monk-agent)
 (require 'filenotify)
+(require 'vc-git)
+
+;; The drive checks history when monk-history is loaded; it needs an
+;; Emacs with SQLite, so it is not required here.
+(declare-function monk-history-runs "monk-history")
+(declare-function monk-history-run "monk-history")
+(declare-function monk-history-repairs "monk-history")
 
 (defgroup monk-testdrive nil
   "Live test drive of Monk."
@@ -571,10 +578,185 @@ so `~' in the policy lands there."
          (cons (string-match-p "^Accept=yes$" (monk-agent-socket-unit)) "socket unit")
          (cons (string-match-p "^StandardInput=socket$" (monk-agent-template-unit)) "template unit"))))))
 
+(defun monk-testdrive--section-guards ()
+  "CELL and CEL guards, skip reasons, the Salt failure model, query."
+  (monk-testdrive--out "\n## Guards and failures")
+  (let ((m (monk-testdrive--machine)))
+    (monk-testdrive--step "guards" ":when skips with the false clause named"
+      (let ((run (monk-converge
+                  m (lambda (_m)
+                      (monk-directory "~/g-cell" :when '(and (class drive) (class mars)))
+                      (monk-directory "~/g-cel" :when "'drive' in classes && facts.kernel != 'Plan9'")
+                      (monk-directory "~/g-fn" :only-if (lambda (_m) nil))))))
+        (monk-testdrive--checks
+         (cons (eq monk-status-skipped (monk-result-status (monk-run-result run '("drive" . "~/g-cell"))))
+               "CELL guard did not skip")
+         (cons (equal "class mars is absent"
+                      (monk-result-comment (monk-run-result run '("drive" . "~/g-cell"))))
+               (format "reason: %S" (monk-result-comment (monk-run-result run '("drive" . "~/g-cell")))))
+         (cons (eq monk-status-repaired (monk-result-status (monk-run-result run '("drive" . "~/g-cel"))))
+               "CEL guard did not run")
+         (cons (equal monk-skip-only-if
+                      (monk-result-comment (monk-run-result run '("drive" . "~/g-fn"))))
+               "only-if reason"))))
+    (monk-testdrive--step "guards" "a bad guard fails the compile, not the run"
+      (condition-case err
+          (progn (monk-compile m (lambda (_m) (monk-directory "~/x" :when "nope == 1")))
+                 (cons 'FAIL "compiled"))
+        (monk-policy-error
+         (monk-testdrive--checks
+          (cons (string-match-p "bad :when guard" (cadr err)) (cadr err))))))
+    (monk-testdrive--step "guards" "CEL round trip and explain"
+      (let* ((form (monk-cel-parse "'drive' in classes && size(classes) > 2"))
+             (cel (monk-cell-to-cel form)))
+        (monk-testdrive--checks
+         (cons (equal form (monk-cel-parse cel)) (format "round trip: %s" cel))
+         (cons (monk-cell-eval m form) "guard false on the drive machine")
+         (cons (string-match-p "class mars is absent"
+                               (monk-cell-explain m '(and (class drive) (class mars))))
+               "explain"))))
+    (monk-testdrive--step "guards" "a failure does not stop the pass; only dependents skip"
+      (let ((run (monk-converge
+                  m (lambda (_m)
+                      (monk-line-in-file "~/absent" "x")
+                      (monk-directory "~/free")
+                      (monk-directory "~/dependent" :require '("~/absent#x"))))))
+        (monk-testdrive--checks
+         (cons (eq monk-status-failed (monk-result-status (monk-run-result run '("drive" . "~/absent#x"))))
+               "absent#x not failed")
+         (cons (eq monk-status-repaired (monk-result-status (monk-run-result run '("drive" . "~/free"))))
+               "free did not run after the failure")
+         (cons (eq monk-status-skipped (monk-result-status (monk-run-result run '("drive" . "~/dependent"))))
+               "dependent ran")
+         (cons (= 2 (monk-run-passes run)) (format "%d passes" (monk-run-passes run))))))
+    (monk-testdrive--step "guards" "git resource clones and fast-forwards through VC"
+      (if (not (executable-find vc-git-program))
+          (cons 'SKIP "no git on this host")
+        (let* ((origin (monk-testdrive--path "origin.git"))
+               (work (monk-testdrive--path "seed"))
+               (default-directory (file-name-as-directory monk-testdrive--home)))
+          (make-directory work t)
+          (let ((default-directory (file-name-as-directory work)))
+            (vc-git--out-ok "init" "-q" "-b" "main")
+            (with-temp-file (expand-file-name "f" work) (insert "one\n"))
+            (vc-git--out-ok "-c" "user.name=drive" "-c" "user.email=d@x" "add" "f")
+            (vc-git--out-ok "-c" "user.name=drive" "-c" "user.email=d@x" "commit" "-q" "-m" "one"))
+          (vc-git--out-ok "clone" "-q" "--bare" work origin)
+          (let* ((policy (lambda (_m) (monk-git "~/clone" origin :branch "main")))
+                 (first (monk-converge m policy))
+                 (_ (let ((default-directory (file-name-as-directory work)))
+                      (with-temp-file (expand-file-name "f" work) (insert "two\n"))
+                      (vc-git--out-ok "-c" "user.name=drive" "-c" "user.email=d@x" "commit" "-q" "-am" "two")
+                      (vc-git--out-ok "push" "-q" origin "main")))
+                 (plan (monk-plan m policy))
+                 (second (monk-converge m policy)))
+            (monk-testdrive--checks
+             (cons (eq monk-status-repaired (monk-result-status (monk-run-result first '("drive" . "~/clone"))))
+                   "clone not repaired")
+             (cons (file-directory-p (monk-testdrive--path "clone/.git")) "no .git after clone")
+             (cons (plist-get (monk-result-changes (monk-run-result plan '("drive" . "~/clone"))) :behind)
+                   "plan did not see the new commit")
+             (cons (equal "two\n" (monk-testdrive--text "clone/f")) "fast-forward did not land")
+             (cons (eq monk-status-repaired (monk-result-status (monk-run-result second '("drive" . "~/clone"))))
+                   "second run not repaired"))))))
+    (monk-testdrive--step "guards" "query buffer lists matches with explanations"
+      (save-window-excursion
+        (monk-ui-query "'drive' in classes && facts.kernel == 'Plan9'" (list m)))
+      (unwind-protect
+          (with-current-buffer monk-ui-query-buffer-name
+            (goto-char (point-min))
+            (monk-testdrive--checks
+             (cons (search-forward "0 of 1 machine" nil t) "count line")
+             (cons (search-forward "– drive" nil t) "no-match row")
+             (cons (search-forward "facts.kernel == 'Plan9' is false" nil t) "explanation in CEL")
+             (cons (eq (key-binding "q") 'monk-ui-quit) "q")))
+        (kill-buffer monk-ui-query-buffer-name)))))
+
+(defun monk-testdrive--section-inspect ()
+  "Inspector, folds, jump to source, rerun, and detail-buffer keys."
+  (monk-testdrive--out "\n## Inspect and navigate")
+  (let* ((m (monk-testdrive--machine))
+         (policy-file (monk-testdrive--path "policy.el")))
+    (with-temp-file policy-file
+      (insert ";; -*- lexical-binding: t; -*-\n"
+              "(defun monk-testdrive--file-policy (_m)\n"
+              "  (monk-directory \"~/from-file\")\n"
+              "  (monk-file \"~/from-file/note\" :content \"hi\\n\"))\n"))
+    (load policy-file nil t)
+    (unwind-protect
+        (let ((plan (monk-plan m 'monk-testdrive--file-policy)))
+          (monk-testdrive--step "inspect" "results and machines remember where they were defined"
+            (let ((origin (monk-result-origin (car (monk-run-results plan)))))
+              (monk-testdrive--checks
+               (cons (equal (monk-origin-file origin) policy-file) (format "origin %S" origin))
+               (cons (equal "~/from-file" (cdr origin)) "origin name"))))
+          (monk-testdrive--step "inspect" "detail buffer: folded machine section, . jumps to the policy"
+            (with-current-buffer (monk-ui-show plan)
+              (save-window-excursion (monk-ui-show-machine "drive")))
+            (with-current-buffer (format monk-ui-detail-buffer-format "drive")
+              (goto-char (point-min))
+              (let ((heading (search-forward "drive: " nil t))
+                    (folded (progn (re-search-forward "\"\\(Linux\\|Darwin\\)\"" nil t)
+                                   (get-text-property (point) 'invisible))))
+                (goto-char (point-min))
+                (search-forward "~/from-file/note" nil t)
+                (let ((jumped (save-window-excursion
+                                (monk-ui-find-definition)
+                                (prog1 (and (equal (buffer-file-name) policy-file)
+                                            (looking-at ".*~/from-file/note"))
+                                  (kill-buffer)))))
+                  (monk-testdrive--checks
+                   (cons heading "no machine heading")
+                   (cons folded "machine section not folded")
+                   (cons (eq (key-binding "a") 'monk-ui-apply) "a not bound in detail")
+                   (cons (eq (key-binding "q") 'monk-ui-quit) "q not bound in detail")
+                   (cons jumped "jump to source"))))))
+          (monk-testdrive--step "inspect" "i opens the inspector with facts unfolded"
+            (with-current-buffer (monk-ui--buffer)
+              (save-window-excursion (monk-ui-inspect-machine "drive")))
+            (let ((name (format monk-ui-detail-buffer-format "drive facts")))
+              (unwind-protect
+                  (with-current-buffer name
+                    (goto-char (point-min))
+                    (monk-testdrive--checks
+                     (cons (search-forward "classes" nil t) "no classes line")
+                     (cons (and (search-forward "kernel" nil t)
+                                (not (get-text-property (point) 'invisible)))
+                           "facts folded in the inspector")))
+                (kill-buffer name))))
+          (monk-testdrive--step "inspect" "g in the plan buffer plans again and sees the repair"
+            (monk-converge m 'monk-testdrive--file-policy)
+            (with-current-buffer (monk-ui--buffer)
+              (setq monk-ui--run plan)
+              (monk-ui-rerun)
+              (monk-testdrive--checks
+               (cons (not (eq monk-ui--run plan)) "run not replaced")
+               (cons (monk-run-dry-run monk-ui--run) "rerun of a plan was not a plan")
+               (cons (= 0 (monk-run-count monk-ui--run monk-status-would-repair))
+                     (format "%d would-repair after repair" (monk-run-count monk-ui--run monk-status-would-repair))))))
+          (monk-testdrive--step "inspect" "history recorded the runs; RET rebuilds one"
+            (if (not (featurep 'monk-history))
+                (cons 'SKIP "monk-history not loaded (no SQLite in this Emacs?)")
+              (let* ((rows (monk-history-runs :host "drive" :limit 5))
+                     (back (and rows (monk-history-run (alist-get 'id (car rows)))))
+                     (shown (with-current-buffer (monk-ui--buffer) monk-ui--run)))
+                (monk-testdrive--checks
+                 (cons (>= (length rows) 3) (format "%d history rows for drive" (length rows)))
+                 (cons back "run did not rebuild")
+                 (cons (and back shown (equal (monk-run-summary back) (monk-run-summary shown)))
+                       "rebuilt summary differs from the last shown run")
+                 (cons (monk-history-repairs "drive" "~/from-file") "no repair timeline"))))))
+      (fmakunbound 'monk-testdrive--file-policy)
+      (when (get-file-buffer policy-file) (kill-buffer (get-file-buffer policy-file)))
+      (when (get-buffer (format monk-ui-detail-buffer-format "drive"))
+        (kill-buffer (format monk-ui-detail-buffer-format "drive"))))))
+
 (defconst monk-testdrive--sections
   '(("Converge" monk-testdrive--section-converge)
     ("Plan and apply" monk-testdrive--section-plan)
     ("Requisites and convergence" monk-testdrive--section-graph)
+    ("Guards and failures" monk-testdrive--section-guards)
+    ("Inspect and navigate" monk-testdrive--section-inspect)
     ("Watch" monk-testdrive--section-watch)
     ("Agent and events" monk-testdrive--section-agent))
   "The drive's sections: (TITLE FUNCTION).")
@@ -652,10 +834,43 @@ so `~' in the policy lands there."
       (with-current-buffer monk-ui-buffer-name (monk-ui-toggle-style))
       r)))
 
+(defun monk-testdrive--tour-inspect ()
+  "Folds, the inspector, the query buffer, and q."
+  (let ((m (monk-testdrive--machine)))
+    (monk-ui-show (monk-converge m #'monk-testdrive--policy))
+    (monk-testdrive--step "tour" "detail buffer opens with a folded machine line; TAB unfolds"
+      (monk-testdrive--focus-detail "drive")
+      (monk-testdrive--ask "Second line reads '▸ drive: N classes, N facts, N vars (TAB to expand)'.  Press TAB on it: does it turn into ▾ with class chips and a facts table under it?  Press q: does the detail close and *monk* stay?"))
+    (monk-testdrive--step "tour" "/ query: matches, explanations, folded facts"
+      (monk-testdrive--focus-monk)
+      (save-window-excursion (monk-ui-query "'drive' in classes && facts.arch == 'nope'" (list m)))
+      (pop-to-buffer monk-ui-query-buffer-name)
+      (delete-other-windows)
+      (prog1 (monk-testdrive--ask "Purple QUERY line at the top, then CELL and CEL renderings, '0 of 1 machine match', a grey '– drive' row with 'facts.arch == 'nope' is false: ...' after it, and a folded ▸ drive line?  Press e: does it ask for a new guard (C-g to cancel)?")
+        (kill-buffer monk-ui-query-buffer-name)))
+    (monk-testdrive--step "tour" "focus lands in *monk* after a command run"
+      (with-current-buffer (monk-testdrive--buf) (delete-other-windows (get-buffer-window (current-buffer) t)))
+      (switch-to-buffer (monk-testdrive--buf))
+      (monk-run-report (monk-plan m #'monk-testdrive--policy))
+      (redisplay)
+      (monk-testdrive--ask "The cursor is now in the *monk* window (not in the report), so 'a' would apply at once?"))))
+
+(defun monk-testdrive--tour-history ()
+  "The history buffer."
+  (monk-testdrive--step "tour" "h opens the history list; RET, c, r"
+    (if (not (featurep 'monk-history))
+        (cons 'SKIP "monk-history not loaded")
+      (with-current-buffer (monk-ui--buffer) (save-window-excursion (monk-ui-history :host "drive")))
+      (pop-to-buffer monk-ui-history-buffer-name)
+      (delete-other-windows)
+      (monk-testdrive--ask "Blue HISTORY box with 'N runs on drive' at the top, rows newest first with a purple 'plan' or blue 'apply' in the Kind column and colored Changed counts?  Press c on a row: does a list of changes open?  q closes it?"))))
+
 (defconst monk-testdrive--tour-stops
   '(("Plan" monk-testdrive--tour-plan)
     ("Apply" monk-testdrive--tour-apply)
     ("Flapping" monk-testdrive--tour-flapping)
+    ("Inspect and query" monk-testdrive--tour-inspect)
+    ("History" monk-testdrive--tour-history)
     ("Watch" monk-testdrive--tour-watch)
     ("Text fallback" monk-testdrive--tour-text))
   "The tour's stops: (TITLE FUNCTION).")
@@ -715,7 +930,10 @@ so `~' in the policy lands there."
     (delete-directory monk-testdrive--home t))
   (setq monk-testdrive--home nil)
   (dolist (name (list (format monk-ui-detail-buffer-format "drive")
-                      (format monk-ui-detail-buffer-format "plan")))
+                      (format monk-ui-detail-buffer-format "drive facts")
+                      (format monk-ui-detail-buffer-format "plan")
+                      monk-ui-query-buffer-name
+                      monk-ui-history-buffer-name))
     (when (get-buffer name) (kill-buffer name))))
 
 (defun monk-testdrive--run (parts)

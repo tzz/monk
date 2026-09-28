@@ -624,9 +624,15 @@ Registering NAME again replaces the function in place."
     (_ (list (cons 'os-family "Unknown")))))
 
 (defun monk--probe-env (m)
-  "Return home and user facts for M."
-  (list (cons 'home (monk-exec-string m "sh" "-c" "echo $HOME"))
-        (cons 'user (monk-exec-string m "id" "-un"))))
+  "Return home and user facts for M.
+The local host answers from Emacs itself.  A remote host needs one
+command, because TRAMP has no primitive for the login name or home of
+the remote user."
+  (if (monk-machine-local-p m)
+      (list (cons 'home (directory-file-name (expand-file-name "~")))
+            (cons 'user (user-login-name)))
+    (list (cons 'home (monk-exec-string m "sh" "-c" "echo $HOME"))
+          (cons 'user (monk-exec-string m "id" "-un")))))
 
 (monk-register-fact-probe 'uname #'monk--probe-uname)
 (monk-register-fact-probe 'os #'monk--probe-os)
@@ -1572,7 +1578,7 @@ Signal `user-error' when ORIGIN has no file."
     (funcall (if other-window #'find-file-other-window #'find-file) file)
     (goto-char (point-min))
     (unless (or (search-forward (format "%S" name) nil t)
-                (re-search-forward (concat "\_<" (regexp-quote name) "\_>") nil t))
+                (re-search-forward (concat "\\_<" (regexp-quote name) "\\_>") nil t))
       (message "Opened %s; %s is not written literally there" file name))
     (beginning-of-line)
     (recenter)))

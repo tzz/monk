@@ -58,7 +58,7 @@
 (require 'monk-event)
 
 (unless (sqlite-available-p)
-  (error "monk-history needs an Emacs built with SQLite support"))
+  (error "Monk history needs an Emacs built with SQLite support"))
 
 ;;;; Location
 
@@ -283,7 +283,10 @@ TABLE is `runs' or `results'.  Unknown keys signal."
     (cl-loop for (key value) on filters by #'cddr
              do (unless (memq key monk-history-filter-keys)
                   (signal 'monk-error (list (format "Unknown history filter %s" key))))
-             when (and value (not (memq key '(:limit :offset))))
+             ;; :dry-run nil is a real filter (applies only); the
+             ;; others are absent when nil.
+             when (and (not (memq key '(:limit :offset)))
+                       (or value (eq key :dry-run)))
              do (pcase key
                   (:host (push (if (eq table 'runs)
                                    "(' ' || hosts || ' ') LIKE ?"
@@ -393,16 +396,18 @@ Machines are stand-ins named from the row; facts are empty."
   (let ((row (car (monk-history-runs :run id))))
     (when row
       (let* ((results (mapcar #'monk-history-result-to-result (monk-history-results :run id)))
-             (hosts (split-string (alist-get 'hosts row) " " t))
-             (run (monk-run-create
-                   :machines (mapcar (lambda (h) (monk-machine :name h)) hosts)
-                   :results results
-                   :passes (alist-get 'passes row)
-                   :dry-run (eq 1 (alist-get 'dry_run row))
-                   :start-time (parse-iso8601-time-string (alist-get 'started row))
-                   :end-time (and (alist-get 'ended row)
-                                  (parse-iso8601-time-string (alist-get 'ended row))))))
-        run))))
+             (hosts (split-string (alist-get 'hosts row) " " t)))
+        ;; The stored start time has no sub-second part; the run id
+        ;; does.  Take the start time back from the id so the id of
+        ;; the rebuilt run equals the stored one.
+        (monk-run-create
+         :machines (mapcar (lambda (h) (monk-machine :name h)) hosts)
+         :results results
+         :passes (alist-get 'passes row)
+         :dry-run (eq 1 (alist-get 'dry_run row))
+         :start-time (monk-run-id-time id)
+         :end-time (and (alist-get 'ended row)
+                        (parse-iso8601-time-string (alist-get 'ended row))))))))
 
 (defun monk-history-result-to-result (row)
   "Return a `monk-result' from history ROW."
@@ -414,7 +419,9 @@ Machines are stand-ins named from the row; facts are empty."
    :degree (or (alist-get 'degree row) 0.0)
    :changes (and (alist-get 'changes row)
                  (condition-case nil
-                     (json-parse-string (alist-get 'changes row) :object-type 'alist)
+                     (monk-event-alist-to-plist
+                      (json-parse-string (alist-get 'changes row) :object-type 'alist
+                                         :null-object nil :false-object :false))
                    (error nil)))
    :comment (alist-get 'comment row)
    :diff (alist-get 'diff row)

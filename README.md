@@ -211,6 +211,18 @@ Remote machines have no notification channel over TRAMP. Monk polls them: every 
 
 A compiled-in notification library does not guarantee delivery. Sandboxes and some network filesystems report `inotify` and deliver nothing. `monk-watch-notifications-work-p` writes a probe file and waits for its event; `monk-watch-start` logs a warning when the probe fails, and local drift then goes unseen until the next manual run.
 
+## History
+
+`monk-history.el` writes every finished run to a SQLite database: one row per run and one per result, with the same fields as the event record. Plans, applies, and watch runs all count. Loading the file turns `monk-history-mode` on; it needs an Emacs built with SQLite (`sqlite-available-p`).
+
+The database is `history.sqlite` under the Monk state directory: `$MONK_HOME` when set, `/etc/monk` when Emacs runs as root, else `$XDG_DATA_HOME/monk` or `~/.local/share/monk`. `monk-history-file` overrides the path.
+
+`monk-history-runs` and `monk-history-results` return alists and take the same filters: `:host`, `:name`, `:type`, `:status`, `:run`, `:since` and `:until` (a timestamp or a duration such as `"7d"`), `:dry-run`, `:changed t` for repaired, would-repair, and partial only, `:limit`, `:offset`. `monk-history-repairs HOST NAME` is the timeline of one resource. `monk-history-run ID` rebuilds a `monk-run` for the report view. `monk-history-delete-before WHEN` prunes.
+
+In `*monk*`, `h` opens `*monk-history*`: newest run first with kind, hosts, counts, passes, and a note for flapping, watch-triggered, or from-plan runs. `RET` opens a run in the report view, `c` lists what changed in it, `r` asks for a host and resource and shows every change to it, `f` filters by host, `g` rereads.
+
+An agent answers `{"op":"history-runs", ...}` and `{"op":"history-results", ...}` over its socket with the same filters as JSON keys (`dry_run`, `since`, `changed`, `limit`...). `monk-agent-history MACHINE 'runs FILTERS` asks a remote machine for its history without reading its database. CELL cannot read history on purpose: a guard must give the same answer while the facts are the same.
+
 ## Execution modes
 
 Monk runs in three modes that share one engine and differ in who decides.
@@ -283,6 +295,8 @@ make check     # checkdoc
 ```
 
 `M-x monk-reload` reloads every loaded `monk-*` library from source in first-load order and fixes what a plain `load` leaves behind: keymap variables are unbound first and re-installed in live `*monk*` and tutorial buffers, an active watch is stopped and started again on the new code with the same policy and mode, the image cache is cleared, and the notification probe is reset. EIEIO classes redefine in place. A run already stored in `*monk*` keeps its old struct layout; the summary line says so, and rerunning refreshes it. `monk-reload-last-failures` holds any file that did not load.
+
+Monk reuses Emacs core where it exists: TRAMP and the `file-*` primitives for files, `file-attributes` for ownership, the `diff` library for diffs, VC (`vc-git`) for git, `filenotify` for watches, built-in SQLite for history. Shell commands remain only where core has nothing: `crontab`, `sysctl`, `systemctl`, `brew`, `apt-get`, `defaults`, `chown` by name, and `fswatch` on macOS where kqueue misses writes inside a directory. Every new feature gets a test drive step or a tour stop as well as ERT tests; batch tests never look at a window.
 
 Tests run against a temporary directory on the local host. Package, sudo, and bridge resources are tested through their pure helpers and a faked exec layer. Cross-machine tests use several local machine objects with different names.
 

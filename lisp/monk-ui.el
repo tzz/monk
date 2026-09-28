@@ -1389,10 +1389,10 @@ the report goes to `*monk*' as usual and the detail buffer shows the
 same machine in the new run, so the eye stays where it was."
   (let ((machine monk-ui--detail-machine))
     (monk-run-report run)
-    (when machine
-      ;; In batch the report is text; fill *monk* anyway so the detail
-      ;; buffer reads the new run from it.
-      (with-current-buffer (monk-ui-show run)
+    ;; In batch the report is text; fill *monk* anyway, so a drive or
+    ;; a detail buffer reads the new run from it.
+    (with-current-buffer (monk-ui-show run)
+      (when machine
         (monk-ui-show-machine machine)))))
 
 ;;;; History

@@ -26,6 +26,7 @@
 ;;; Code:
 
 (require 'monk)
+(require 'vc-git)
 (require 'monk-file)
 (require 'format-spec)
 
@@ -148,12 +149,26 @@ and common keys."
            :documentation "When non-nil, fast-forward an existing checkout on each run."))
   "A git checkout at NAME from REPO.")
 
+(defun monk--git-in (directory &rest args)
+  "Run git with ARGS in DIRECTORY through VC and return trimmed output.
+DIRECTORY can be a TRAMP path; `vc-git--call' runs through
+`process-file', so remote and sudo hops work, and `vc-git-program'
+and the VC coding settings apply.  Signal `monk-exec-error' on a
+non-zero exit."
+  (let ((default-directory (file-name-as-directory directory)))
+    (with-temp-buffer
+      (let ((code (apply #'vc-git--call nil '(t t) (car args) (cdr args))))
+        (unless (eql 0 code)
+          (signal 'monk-exec-error
+                  (list default-directory (cons vc-git-program args) code
+                        (string-trim (buffer-string)))))
+        (string-trim (buffer-string))))))
+
 (cl-defgeneric monk--git (resource machine &rest args)
   "Run git with ARGS inside the checkout of RESOURCE on MACHINE.")
 
 (cl-defmethod monk--git ((r monk-git-resource) (m monk-machine) &rest args)
-  (apply #'monk-exec-string m "git"
-         (append args (list :directory (oref r name) :sudo (oref r sudo)))))
+  (apply #'monk--git-in (monk-machine-path m (oref r name) (oref r sudo)) args))
 
 (cl-defmethod monk-check ((r monk-git-resource) (m monk-machine))
   (let ((full (monk-machine-path m (oref r name) (oref r sudo)))
@@ -189,9 +204,14 @@ and common keys."
     (when (plist-get changes :clone)
       (dolist (dir (monk--parent-directories-to-create full))
         (make-directory dir))
-      (monk-exec-string m "git" "clone" "--quiet" "--branch" branch
-                        (oref r repo) (monk-machine-local-path full)
-                        :sudo (oref r sudo))
+      ;; `vc-git-clone' runs in `default-directory', so the parent of
+      ;; the checkout on M decides where, and with what rights, it runs.
+      (let ((default-directory (file-name-directory (directory-file-name full))))
+        (unless (with-temp-buffer
+                  (vc-git-clone (oref r repo) (monk-machine-local-path full) branch))
+          (signal 'monk-exec-error
+                  (list (oref m name) (list vc-git-program "clone" (oref r repo)) 1
+                        (format "clone of %s failed" (oref r repo))))))
       (push "cloned" notes))
     (when (plist-get changes :checkout)
       (monk--git r m "checkout" "--quiet" branch)
