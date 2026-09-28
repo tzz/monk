@@ -50,6 +50,7 @@
 ;;; Code:
 
 (require 'monk)
+(require 'monk-cell)
 
 (defvar monk-inventory nil
   "The current inventory: a list of `monk-machine' objects.")
@@ -78,14 +79,16 @@
         (pcase-let ((`(,host-name . ,host-plist) host))
           (unless (symbolp host-name)
             (signal 'monk-inventory-error (list "Host name must be a symbol" host-name)))
-          (push (monk-machine
-                 :name (symbol-name host-name)
-                 :address (plist-get host-plist :address)
-                 :user (plist-get host-plist :user)
-                 :port (plist-get host-plist :port)
-                 :vars (monk--inventory-merge-vars vars (plist-get host-plist :vars))
-                 :groups groups)
-                result)))
+          (let ((all-vars (monk--inventory-merge-vars vars (plist-get host-plist :vars))))
+            (push (monk-machine
+                   :name (symbol-name host-name)
+                   :address (plist-get host-plist :address)
+                   :user (plist-get host-plist :user)
+                   :port (plist-get host-plist :port)
+                   :vars all-vars
+                   :groups groups
+                   :ignore-unreachable (and (cdr (assq 'ignore_unreachable all-vars)) t))
+                  result))))
       result)))
 
 (defun monk-inventory-define (tree)
@@ -99,6 +102,82 @@ Signal `monk-inventory-error' on duplicate host names."
     (dolist (m machines)
       (oset m origin (cons file (oref m name))))
     (setq monk-inventory (nreverse machines))))
+
+;;;; Derived groups and tags
+;;
+;; A derived group is a group whose members are decided by a guard
+;; over facts, not listed by hand: Salt's derived grains, Ansible's
+;; `constructed' plugin.  A keyed group makes one group per value of
+;; a fact: `distro_ubuntu', `distro_raspbian'.  Both apply when the
+;; machine's facts arrive, live or from the cache, so a plan for a
+;; machine that is off still puts it in the right groups.  Groups
+;; become classes, as inventory groups do.
+
+(defvar monk-inventory-derived nil
+  "List of derived group rules: (GROUP . GUARD) or (:keyed GUARD PREFIX SEPARATOR).")
+
+(defun monk-group (name guard)
+  "Declare derived group NAME: every machine for which GUARD is true belongs.
+GUARD is a CELL form or a CEL string.  Call after `monk-inventory-define'."
+  (if (assq name monk-inventory-derived)
+      (setf (alist-get name monk-inventory-derived) (list 'guard (monk-cell-guard guard)))
+    (setq monk-inventory-derived
+          (append monk-inventory-derived (list (cons name (list 'guard (monk-cell-guard guard)))))))
+  (monk-inventory-apply-derived)
+  name)
+
+(defun monk-keyed-groups (guard &optional prefix separator)
+  "Declare one derived group per value of GUARD, a CELL form or CEL string.
+The group name is PREFIX, SEPARATOR, and the value, lowercased and
+made a symbol: (monk-keyed-groups \"facts.distribution\" \"distro\")
+gives `distro_ubuntu'.  SEPARATOR defaults to `_'.  Ansible's
+keyed_groups."
+  (setq monk-inventory-derived
+        (append monk-inventory-derived (list (list :keyed (monk-cell-guard guard) prefix (or separator "_")))))
+  (monk-inventory-apply-derived)
+  guard)
+
+(defun monk-inventory-clear-derived ()
+  "Forget every derived rule and the groups it produced."
+  (dolist (m monk-inventory)
+    (oset m groups (seq-remove (lambda (g) (get g 'monk-derived)) (oref m groups))))
+  (setq monk-inventory-derived nil))
+
+(defun monk--derived-group-symbol (prefix separator value)
+  "Return the group symbol for VALUE under PREFIX with SEPARATOR."
+  (let ((name (downcase (replace-regexp-in-string "[^[:alnum:]]+" separator (format "%s" value)))))
+    (intern (if prefix (concat prefix separator name) name))))
+
+(defun monk-inventory-apply-derived (&optional machines)
+  "Recompute derived groups on MACHINES, default the inventory.
+A machine without facts keeps whatever derived groups it had.  Return
+the machines whose groups changed."
+  (let (changed)
+    (dolist (m (or machines monk-inventory))
+      (when (oref m facts)
+        (let ((before (oref m groups))
+              (kept (seq-remove (lambda (g) (get g 'monk-derived)) (oref m groups)))
+              (new nil))
+          (dolist (rule monk-inventory-derived)
+            (condition-case nil
+                (pcase rule
+                  (`(,group guard ,guard)
+                   (when (monk-cell-eval m guard)
+                     (put group 'monk-derived t)
+                     (push group new)))
+                  (`(:keyed ,guard ,prefix ,separator)
+                   (let ((value (monk-cell-eval m guard)))
+                     (when (and value (not (eq value t)))
+                       (let ((group (monk--derived-group-symbol prefix separator value)))
+                         (put group 'monk-derived t)
+                         (push group new))))))
+              (monk-guard-error nil)))
+          (oset m groups (append kept (nreverse new)))
+          (when (oref m classes)
+            (oset m classes (monk-hard-classes m)))
+          (unless (equal before (oref m groups))
+            (push m changed)))))
+    changed))
 
 (defun monk-inventory-find (name)
   "Return the machine named NAME, a string or symbol, or nil.
@@ -141,6 +220,13 @@ OPTIONS pass to `monk-converge'.  Return a list of `monk-run'."
   (mapcar (lambda (m)
             (monk-run-report (apply #'monk-converge m policy options)))
           (monk-inventory-select selector)))
+
+(defun monk-inventory--on-facts (m)
+  "Apply derived groups to M when it is an inventory machine."
+  (when (memq m monk-inventory)
+    (monk-inventory-apply-derived (list m))))
+
+(add-hook 'monk-facts-ready-functions #'monk-inventory--on-facts)
 
 (provide 'monk-inventory)
 ;;; monk-inventory.el ends here

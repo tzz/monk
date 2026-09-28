@@ -84,13 +84,16 @@
   "The fswatch binary.")
 
 (defconst monk-watch-fswatch-args
-  '("--recursive" "--latency" "0.2" "--event" "Created" "--event" "Updated"
+  '("--latency" "0.2" "--event" "Created" "--event" "Updated"
     "--event" "Removed" "--event" "Renamed" "--event" "AttributeModified"
     "--print0")
   "Arguments for fswatch.
-Recursive, the events Monk cares about, NUL-separated paths because a
-path can hold a newline.  `--latency' is the FSEvents coalescing
-window, kept below `monk-watch-debounce'.")
+The events Monk cares about, NUL-separated paths because a path can
+hold a newline.  `--latency' is the FSEvents coalescing window, kept
+below `monk-watch-debounce'.  `--recursive' is added only for the
+process that watches owned subtrees: a home directory that holds a
+few managed dotfiles must not be walked, or every application's
+scratch file under it becomes an event.")
 
 (defconst monk-watch-fswatch-excludes '("/\\.git/" "/\\.Trash/" "/Library/Caches/")
   "Regexps fswatch drops before Monk sees them.  Noise that no policy owns.")
@@ -140,7 +143,8 @@ Each check is a dry run over TRAMP, so keep this in minutes."
   (descriptors nil)     ; file-notify descriptors for local directories
   (watched nil)         ; alist of (PATH . DESCRIPTOR) actually watched
   (backend nil)         ; `fswatch', `filenotify', or nil
-  (process nil)         ; the fswatch process, when that backend runs
+  (process nil)         ; the fswatch process over parent directories, flat
+  (tree-process nil)    ; the recursive fswatch over owned subtrees
   (path-index nil)      ; alist of (EXPANDED-DIR . ((FILE . NODE) ...))
   (pending nil)         ; keys collected since the last reaction
   (pending-reasons nil) ; alist of (KEY . PATH) for the log
@@ -241,7 +245,30 @@ kqueue the file too, then writes the file and waits."
       (insert (format-time-string "%T ") (apply #'format format-string args) "\n"))
     (unless (derived-mode-p 'special-mode)
       (special-mode)))
-  (apply #'monk-log 'info (concat "watch: " format-string) args))
+  (apply #'monk-log (if (or (string-prefix-p "warning" format-string)
+                            (string-prefix-p "started" format-string)
+                            (string-prefix-p "drift" format-string)
+                            (string-prefix-p "%s %s:%s" format-string))
+                        'warn 'info)
+         (concat (monk-watch-glyph) " " format-string) args))
+
+(defconst monk-watch-glyph-prefix "M"
+  "Prefix of watch lines.
+A letter: an eye emoji drew as a color glyph of its own size and
+looked out of place next to text.")
+
+(defconst monk-watch-glyph-drift "Δ"
+  "Marks a drift line on a UTF-8 terminal.")
+
+(defun monk-watch-glyph ()
+  "Return the watch prefix."
+  monk-watch-glyph-prefix)
+
+(defun monk-watch--utf8-p ()
+  "Return non-nil when the locale says UTF-8, or when not in batch."
+  (or (not noninteractive)
+      (let ((lang (or (getenv "LC_ALL") (getenv "LC_CTYPE") (getenv "LANG") "")))
+        (and (string-match-p "[Uu][Tt][Ff]-?8" lang) t))))
 
 ;;;; Path index
 
@@ -252,21 +279,37 @@ kqueue the file too, then writes the file and waits."
     (mapcar (lambda (p) (monk-machine-expand m p (oref r sudo)))
             (monk-resource-paths r))))
 
+(defun monk-watch-real-path (path)
+  "Return PATH with every symlink in its directory part resolved.
+The last component stays as written, so a managed symlink is indexed
+under its own name and not under its target.  Kernels report the
+real path of a changed file: when ~/autodist is a link into another
+tree, an edit there arrives as the other tree's path, and an index
+keyed on the spelling in the policy would never match it."
+  (let* ((full (expand-file-name path))
+         (dir (file-name-directory (directory-file-name full)))
+         (name (file-name-nondirectory (directory-file-name full))))
+    (if (and dir (file-directory-p dir))
+        (concat (file-name-as-directory (file-truename dir)) name)
+      full)))
+
 (defun monk-watch--build-index (nodes)
   "Return an alist of (DIRECTORY . ((PATH . NODE) ...)) for local NODES.
-Only machines without an address are indexed; remote ones poll."
+Only machines without an address are indexed; remote ones poll.
+Paths and directories are real paths, see `monk-watch-real-path'."
   (let ((index nil))
     (dolist (node nodes)
       (when (monk-machine-local-p (monk-node-machine node))
         (dolist (path (monk-watch--node-paths node))
-          (let* ((full (expand-file-name path))
+          (let* ((full (monk-watch-real-path path))
                  (dir (file-name-directory (directory-file-name full))))
             (push (cons full node) (alist-get dir index nil nil #'equal))))))
     index))
 
 (defun monk-watch--nodes-for-file (watch file)
-  "Return the nodes in WATCH whose owned path is FILE or contains it."
-  (let ((full (expand-file-name file))
+  "Return the nodes in WATCH whose owned path is FILE or contains it.
+FILE is compared as a real path, like the index."
+  (let ((full (monk-watch-real-path file))
         (hits nil))
     (dolist (entry (monk-watch-path-index watch))
       (dolist (cell (cdr entry))
@@ -303,15 +346,45 @@ writes the kernel reports late."
          (t
           (dolist (f (cons file rest))
             (monk-watch--adopt-new-file watch f)
-            (dolist (node (monk-watch--nodes-for-file watch f))
-              (monk-watch--queue watch (monk-node-key node) f action)))))))))
+            (let ((nodes (monk-watch--nodes-for-file watch f)))
+              (if nodes
+                  (dolist (node nodes)
+                    (monk-watch--queue watch (monk-node-key node) f action))
+                (monk-watch--unmanaged watch f action))))))))))
+
+(defvar monk-watch--unmanaged-seen nil
+  "Paths already reported as unmanaged, so a busy directory logs once.")
+
+(defconst monk-watch-unmanaged-log-limit 3
+  "How many unmanaged paths are logged by name before the log goes quiet.
+A flat watch on a parent such as ~ sees every file written there;
+after a few, the count in `monk-watch-status' is the record.")
+
+(defvar monk-watch--unmanaged-count 0
+  "Unmanaged events seen since the watch started.")
+
+(defun monk-watch--unmanaged (watch file action)
+  "Note that WATCH saw ACTION on FILE, which no resource owns.
+The first few are logged by name, at info, so a watch that looks dead
+can be checked; after that only the count grows."
+  (ignore watch)
+  (cl-incf monk-watch--unmanaged-count)
+  (unless (member file monk-watch--unmanaged-seen)
+    (push file monk-watch--unmanaged-seen)
+    (cond
+     ((<= (length monk-watch--unmanaged-seen) monk-watch-unmanaged-log-limit)
+      (monk-log 'info "%s %s %s: not managed by any resource" (monk-watch-glyph) action file))
+     ((= (length monk-watch--unmanaged-seen) (1+ monk-watch-unmanaged-log-limit))
+      (monk-log 'info "%s more unmanaged paths; see the event count in the status" (monk-watch-glyph))))))
 
 (defun monk-watch--queue (watch key path action)
   "Record on WATCH drift on KEY at PATH after ACTION; arm the debounce timer."
   (unless (member key (monk-watch-pending watch))
     (push key (monk-watch-pending watch))
     (push (cons key (format "%s %s" action path)) (monk-watch-pending-reasons watch))
-    (monk-watch--log "drift %s:%s (%s %s)" (car key) (cdr key) action path)
+    (monk-watch--log "%s %s:%s  %s %s"
+                     (if (monk-watch--utf8-p) monk-watch-glyph-drift "drift")
+                     (car key) (cdr key) action path)
     (run-hook-with-args 'monk-watch-functions 'drift (list :key key :path path :action action)))
   (when (monk-watch-debounce-timer watch)
     (cancel-timer (monk-watch-debounce-timer watch)))
@@ -337,7 +410,7 @@ REASONS is an alist of (KEY . TEXT) for the log."
   (let ((monk-watch--running t)
         (mode monk-watch-mode))
     (cl-incf (monk-watch-runs watch))
-    (monk-watch--log "%s run for %d key(s): %s" mode (length keys)
+    (monk-watch--log "%s run for %d key%s: %s" mode (length keys) (if (= 1 (length keys)) "" "s")
                      (mapconcat (lambda (k) (format "%s:%s" (car k) (cdr k))) keys ", "))
     (unwind-protect
         (let ((run (apply #'monk-orchestrate
@@ -398,21 +471,60 @@ A partial path at the end of a chunk waits for the next one."
   (unless (process-live-p proc)
     (monk-watch--log "fswatch exited: %s" (string-trim event))))
 
+(defun monk-watch--fswatch-paths (watch)
+  "Return (FLAT . TREES) for WATCH: directories to watch flat, subtrees to walk.
+A resource that owns a subtree (a git checkout, an rsync source tree,
+a managed directory) gets its own path, walked.  Any other owned path
+gets its parent directory, not walked: FSEvents reports the changed
+file's own path, so the parent is enough, and walking ~ would report
+every application's scratch file.  A parent already inside a walked
+tree is dropped."
+  (let (flat trees)
+    (dolist (entry (monk-watch-path-index watch))
+      (dolist (cell (cdr entry))
+        (let ((path (car cell))
+              (node (cdr cell)))
+          (if (and (monk-resource-owns-subtree-p (monk-node-resource node))
+                   (file-directory-p path))
+              (cl-pushnew (directory-file-name path) trees :test #'equal)
+            (when (file-directory-p (car entry))
+              (cl-pushnew (directory-file-name (car entry)) flat :test #'equal))))))
+    (setq flat (seq-remove (lambda (d)
+                             (seq-some (lambda (tree)
+                                         (or (equal d tree)
+                                             (string-prefix-p (file-name-as-directory tree) d)))
+                                       trees))
+                           flat))
+    (cons (sort flat #'string<) (sort trees #'string<))))
+
+(defun monk-watch--fswatch-spawn (name paths recursive)
+  "Start one fswatch called NAME over PATHS, walking them when RECURSIVE."
+  (let ((proc (apply #'start-process name nil monk-watch-fswatch-program
+                     (append (and recursive '("--recursive"))
+                             monk-watch-fswatch-args
+                             (mapcan (lambda (re) (list "--exclude" re))
+                                     monk-watch-fswatch-excludes)
+                             paths))))
+    (set-process-filter proc #'monk-watch--fswatch-filter)
+    (set-process-sentinel proc #'monk-watch--fswatch-sentinel)
+    (set-process-query-on-exit-flag proc nil)
+    proc))
+
 (defun monk-watch--fswatch-start (watch)
-  "Start one fswatch over every indexed directory of WATCH that exists."
-  (let ((dirs (seq-filter #'file-directory-p (mapcar #'car (monk-watch-path-index watch)))))
-    (when dirs
-      (let ((proc (apply #'start-process "monk-fswatch" nil monk-watch-fswatch-program
-                         (append monk-watch-fswatch-args
-                                 (mapcan (lambda (re) (list "--exclude" re))
-                                         monk-watch-fswatch-excludes)
-                                 dirs))))
-        (set-process-filter proc #'monk-watch--fswatch-filter)
-        (set-process-sentinel proc #'monk-watch--fswatch-sentinel)
-        (set-process-query-on-exit-flag proc nil)
+  "Start fswatch for WATCH.
+One flat process over parent directories of owned files, one
+recursive process over owned subtrees.  Return the first process
+started, or nil when nothing exists to watch."
+  (pcase-let ((`(,flat . ,trees) (monk-watch--fswatch-paths watch)))
+    (when flat
+      (let ((proc (monk-watch--fswatch-spawn "monk-fswatch" flat nil)))
         (setf (monk-watch-process watch) proc)
-        (dolist (d dirs) (push (cons d proc) (monk-watch-watched watch)))
-        proc))))
+        (dolist (d flat) (push (cons d proc) (monk-watch-watched watch)))))
+    (when trees
+      (let ((proc (monk-watch--fswatch-spawn "monk-fswatch-trees" trees t)))
+        (setf (monk-watch-tree-process watch) proc)
+        (dolist (d trees) (push (cons d proc) (monk-watch-watched watch)))))
+    (or (monk-watch-process watch) (monk-watch-tree-process watch))))
 
 ;;;; Start and stop
 
@@ -482,16 +594,25 @@ machines get filesystem notifications; remote ones are polled every
     (when (seq-remove #'monk-machine-local-p machines)
       (setf (monk-watch-poll-timer watch)
             (run-at-time monk-watch-poll-interval monk-watch-poll-interval #'monk-watch--poll)))
-    (monk-watch--log "started: %d machine(s), %s, %d remote polled every %ds, mode %s"
-                     (length machines)
-                     (pcase backend
-                       ('fswatch (format "fswatch over %d dir(s)" (length (monk-watch-watched watch))))
-                       ('filenotify (format "%d filenotify watch(es)%s"
-                                            (length (monk-watch-descriptors watch))
-                                            (if (monk-watch-file-watch-needed-p) " (dirs and files, kqueue)" "")))
-                       (_ "no local backend"))
-                     (length (seq-remove #'monk-machine-local-p machines))
-                     monk-watch-poll-interval monk-watch-mode)
+    (setq monk-watch--unmanaged-seen nil
+          monk-watch--unmanaged-count 0)
+    (let ((remote (length (seq-remove #'monk-machine-local-p machines)))
+          (local (length (seq-filter #'monk-machine-local-p machines))))
+      (monk-watch--log "started: %s, %s%s, mode %s"
+                       (cond ((and (> local 0) (> remote 0))
+                              (format "%d machines: %d local, %d remote" (length machines) local remote))
+                             ((> remote 0) (format "%d remote machine%s" remote (if (= 1 remote) "" "s")))
+                             (t (format "%d local machine%s" local (if (= 1 local) "" "s"))))
+                       (pcase backend
+                         ('fswatch (format "fswatch over %d dir%s" (length (monk-watch-watched watch))
+                                           (if (= 1 (length (monk-watch-watched watch))) "" "s")))
+                         ('filenotify (format "%d filenotify watch%s%s"
+                                              (length (monk-watch-descriptors watch))
+                                              (if (= 1 (length (monk-watch-descriptors watch))) "" "es")
+                                              (if (monk-watch-file-watch-needed-p) ", dirs and files on kqueue" "")))
+                         (_ (if (> local 0) "no local backend" "no local machine")))
+                       (if (> remote 0) (format ", remote polled every %ds" monk-watch-poll-interval) "")
+                       monk-watch-mode))
     (run-hook-with-args 'monk-watch-functions 'started (list :watch watch))
     watch))
 
@@ -504,16 +625,18 @@ machines get filesystem notifications; remote ones are polled every
       (dolist (desc (monk-watch-descriptors watch))
         (when (file-notify-valid-p desc)
           (file-notify-rm-watch desc)))
-      (when (process-live-p (monk-watch-process watch))
-        (set-process-sentinel (monk-watch-process watch) nil)
-        (delete-process (monk-watch-process watch)))
+      (dolist (proc (list (monk-watch-process watch) (monk-watch-tree-process watch)))
+        (when (process-live-p proc)
+          (set-process-sentinel proc nil)
+          (delete-process proc)))
       (when (monk-watch-debounce-timer watch)
         (cancel-timer (monk-watch-debounce-timer watch)))
       (when (monk-watch-poll-timer watch)
         (cancel-timer (monk-watch-poll-timer watch)))
       (setq monk-watch--current nil)
-      (monk-watch--log "stopped after %d event(s), %d run(s)"
-                       (monk-watch-events watch) (monk-watch-runs watch))
+      (monk-watch--log "stopped after %d event%s, %d run%s"
+                       (monk-watch-events watch) (if (= 1 (monk-watch-events watch)) "" "s")
+                       (monk-watch-runs watch) (if (= 1 (monk-watch-runs watch)) "" "s"))
       (run-hook-with-args 'monk-watch-functions 'stopped (list :watch watch)))))
 
 ;;;###autoload
@@ -528,10 +651,10 @@ machines get filesystem notifications; remote ones are polled every
   "Return a one-line description of the active watch, or nil."
   (when monk-watch--current
     (let ((w monk-watch--current))
-      (format "%s, %s, %d dir(s), %d event(s), %d run(s), up %s"
+      (format "%s, %s, %d dir(s), %d event(s) (%d unmanaged), %d run(s), up %s"
               monk-watch-mode (or (monk-watch-backend w) "no local backend")
               (length (monk-watch-watched w))
-              (monk-watch-events w) (monk-watch-runs w)
+              (monk-watch-events w) monk-watch--unmanaged-count (monk-watch-runs w)
               (format-seconds "%hh%mm%ss" (float-time (time-since (monk-watch-started w))))))))
 
 (provide 'monk-watch)

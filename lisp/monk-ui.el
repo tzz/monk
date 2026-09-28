@@ -98,7 +98,7 @@
   "Smallest bar height in pixels.")
 
 (defconst monk-ui-status-order
-  (list monk-status-failed monk-status-partial monk-status-repaired
+  (list monk-status-unreachable monk-status-failed monk-status-partial monk-status-repaired
         monk-status-would-repair monk-status-kept monk-status-skipped)
   "Bar layer order, bottom to top, and sort order for detail buffers.")
 
@@ -153,6 +153,11 @@ steal focus.  t always selects.  nil only displays."
   '((((background dark)) :foreground "#f85149")
     (t :foreground "#cf222e"))
   "Resource failed.")
+
+(defface monk-ui-unreachable
+  '((((background dark)) :foreground "#d2a8ff" :slant italic)
+    (t :foreground "#8250df" :slant italic))
+  "Machine did not answer.  Purple, apart from red: not a policy failure.")
 
 (defface monk-ui-skipped
   '((((background dark)) :foreground "#6e7681")
@@ -245,6 +250,44 @@ steal focus.  t always selects.  nil only displays."
     (t :foreground "#ffffff" :background "#6e7781"))
   "One class in the machine inspector.")
 
+(defface monk-ui-facts-fresh
+  '((((background dark)) :foreground "#8b949e")
+    (t :foreground "#6e7781"))
+  "Age of facts that are within `monk-fact-ttl'.")
+
+(defface monk-ui-facts-stale
+  '((((background dark)) :foreground "#d29922" :weight bold)
+    (t :foreground "#9a6700" :weight bold))
+  "Age badge of stale facts.
+Facts older than `monk-fact-ttl', or from the cache of a machine that
+did not answer.  What the guards saw may not be what is.")
+
+(defun monk-ui-facts-age-string (seconds)
+  "Return SECONDS as a short age: 3m, 2h, 5d."
+  (cond ((< seconds 60) (format "%ds" (round seconds)))
+        ((< seconds 3600) (format "%dm" (round (/ seconds 60))))
+        ((< seconds 86400) (format "%dh" (round (/ seconds 3600))))
+        (t (format "%dd" (round (/ seconds 86400))))))
+
+(defun monk-ui-facts-badge (m)
+  "Return a short badge that says how old and how trustworthy M's facts are.
+Empty when the facts were gathered live in this session: nothing to
+say.  `·3h' in grey for fresh cached facts, `!2d' in amber for stale
+ones, `?' when there are no facts at all."
+  (let ((age (monk-machine-facts-age m)))
+    (cond
+     ((null (oref m facts)) (propertize "?" 'face 'monk-ui-facts-stale
+                                        'help-echo "no facts gathered"))
+     ((eq (oref m facts-source) 'live) "")
+     ((null age) "")
+     ((monk-machine-facts-fresh-p m)
+      (propertize (concat "·" (monk-ui-facts-age-string age)) 'face 'monk-ui-facts-fresh
+                  'help-echo (format "facts from the cache, %s old, within monk-fact-ttl"
+                                     (monk-ui-facts-age-string age))))
+     (t (propertize (concat "!" (monk-ui-facts-age-string age)) 'face 'monk-ui-facts-stale
+                    'help-echo (format "facts from the cache, %s old, past monk-fact-ttl: stale"
+                                       (monk-ui-facts-age-string age)))))))
+
 (defface monk-ui-match
   '((t :inherit monk-ui-kept :weight bold))
   "A machine that a query matched.")
@@ -259,6 +302,7 @@ steal focus.  t always selects.  nil only displays."
     (,monk-status-would-repair . monk-ui-would-repair)
     (,monk-status-partial . monk-ui-partial)
     (,monk-status-failed . monk-ui-failed)
+    (,monk-status-unreachable . monk-ui-unreachable)
     (,monk-status-skipped . monk-ui-skipped)
     (,monk-status-running . monk-ui-running)
     (,monk-status-pending . monk-ui-pending))
@@ -288,6 +332,7 @@ steal focus.  t always selects.  nil only displays."
     (,monk-status-would-repair "◐" "~")
     (,monk-status-partial "◒" "%")
     (,monk-status-failed "✗" "!")
+    (,monk-status-unreachable "⊘" "x")
     (,monk-status-skipped "–" "-")
     (,monk-status-running "▶" ">")
     (,monk-status-pending "·" "."))
@@ -643,6 +688,7 @@ merged results of finished passes."
    ((and monk-ui--live-nodes
          (< (apply #'+ (mapcar #'cdr counts)) (monk-ui--machine-total machine-name)))
     monk-status-pending)
+   ((> (alist-get monk-status-unreachable counts 0) 0) monk-status-unreachable)
    ((> (alist-get monk-status-failed counts 0) 0) monk-status-failed)
    ((> (alist-get monk-status-partial counts 0) 0) monk-status-partial)
    ((> (alist-get monk-status-would-repair counts 0) 0) monk-status-would-repair)
@@ -798,7 +844,12 @@ a plan gains a Plan column."
                          (alist-get monk-status-partial counts 0))))
          (list name
                (vconcat
-                (list (propertize name 'face 'monk-ui-machine)
+                (list (let ((m (monk-ui--run-machine name)))
+                        (concat (propertize name 'face 'monk-ui-machine)
+                                (if (and m (not (string-empty-p (monk-ui-facts-badge m))))
+                                    (concat " " (monk-ui-facts-badge m))
+                                  "")
+                                (monk-ui-batch-badge name)))
                       (if (eq verdict monk-status-running)
                           (concat (monk-ui-spinner) " "
                                   (propertize "running" 'face 'monk-ui-running))
@@ -812,6 +863,26 @@ a plan gains a Plan column."
                      (list (if comparison (monk-ui--machine-plan-cell name comparison) "")))
                 (list (format "%.1fs" (monk-ui--machine-duration name)))))))
      (monk-ui--machine-names))))
+
+(defun monk-ui-batch-badge (name)
+  "Return a badge with the batch number of machine NAME, or the empty string.
+Only a run split by :serial has batches.  A batch that never started
+because an earlier one failed past the threshold is marked."
+  (let* ((run (or monk-ui--live-run monk-ui--run))
+         (batches (and run (monk-run-batches run)))
+         (index (and batches (seq-position batches name (lambda (batch n) (member n batch))))))
+    (if (null index)
+        ""
+      (let* ((number (1+ index))
+             (stopped (monk-run-stopped-at-batch run))
+             (skipped (and stopped (> number stopped))))
+        (concat " "
+                (propertize (format "b%d%s" number (if skipped "×" ""))
+                            'face (if skipped 'monk-ui-skipped 'monk-ui-key)
+                            'help-echo (cond
+                                        (skipped (format "Batch %d of %d: never started, batch %d failed past :max-fail-percentage"
+                                                         number (length batches) stopped))
+                                        (t (format "Batch %d of %d (:serial)" number (length batches))))))))))
 
 (defun monk-ui--header-line ()
   "Return the header line: run summary and a total bar."
@@ -861,6 +932,14 @@ a plan gains a Plan column."
                                     (and (> n 0) (monk-ui-badge status (number-to-string n)))))
                                 monk-ui-status-order))
                   " ")
+       (if (and run (monk-run-stopped-at-batch run))
+           (concat "  " (propertize (format "%s stopped at batch %d/%d"
+                                            (monk-ui-glyph monk-status-failed)
+                                            (monk-run-stopped-at-batch run)
+                                            (length (monk-run-batches run)))
+                                    'face 'monk-ui-failed
+                                    'help-echo "More machines failed in that batch than :max-fail-percentage allows; later batches were skipped."))
+         "")
        (if (and run (not monk-ui--live-run) (monk-run-flapping-p run))
            (concat "  " (propertize (format "%s flapping %d"
                                             (monk-ui-glyph monk-status-partial)
@@ -989,11 +1068,12 @@ and the planned status when it differs.  RUN supplies drift reasons."
     (when (and (monk-result-changes result) (not (monk-result-diff result)))
       (insert (propertize (format "    %s\n" (monk-describe-changes (monk-result-changes result)))
                           'face 'monk-ui-skipped)))
-    (when (monk-result-diff result)
-      (let ((start (point)))
-        (insert (monk-result-diff result))
-        (unless (bolp) (insert "\n"))
-        (monk-ui--fontify-diff start (point))))))
+    (let ((text (monk-result-diff-text result)))
+      (when text
+        (let ((start (point)))
+          (insert text)
+          (unless (bolp) (insert "\n"))
+          (monk-ui--fontify-diff start (point)))))))
 
 (defun monk-ui--fontify-diff (start end)
   "Apply diff faces between START and END."
@@ -1004,6 +1084,7 @@ and the planned status when it differs.  RUN supplies drift reasons."
                         ((looking-at "^@@") 'diff-hunk-header)
                         ((looking-at "^\\+") 'diff-added)
                         ((looking-at "^-") 'diff-removed)
+                        ((looking-at "^[a-z]+: .* → ") 'diff-changed)
                         (t nil))))
         (when face
           (add-text-properties (line-beginning-position) (line-end-position)
@@ -1135,6 +1216,16 @@ the prefix argument, show the file in another window.  `M-,' returns."
       (insert (propertize (format " %s " class) 'face 'monk-ui-class) " "))
     (insert "\n  " (propertize "groups  " 'face 'monk-ui-key)
             (mapconcat #'symbol-name (alist-get 'groups description) " ") "\n")
+    (insert "  " (propertize "facts from " 'face 'monk-ui-key)
+            (pcase (oref m facts-source)
+              ('live "this session, gathered live")
+              ('cache (let ((age (monk-machine-facts-age m)))
+                        (concat "the cache, " (monk-ui-facts-age-string (or age 0)) " old, "
+                                (if (monk-machine-facts-fresh-p m)
+                                    (propertize "fresh" 'face 'monk-ui-facts-fresh)
+                                  (propertize "stale" 'face 'monk-ui-facts-stale)))))
+              (_ (propertize "nowhere yet" 'face 'monk-ui-facts-stale)))
+            "\n")
     (dolist (section '(facts vars))
       (insert "  " (propertize (format "%s" section) 'face 'monk-ui-key) "\n")
       (if (null (alist-get section description))
@@ -1148,10 +1239,14 @@ the prefix argument, show the file in another window.  `M-,' returns."
 OPEN unfolds it.  Return the heading position.  The heading carries
 M in the `monk-ui-machine' property, so `.' jumps to the inventory."
   (let ((heading (monk-ui-insert-fold (intern (format "machine-%s" (oref m name)))
-                                      (format "%s: %d classes, %d facts, %d vars  (TAB to expand)"
+                                      (format "%s: %d classes, %d facts%s, %d vars  (TAB to expand)"
                                               (oref m name)
                                               (length (oref m classes))
                                               (length (oref m facts))
+                                              (pcase (oref m facts-source)
+                                                ('live "")
+                                                ('cache (format " %s" (monk-ui-facts-badge m)))
+                                                (_ (if (oref m facts) "" " ?")))
                                               (length (oref m vars)))
                                       (lambda () (monk-ui--insert-machine-description m))
                                       open)))
@@ -1240,7 +1335,7 @@ GATHER passes to `monk-cell-matches'."
                                           (t 'monk-ui-no-match))
                               'monk-ui-machine m)
                   (propertize (cond (failed (format "%s" (cadr result)))
-                                    ((null (oref m facts)) "no facts gathered yet; g gathers")
+                                    ((null (oref m facts)) "no facts yet; g gathers")
                                     (t (monk-cell-explain m form notation)))
                               'face 'monk-ui-skipped)
                   "\n")
@@ -1293,6 +1388,86 @@ over the network.  Press `e' to edit the guard, `q' to close."
   "Gather facts for machines in this query that have none, then evaluate again."
   (interactive)
   (monk-ui--query-render monk-ui--query-text monk-ui--query-machines t))
+
+;;;; Check policy: compile only
+
+(defconst monk-ui-check-buffer-name "*monk-check*"
+  "Buffer of `monk-ui-check-policy'.")
+
+(defvar monk-ui-check-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map special-mode-map)
+    (define-key map (kbd "q") #'monk-ui-quit)
+    (define-key map (kbd "TAB") #'monk-ui-toggle-fold)
+    (define-key map (kbd "<tab>") #'monk-ui-toggle-fold)
+    (define-key map (kbd ".") #'monk-ui-find-definition)
+    (define-key map (kbd "M-.") #'monk-ui-find-definition)
+    map)
+  "Keymap for `monk-ui-check-mode'.")
+
+(define-derived-mode monk-ui-check-mode special-mode "Monk-Check"
+  "A policy compiled with no connection: resources, tags, and errors.
+\\{monk-ui-check-mode-map}")
+
+(defun monk-ui-check-policy (machines policy &rest options)
+  "Compile POLICY for MACHINES without a connection and show the outcome.
+OPTIONS are as for `monk-check-policy'.  Each machine's resources are
+listed with their type, tags, and, under :tags or :skip-tags, whether
+the selection would run them.  Errors and unresolved requisites come
+first.  `.' jumps to a resource's definition, `q' closes."
+  (let* ((report (apply #'monk-check-policy machines policy options))
+         (buffer (get-buffer-create monk-ui-check-buffer-name))
+         (selected (plist-get report :selected))
+         (selecting (or (plist-get options :tags) (plist-get options :skip-tags)))
+         (inhibit-read-only t))
+    (with-current-buffer buffer
+      (monk-ui-check-mode)
+      (erase-buffer)
+      (insert (propertize (if (monk-check-policy-ok-p report) " CHECK OK " " CHECK FAILED ")
+                          'face (if (monk-check-policy-ok-p report) 'monk-ui-apply-badge 'monk-ui-failed))
+              (format "  %d machine(s), %d resource(s), %d tag(s)%s\n"
+                      (length (plist-get report :machines)) (length (plist-get report :nodes))
+                      (length (plist-get report :tags))
+                      (if selecting (format ", %d selected by tags %S skip %S" (length selected)
+                                            (plist-get options :tags) (plist-get options :skip-tags))
+                        "")))
+      (dolist (cell (plist-get report :errors))
+        (insert (propertize (format "  %s error: " (monk-ui-glyph monk-status-failed)) 'face 'monk-ui-failed)
+                (car cell) ": " (cdr cell) "\n"))
+      (dolist (text (plist-get report :unresolved))
+        (insert (propertize (format "  %s unresolved: " (monk-ui-glyph monk-status-failed)) 'face 'monk-ui-failed)
+                text "\n"))
+      (when (plist-get report :tags)
+        (insert "  " (propertize "tags " 'face 'monk-ui-key))
+        (dolist (tag (plist-get report :tags))
+          (insert (propertize (format " %s " tag) 'face 'monk-ui-class) " "))
+        (insert "\n"))
+      (dolist (name (plist-get report :machines))
+        (let ((nodes (seq-filter (lambda (n) (equal (oref (monk-node-machine n) name) name))
+                                 (plist-get report :nodes))))
+          (insert "\n" (propertize name 'face 'monk-ui-machine 'monk-ui-machine (and nodes (monk-node-machine (car nodes))))
+                  (format "  %d resource(s)\n" (length nodes)))
+          (dolist (node nodes)
+            (let* ((r (monk-node-resource node))
+                   (key (monk-node-key node))
+                   (in (or (not selecting) (member key selected)))
+                   (start (point)))
+              (insert (format "  %s %-14s %s"
+                              (if selecting (monk-ui-glyph (if in monk-status-kept monk-status-skipped)) " ")
+                              (monk-resource-type r) (oref r name)))
+              (when (oref r tags)
+                (insert "  ")
+                (dolist (tag (oref r tags))
+                  (insert (propertize (format " %s " tag) 'face 'monk-ui-class) " ")))
+              (insert "\n")
+              (put-text-property start (point) 'monk-ui-result
+                                 (monk-result-create :machine name :name (oref r name)
+                                                     :type (monk-resource-type r) :origin (oref r origin)))
+              (unless in
+                (add-face-text-property start (point) 'monk-ui-skipped))))))
+      (goto-char (point-min)))
+    (pop-to-buffer buffer)
+    report))
 
 (defun monk-ui-show-machine (&optional machine-name)
   "Show the results for MACHINE-NAME, or the machine at point.

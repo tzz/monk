@@ -29,7 +29,7 @@
 ;; tree), so this is a justified shell call.
 ;;
 ;;   (monk-rsync "dotfiles to work" '("~/.zshrc" "~/.zshenv") "work:"
-;;               :follow-links t)
+;;               :follow-links t :perms t)
 ;;   (monk-rsync "tmux plugins" '("~/.tmux/plugins/") "work:.tmux/plugins/"
 ;;               :archive t :delete t)
 ;;
@@ -57,11 +57,34 @@
 (defconst monk-rsync-stats-files-regexp "^Number of files: \\([0-9,]+\\)"
   "The `--stats' line that counts every file rsync looked at.")
 
+(defconst monk-rsync-suspect-item-regexp "\\`[<>ch.*][fdLDS]"
+  "A line that starts like an itemize entry.  Used to spot parser gaps.")
+
+(defconst monk-rsync-not-a-change-regexp
+  (concat "\\`\\(?:"
+          "\\.d\\.\\.[tT]\\.*"          ; directory, mtime only
+          "\\|[<>.][fdLDS]\\.\\.T\\.*"  ; anything, time would be stamped only
+          "\\|\\.L\\.\\.\\.p\\.*"     ; symlink, permission bits only
+          "\\)\\'")
+  "Itemize entries that are not drift.
+`.d..t......': a directory whose only difference is its mtime; rsync
+sets it as a side effect of touching the content.  `..T.......' on
+anything: the item is identical and rsync would only stamp the time
+because times are not preserved; without this a sync without `-t'
+reports the same files on every run and the run flaps.
+`.L...p.....': a symlink whose only difference is its mode; Linux
+gives every symlink 0777 and cannot change it, macOS keeps a mode on
+links, so a Mac to Linux sync reports these forever.  A mode (`p') or
+owner (`o', `g') difference on a file or directory keeps the line.")
+
 (defconst monk-rsync-unreachable-exit 255
   "Exit code rsync gives when ssh could not connect.")
 
-(defconst monk-rsync-item-regexp "\\`\\([<>ch.*][fdLDS][^ ]\\{7,9\\}\\|\\*deleting\\) +\\(.*\\)\\'"
-  "One `--itemize-changes' line: the flags, then the path.")
+(defconst monk-rsync-item-regexp "\\`\\([<>ch.][fdLDS][^ ]\\{9,10\\}\\|\\*deleting\\) +\\(.*\\)\\'"
+  "One `--itemize-changes' line: the flags, then the path.
+The flag field is 11 characters up to protocol 30 and 12 from
+protocol 31 on, which is why the middle run is 9 or 10 wide.  rsync
+3.2 on Linux printed 11 in the sandbox; rsync on macOS printed 12.")
 
 
 (defcustom monk-rsync-reach-port 22
@@ -115,13 +138,22 @@ while sshd is down.  Cached per run under (reachable HOST PORT)."
                 :documentation "rsync destination: `host:path' or a local path.")
    (archive :initarg :archive
             :initform nil
-            :documentation "Pass -a.")
+            :documentation "Recursive, links kept, perms, times, devices: rsync's -a
+without -o and -g.  A sync as an ordinary user cannot set owner or
+group, and the remote group is often not the local one, so -a
+itself re-reports every file on every run.  Add \"-o\" \"-g\" in
+:options for a root sync that must carry ownership.")
    (recursive :initarg :recursive
               :initform nil
               :documentation "Pass -r.  Implied by :archive.")
    (follow-links :initarg :follow-links
                  :initform nil
                  :documentation "Pass -L: copy what links point to.")
+   (perms :initarg :perms
+          :initform nil
+          :documentation "Pass -p and -t: carry permissions and times.  Implied by :archive.
+Without -p a directory created on the destination gets the remote
+umask.  Without -t rsync re-stamps identical files on every run.")
    (delete :initarg :delete
            :initform nil
            :documentation "Pass --delete: remove destination files absent from the source.")
@@ -146,9 +178,10 @@ Both are availability, not policy: a mock run asks neither."
 
 (defun monk--rsync-arguments (r m)
   "Return the rsync argument list for R on M, without the dry-run flags."
-  (append (and (oref r archive) '("-a"))
+  (append (and (oref r archive) '("-rlptD"))
           (and (oref r recursive) (not (oref r archive)) '("-r"))
           (and (oref r follow-links) '("-L"))
+          (and (oref r perms) (not (oref r archive)) '("-p" "-t"))
           (and (oref r delete) '("--delete"))
           (mapcar (lambda (p) (concat "--exclude=" p)) (oref r excludes))
           (oref r options)
@@ -159,25 +192,44 @@ Both are availability, not policy: a mock run asks neither."
   "Return (CHANGED . TOTAL) from rsync OUTPUT with itemize and stats.
 CHANGED is the list of \"FLAGS PATH\" lines for items rsync would
 touch.  rsync itemizes changed items only, so TOTAL comes from the
-`--stats' file count, for the degree; it is nil without stats.  A
-pure attribute change on a directory (`.d..t......') is not counted:
-rsync sets those times as a side effect of other changes."
-  (let ((changed nil) (total nil))
+`--stats' file count, for the degree; it is nil without stats.
+Entries that `monk-rsync-not-a-change-regexp' names are not counted."
+  (let ((changed nil) (total nil) (unparsed nil)
+        ;; t and T mean different things in itemize flags.
+        (case-fold-search nil))
     (dolist (line (split-string output "\n" t))
       (cond
        ((string-match monk-rsync-stats-files-regexp line)
         (setq total (string-to-number (string-replace "," "" (match-string 1 line)))))
-       ((and (string-match monk-rsync-item-regexp line)
-             (not (string-prefix-p ".d" (match-string 1 line))))
-        (push line changed))))
+       ((string-match monk-rsync-item-regexp line)
+        (unless (string-match-p monk-rsync-not-a-change-regexp (match-string 1 line))
+          (push line changed)))
+       ((string-match-p monk-rsync-suspect-item-regexp line)
+        (push line unparsed))))
+    ;; A line that looks like an itemize entry but did not parse is a
+    ;; parser gap, and a gap reads as "nothing to do".  Say so.
+    (when unparsed
+      (monk-log 'warn "rsync: %d itemize line(s) not understood, first: %S"
+                (length unparsed) (car (last unparsed))))
     (cons (nreverse changed) total)))
 
+(defconst monk-rsync-repair-args '("--itemize-changes" "--out-format=%i %n")
+  "Arguments that make the real transfer name what it did, line by line.")
+
 (defun monk--rsync-run (r m dry-run)
-  "Run rsync for R on M.  With DRY-RUN, itemize only.  Return the `monk-exec'."
+  "Run rsync for R on M.  With DRY-RUN, itemize only.  Return the `monk-exec'.
+The real run itemizes too, so the repair comment can name the items."
   (apply #'monk-exec m monk-rsync-program
-         (append (and dry-run monk-rsync-check-args)
+         (append (if dry-run monk-rsync-check-args monk-rsync-repair-args)
                  (monk--rsync-arguments r m)
                  (list :sudo (oref r sudo)))))
+
+(defconst monk-rsync-comment-items 3
+  "How many synced items the repair comment names before it counts the rest.")
+
+(defun monk-rsync--item-name (line)
+  "Return the path part of itemize LINE, with a symlink arrow kept."
+  (if (string-match monk-rsync-item-regexp line) (match-string 2 line) line))
 
 (cl-defmethod monk-check ((r monk-rsync-resource) (m monk-machine))
   (let ((exec (monk--rsync-run r m t)))
@@ -199,14 +251,29 @@ rsync sets those times as a side effect of other changes."
                           0.0))))))))
 
 (cl-defmethod monk-repair ((r monk-rsync-resource) (m monk-machine) changes)
+  "Transfer R to its destination on M.  The comment names what rsync moved.
+That is the real run's itemize output, not the dry run's list in
+CHANGES: the two can differ when the source moved in between."
   (let ((exec (monk--rsync-run r m nil)))
     (unless (monk-exec-ok-p exec)
       (signal 'monk-exec-error
               (list (oref m name) (monk-exec-command exec) (monk-exec-exit-code exec)
                     (string-trim (monk-exec-output exec)))))
-    (format "synced %d item%s to %s" (length (plist-get changes :sync))
-            (if (= 1 (length (plist-get changes :sync))) "" "s")
-            (oref r destination))))
+    (let* ((moved (car (monk-rsync-parse-itemize (monk-exec-output exec))))
+           (names (mapcar #'monk-rsync--item-name moved))
+           (shown (seq-take names monk-rsync-comment-items))
+           (rest (- (length names) (length shown))))
+      (cond
+       ((null moved)
+        ;; The dry run saw a change and the real run moved nothing: the
+        ;; source changed back, or rsync decided differently.  Say so,
+        ;; and keep the dry run's view for the record.
+        (format "rsync moved nothing; the check had %d item%s: %s"
+                (length (plist-get changes :sync))
+                (if (= 1 (length (plist-get changes :sync))) "" "s")
+                (string-join (mapcar #'monk-rsync--item-name (plist-get changes :sync)) ", ")))
+       (t (format "%s -> %s%s" (string-join shown ", ") (oref r destination)
+                  (if (> rest 0) (format " (+%d more)" rest) "")))))))
 
 (cl-defmethod monk-resource-paths ((r monk-rsync-resource))
   "The sources of R: a change under one of them is drift for the sync."
@@ -215,23 +282,19 @@ rsync sets those times as a side effect of other changes."
 (cl-defmethod monk-resource-owns-subtree-p ((_r monk-rsync-resource))
   t)
 
-(defun monk-rsync (name sources destination &rest args)
-  "Ensure DESTINATION mirrors SOURCES through rsync.  NAME identifies the sync.
-SOURCES is a list of paths.  ARGS: :archive :recursive :follow-links
-:delete :excludes :options :reachable HOST, and common keys."
-  (monk-add-resource
-   (apply #'monk-rsync-resource
-          :name name
-          (monk--resource-plist args
-                                :sources sources
-                                :destination destination
-                                :archive (plist-get args :archive)
-                                :recursive (plist-get args :recursive)
-                                :follow-links (plist-get args :follow-links)
-                                :delete (plist-get args :delete)
-                                :excludes (plist-get args :excludes)
-                                :options (plist-get args :options)
-                                :reachable (plist-get args :reachable)))))
+(monk-define-resource monk-rsync monk-rsync-resource
+  "Ensure DESTINATION mirrors SOURCES through rsync."
+  ((name :type string :doc "Identifies the sync.")
+   (sources :type list :doc "Source paths; a trailing / means the contents, as in rsync.")
+   (destination :type string :doc "rsync destination: host:path or a local path."))
+  ((archive :type boolean :doc "-rlptD: recursive, links kept, perms, times, devices; never -o -g.")
+   (recursive :type boolean :doc "-r.  Implied by :archive.")
+   (follow-links :type boolean :doc "-L: copy what links point to.")
+   (perms :type boolean :doc "-p -t: carry permissions and times.  Implied by :archive.")
+   (delete :type boolean :doc "--delete: remove destination files absent from the source.")
+   (excludes :type list :doc "Patterns for --exclude.")
+   (options :type list :doc "Extra rsync arguments, verbatim.")
+   (reachable :type string :doc "Host to probe on the ssh port first; unreachable means skipped.")))
 
 (provide 'monk-sync)
 ;;; monk-sync.el ends here

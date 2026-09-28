@@ -84,11 +84,30 @@ A command without `:creates` or `:unless` is always kept. With `:watch` it becom
 (monk-watch-start (monk-inventory-select 'home) #'my-policy)
 ```
 
+## Declared parameters
+
+Every constructor is defined with `monk-define-resource`, which declares its positional and keyword parameters with a type, a default, choices, aliases, and a one-line doc, the way an Ansible module declares its `argument_spec`. A call is checked when the policy compiles: an unknown keyword, a wrong type, a value outside the choices, a missing required parameter, or two parameters that exclude each other signals `monk-argument-error` with the parameter list, for example `Unsupported parameter for monk-directory: :mdoe.  Supported parameters include: :group, :mode, :owner`. An explicit nil for an optional parameter means not given. The same declaration writes the constructor's docstring and fills `monk-resource-specs`, which the documentation and the importers read.
+
+## Unreachable machines
+
+A machine that does not answer is not a failed policy. When a connection fails, at fact time or during a resource, every remaining resource on that machine gets the status `unreachable` (Ansible's `dark`) without being tried, resources on other machines that require one of them skip with `HOST is unreachable`, and the run's `monk-run-unreachable` lists the machine and the first line of the error. Unreachable results have their own purple glyph and count and stay out of the degree math. `monk-run-ok-p` is nil unless the machine has `ignore-unreachable`, set by the inventory variable `ignore_unreachable`, for a laptop that comes and goes. Batch entry points exit with Ansible's bit-safe codes from `monk-run-exit-code`: 0, 2 when something failed, 4 when a machine was unreachable, 6 for both; the run-end event carries `exit_code` and `unreachable`.
+
 ## Run controls
+
+`:changed-when` and `:failed-when` on `monk-command` take a function of the `monk-exec` or a CELL form over `(rc)`, `(stdout)`, and `(stderr)`. With `:changed-when` the command runs on every pass as a query and is repaired only when the predicate holds, so a command can have a real check without `:creates`. `:failed-when` replaces the exit-code rule in both directions. A predicate that errors fails the resource with the reason. Ansible's `changed_when` and `failed_when`.
+
+`:no-log t` on any resource replaces the result's changes, diff, and comment with `[censored: no-log]` before anything records or shows them: the ledger, the history, etcd, the socket, the reports, and the log. Status and degree stay. A `line-in-file` with `:no-log` also hashes the line out of its resource name. Ansible's `no_log`.
+
+`:tags '(ssh slow)` on any resource lets a run select by name: `(monk-plan machines policy :tags '(ssh) :skip-tags '(slow))`. The rules are Ansible's `evaluate_tags`: `always` runs unless a skip names it or `all`, `never` runs only when named, `all`, `tagged`, and `untagged` select by presence of tags. The selection feeds `:only`, so requisites still pull in what a selected resource needs and everything else compiles and reports `skipped`. A selection that matches nothing runs nothing. `monk-check-policy` lists the tags in use.
+
+`:serial` on `monk-orchestrate` rolls a change out in batches: `:serial 1`, `:serial "25%"`, or a list such as `'(1 "25%" "100%")` whose last entry repeats. The graph is one, so a resource in a later batch can `:require` one from an earlier batch, but a batch runs to convergence before the next starts. `:max-fail-percentage 20` is the circuit breaker: when more than that share of a batch's machines failed or were unreachable, the remaining batches do not start and their resources report `skipped` with `an earlier batch failed past :max-fail-percentage`. Failures count per batch, not cumulatively, which departs from Ansible on purpose (its cumulative count is an accident of the code). The run records `monk-run-batches` and `monk-run-stopped-at-batch`; the `*monk*` row shows `b2`, or `b3×` for a batch that never started, and the header says where it stopped. A plan never stops.
+
+`(monk-check-policy MACHINES POLICY)` compiles with no connection at all: machines use the facts they have, cached or none. It returns the nodes, every tag in use, per-machine compile errors such as a bad CELL form or an unknown keyword, and requisite refs that resolve to nothing. With `:tags`/`:skip-tags` it also returns the keys the selection would run. `monk-ui-check-policy` shows it in `*monk-check*`, with `.` to jump to a resource. `emacs --batch -l monk -f monk-batch-check POLICY-FILE` prints the same and exits 1 on a problem, for CI. Ansible's `--syntax-check`, `--list-tasks`, and `--list-tags`.
+
 
 These come from Salt and apply to any resource.
 
-`:retry PLIST` tries a failed check or repair again inside the same pass: `(:attempts 3 :interval 5 :backoff 2 :splay 1 :until success)`. `:attempts` is the total number of tries, `:interval` the wait before try two, each later wait is the previous one times `:backoff`, `:splay` adds up to that many random seconds, `:until` is `success` or `failure`. `:retry t` takes `monk-retry-defaults` (2 tries, 30 seconds, no backoff). `monk-retry-max-interval` caps one wait. The wait uses `sit-for`, so the display updates and `C-g` works; the run is still synchronous. A plan reports the retry policy and does not wait. The result comment says `attempt N of M` when more than one try ran.
+`:retry PLIST` tries a failed check or repair again inside the same pass: `(:attempts 3 :interval 5 :backoff 2 :splay 1 :until success)`. `:attempts` is the total number of tries, `:interval` the wait before try two, each later wait is the previous one times `:backoff`, `:splay` adds up to that many random seconds, `:until` is `success`, `failure`, or a function of the result that says when to stop (Ansible's `until`). `:retry t` takes `monk-retry-defaults` (2 tries, 30 seconds, no backoff). `monk-retry-max-interval` caps one wait. The wait uses `sit-for`, so the display updates and `C-g` works; the run is still synchronous. A plan reports the retry policy and does not wait. The result comment says `attempt N of M` when more than one try ran.
 
 `:verify` on `monk-command` runs after the command: a `(PROGRAM . ARGS)` list that must exit zero, or a function of the machine that returns nil or a reason. A failed verification fails the resource with the output as comment. Salt's `check_cmd`. Other resources need none, because the next pass re-checks them.
 
@@ -124,6 +143,8 @@ CEL is Google's Common Expression Language. A string guard is CEL. Monk translat
 ```
 
 `monk-cell-to-cel` prints a CELL form as CEL with the fewest parentheses that CEL precedence allows, and the output parses back to an equal form. `monk-cell-explain MACHINE FORM` returns why a guard is true or false. `monk-cell-select GUARD MACHINES` returns the machines that match. `monk-cell-matches` keeps the result or error per machine.
+
+`(get X KEY...)` walks an alist by keys and gives nil when a key is absent, so `(get (fact local) monk role)` reads a nested local fact. In CEL the same is `facts.local.monk.role`. `(machine-fact HOST KEY)`, `(machine-var HOST KEY)`, and `(machine-class HOST SYM)` read another inventory machine, so one host can depend on what another is: `(= (machine-fact leader arch) (fact arch))`. They read the facts as known, live or cached, and never open a connection; a machine with no facts yields nil.
 
 `:only-if FN` and `:not-if FN` stay for guards that must run code on the host. Their skip comment only names the function, because Monk cannot look inside it.
 
@@ -183,7 +204,7 @@ Bridge resources in `monk-bridge.el` call another tool installed on the target. 
 |---|---|
 | `(monk-rsync NAME SOURCES DEST &key archive recursive follow-links delete excludes options reachable)` | DEST mirrors SOURCES through rsync. Check is `rsync --dry-run --itemize-changes --stats`; the changed items are the changes and the degree is the share of files already in step. `:reachable HOST` probes the ssh port first and skips with `HOST is not reachable` instead of failing. Needs rsync. |
 | `(monk-launchd LABEL &key plist loaded daemon)` | A launchd job on macOS: its plist under `~/Library/LaunchAgents` (or `/Library/LaunchDaemons` with `:daemon`) rendered from an alist by `monk-launchd-plist`, and its loaded state through `launchctl bootstrap`/`bootout`. The systemd-unit of macOS. |
-| `(monk-ansible NAME MODULE ARGS &key become)` | One Ansible module through `ansible localhost -c local -m MODULE -a ... -o`. Check uses `--check --diff`. ARGS is an alist. A module without check mode counts as changed. |
+| `(monk-ansible NAME MODULE ARGS &key become)` | One Ansible module. With `monk-ansible-library` set to a directory that holds the `ansible` Python package, the module runs directly: `python3 -m ansible.modules.MODULE` on the target with `{"ANSIBLE_MODULE_ARGS": ...}` on stdin and `PYTHONPATH` pointing at a zip of `module_utils`, `_vendor`, and `modules` that Monk builds once from the library and copies once to `~/.cache/monk` on each target. No controller Ansible, no inventory, no tmpdir; about 0.1s per call. Check mode passes `_ansible_check_mode` and `_ansible_diff`; the result's `diff` becomes structured entries (content or attributes), a non-zero exit without `failed` is failed, and `_ansible_new_secrets` values are masked. Without the library, the old path runs `ansible localhost -c local -m MODULE -a ... -o` on the target. Modules that live in an action plugin (`template`, `copy` with a local `src`, `fetch`, `package`, `service`) need the CLI path or a native Monk resource. |
 | `(monk-salt NAME FUNCTION ARGS &key id)` | One Salt state through `salt-call --local --out=json`. Alone it uses `state.single`; independent salt resources on one machine aggregate into one `state.high` call with Salt's own requisites among them. Check uses `test=True`. `monk-salt-read-function` completes over `sys.list_state_functions`, cached per run. |
 
 Both parse JSON and map `changed`, `failed`, `result`, `changes`, and `comment` onto Monk results. Neither is verified against a live install in this tree. The parsers are tested against captured output shapes.
@@ -211,6 +232,8 @@ Both parse JSON and map `changed`, `failed`, `result`, `changes`, and `comment` 
 
 A host with no `:address` is the local machine. `self` selects the host whose name matches `system-name`.
 
+Derived groups follow the facts, like Salt's derived grains or Ansible's `group_by` and `keyed_groups`. `(monk-group 'big-disk "facts.disk > 100")` puts every machine whose guard is true into `big-disk`. `(monk-keyed-groups "facts.distribution" "distro")` makes one group per value, `distro_ubuntu`, `distro_macos`. Derived membership is recomputed whenever facts arrive, live or from the cache, and `monk-inventory-select` and `(group SYM)` see it like any other group. `monk-inventory-clear-derived` forgets the rules.
+
 ## Plan and apply
 
 `monk-plan` is a dry run. It returns a run whose results say `would-repair` where a change is needed and `kept` where none is. Nothing on the machine changes. `monk-apply` takes that run, repeats its policy on its machines for real, and links the plan to the new run. `monk-run-compare` then gives one verdict per resource.
@@ -229,7 +252,7 @@ A host with no `:address` is the local machine. `self` selects the host whose na
 
 `monk-watch.el` keeps a policy enforced between runs. `(monk-watch-start MACHINES POLICY)` compiles the policy, asks every resource which paths it owns through `monk-resource-paths`, and waits for changes to them.
 
-Local machines have two backends, chosen by `monk-watch-backend`. On macOS with `fswatch` installed (`brew install fswatch`), Monk runs one `fswatch --recursive --print0` over every parent directory of an owned path and reads the NUL-separated paths through a process filter. FSEvents is recursive and reports writes, so one process covers everything and a file created later needs no new watch. Elsewhere, and on macOS without `fswatch`, Monk uses `filenotify.el` on the parent directory of each owned path, because a directory watch sees creates, deletes, and renames, which a file watch misses. On kqueue a directory watch does not report writes to the files inside it, so Monk also watches every owned file that exists and adopts a file the moment its directory reports it created. `fswatch` is the better choice on a Mac: kqueue costs one file descriptor per watched file. An event maps to the resources that own the path, and to the resources that require or watch those, transitively. Monk then runs only that set with `:only`; the rest of the policy compiles so requisites resolve, and is skipped. A burst of events within `monk-watch-debounce` seconds makes one run. Events during a run and for `monk-watch-settle` seconds after are dropped, because Monk's own repairs also touch watched paths.
+Local machines have two backends, chosen by `monk-watch-backend`. On macOS with `fswatch` installed (`brew install fswatch`), Monk runs two `fswatch --print0` processes and reads the NUL-separated paths through a process filter: one flat over the parent directories of owned files, one `--recursive` over owned subtrees (a managed directory, a git checkout, an rsync source tree). The home directory that holds a few managed dotfiles is watched flat, never walked; walking it reported every application's scratch file under `~/Library`. FSEvents reports the changed file's own path, so a flat parent watch sees writes, creates, and deletes of the files in it. An event on a path no resource owns is counted and, for the first few, logged at info; `monk-watch-status` shows the count. An event maps to the resources that own the path, and to the resources that require or watch those or own the same path, transitively. Elsewhere, and on macOS without `fswatch`, Monk uses `filenotify.el` on the parent directory of each owned path, because a directory watch sees creates, deletes, and renames, which a file watch misses. On kqueue a directory watch does not report writes to the files inside it, so Monk also watches every owned file that exists and adopts a file the moment its directory reports it created. `fswatch` is the better choice on a Mac: kqueue costs one file descriptor per watched file. Monk then runs only that set with `:only`; the rest of the policy compiles so requisites resolve, and is skipped. A burst of events within `monk-watch-debounce` seconds makes one run. Events during a run and for `monk-watch-settle` seconds after are dropped, because Monk's own repairs also touch watched paths.
 
 Remote machines have no notification channel over TRAMP. Monk polls them: every `monk-watch-poll-interval` seconds, default 300, a dry run finds resources that would change, and those count as drift.
 
@@ -257,6 +280,10 @@ In `*monk*`, `h` opens `*monk-history*`: newest run first with kind, hosts, coun
 
 An agent answers `{"op":"history-runs", ...}` and `{"op":"history-results", ...}` over its socket with the same filters as JSON keys (`dry_run`, `since`, `changed`, `limit`...). `monk-agent-history MACHINE 'runs FILTERS` asks a remote machine for its history without reading its database. CELL cannot read history on purpose: a guard must give the same answer while the facts are the same.
 
+## Terminal output
+
+`monk-cli.el` is what a batch Emacs shows on a terminal. When standard error is a terminal, one status line at the bottom is rewritten in place with a spinner, the pass, the count of nodes done, and the machine, type, and name of the resource in progress; every changed or failed result prints above it as a permanent line the moment it finishes, and the summary replaces the status line at the end. Columns are sized once per run from the longest machine and type names, so the line does not jump. Off a terminal (a pipe, a log file, launchd) nothing is rewritten and no escape bytes are written; the permanent lines and the summary still print. Color follows `TERM`, `NO_COLOR`, and `monk-cli-color`. The agent turns this on; `monk-cli-enable` does it for any batch entry point.
+
 ## Execution modes
 
 Monk runs in three modes that share one engine and differ in who decides.
@@ -266,6 +293,8 @@ Monk runs in three modes that share one engine and differ in who decides.
 | Standalone | `emacs --batch -f monk-agent-main` on the host, from systemd or launchd | nobody: local policy applies on drift and on a timer | ledger file and journald; a central Monk observes by tailing it |
 | Supervised | the central Emacs, over TRAMP | a human, through the plan buffer and `a` | `*monk*` |
 | Autopilot | the central Emacs, over TRAMP, driven by `monk-watch` | nobody | `*monk*` and the watch log |
+
+Two `ansible-pull` habits are options of the agent. `monk-agent-splay` (seconds, default 0) delays the first converge and each timed one by a random amount up to that, so a fleet does not hit a shared server at the same second. `monk-agent-policy-repo` names the git checkout the policy is loaded from; before each timed converge the agent fast-forwards it through VC and, when HEAD moved, reloads `monk-agent-policy-file`. With `monk-agent-only-if-changed` set, a timed converge runs only after the checkout moved; the converge on start and the drift watch always run. A failed fetch is logged and the converge uses the policy on disk.
 
 Supervised and autopilot are `monk-watch-mode`. Standalone is `monk-agent.el`. The agent converges the local policy on start, watches owned paths in autopilot, and converges in full every `monk-agent-full-interval` seconds (3600). It appends every event to `monk-agent-ledger-file` as JSON Lines and mirrors them to journald through `systemd-cat` when present. `(monk-agent-observe MACHINE)` on the central Monk runs `tail -F` on that ledger through TRAMP and dispatches each parsed event to `monk-agent-observe-functions`; there is no port and no daemon beyond SSH. The agent and a controller applying the same policy do not fight: both apply the same policy, and the settle window drops the events the other side produced.
 
@@ -319,7 +348,15 @@ A set resource, one that manages several members, returns `:degree` in its chang
 
 ## Facts
 
-`monk-gather-facts` runs the probes in `monk-fact-probes`. The default probes give `kernel`, `arch`, `nodename`, `hostname`, `os-family`, `distribution`, `distribution-release`, `distribution-version`, `home`, and `user`. Register a probe with `monk-register-fact-probe`.
+`monk-gather-facts` runs the probes in `monk-fact-probes`. The default probes give `kernel`, `arch`, `nodename`, `hostname`, `os-family`, `distribution`, `distribution-release`, `distribution-version`, `home`, `user`, `pkg-mgr`, and `service-mgr`. Register a probe with `monk-register-fact-probe`.
+
+`pkg-mgr` and `service-mgr` name the first manager found on the machine from `monk-package-managers` and `monk-service-managers`; they are classes too. `(monk-package NAME PACKAGES)` and `(monk-service NAME ...)` dispatch on them: brew or apt, launchd or systemd. A machine with a manager Monk has no resource for gets a `monk-unsupported` placeholder that reports skipped with the reason, so one policy compiles everywhere.
+
+Local facts come from `*.fact` files in the directories of `monk-facts-d-directories`: `~/.config/monk/facts.d`, `/etc/monk/facts.d`, and `/etc/ansible/facts.d`, so a host that already publishes facts for Ansible needs nothing new. Each file gives one key under the `local` fact. JSON parses first, INI second, and an executable file is run for its output. A file that fails to parse contributes its error text, visible in the inspector.
+
+Facts are cached when `monk-history` is loaded. A gather stores them in the history database, and the next compile within `monk-fact-ttl` (a day) reads them back instead of probing the host, so a plan over many machines starts at once. Set `monk-fact-ttl` to nil to always probe; `monk-facts-flush` drops the cache for a machine. The `*monk*` machine row, the fold heading in the detail buffer, and the inspector's `facts from` line show a badge with the age of cached facts: grey `·3h` when fresh, amber `!2d` when older than the TTL and Monk could not refresh them, `?` when a machine has none. Live facts show no badge.
+
+`monk-diff` returns a list of `monk-diff-entry` structs, not a string. An entry has a kind: `content`, a unified diff of text; `attributes`, before and after values of mode, owner, and group; or `rendered`, text a resource produced itself. `monk-result-diff-text` renders a result's entries for the report, and the event stream carries them structured, so a consumer can tell a mode change from a content change without parsing a diff.
 
 ## Test drive, tour, tutorial
 

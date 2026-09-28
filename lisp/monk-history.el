@@ -62,22 +62,6 @@
 
 ;;;; Location
 
-(defconst monk-home-environment-variable "MONK_HOME"
-  "Environment variable that names the Monk state directory.")
-
-(defconst monk-home-root-directory "/etc/monk"
-  "Monk state directory when Emacs runs as root.")
-
-(defun monk-home-directory ()
-  "Return the directory for Monk state on this host.
-$MONK_HOME wins.  Root uses `monk-home-root-directory'.  Anyone else
-uses $XDG_DATA_HOME/monk or ~/.local/share/monk."
-  (file-name-as-directory
-   (or (getenv monk-home-environment-variable)
-       (if (zerop (user-uid))
-           monk-home-root-directory
-         (expand-file-name "monk" (or (getenv "XDG_DATA_HOME") "~/.local/share"))))))
-
 (defcustom monk-history-file nil
   "Path of the history database.
 Nil means history.sqlite under `monk-home-directory'."
@@ -91,7 +75,7 @@ Nil means history.sqlite under `monk-home-directory'."
 
 ;;;; Schema
 
-(defconst monk-history-schema-version 2
+(defconst monk-history-schema-version 4
   "Schema version stored in the `meta' table.")
 
 (defconst monk-history-schema
@@ -108,6 +92,7 @@ Nil means history.sqlite under `monk-home-directory'."
        ok INTEGER,
        kept INTEGER, repaired INTEGER, would_repair INTEGER,
        partial INTEGER, failed INTEGER, skipped INTEGER,
+       unreachable INTEGER,
        flapping TEXT,
        reasons TEXT)"
     "CREATE TABLE IF NOT EXISTS results (
@@ -124,6 +109,10 @@ Nil means history.sqlite under `monk-home-directory'."
        source TEXT,
        seq INTEGER,
        pass INTEGER)"
+    "CREATE TABLE IF NOT EXISTS facts (
+       machine TEXT PRIMARY KEY,
+       gathered TEXT NOT NULL,
+       facts TEXT NOT NULL)"
     "CREATE TABLE IF NOT EXISTS events (
        ts TEXT NOT NULL,
        tag TEXT NOT NULL,
@@ -138,7 +127,7 @@ Nil means history.sqlite under `monk-home-directory'."
 
 (defconst monk-history-run-columns
   '(id started ended dry_run hosts policy passes plan_id ok
-    kept repaired would_repair partial failed skipped flapping reasons)
+    kept repaired would_repair partial failed skipped unreachable flapping reasons)
   "Columns of the runs table, in table order.")
 
 (defconst monk-history-result-columns
@@ -178,7 +167,10 @@ Columns are added, never removed, so an old Monk still reads the file."
   (let ((columns (mapcar #'cadr (sqlite-select db "PRAGMA table_info(results)"))))
     (dolist (column '("seq" "pass"))
       (unless (member column columns)
-        (sqlite-execute db (format "ALTER TABLE results ADD COLUMN %s INTEGER" column))))))
+        (sqlite-execute db (format "ALTER TABLE results ADD COLUMN %s INTEGER" column)))))
+  (let ((columns (mapcar #'cadr (sqlite-select db "PRAGMA table_info(runs)"))))
+    (unless (member "unreachable" columns)
+      (sqlite-execute db "ALTER TABLE runs ADD COLUMN unreachable INTEGER"))))
 
 (defun monk-history-close ()
   "Close the database connection, if open."
@@ -228,6 +220,7 @@ A run id that exists already is replaced, so recording is idempotent."
                  (monk-run-count run monk-status-partial)
                  (monk-run-count run monk-status-failed)
                  (monk-run-count run monk-status-skipped)
+                 (monk-run-count run monk-status-unreachable)
                  (and (monk-run-flapping-p run)
                       (mapconcat (lambda (k) (format "%s:%s" (car k) (cdr k)))
                                  (monk-run-flapping run) " "))
@@ -251,7 +244,8 @@ A run id that exists already is replaced, so recording is idempotent."
                    (monk-history--json (and (monk-result-changes result)
                                             (monk-event--plist-to-alist (monk-result-changes result))))
                    (monk-result-comment result)
-                   (monk-result-diff result)
+                   (and (monk-result-diff result)
+                        (monk-event--json (monk-event-diff (monk-result-diff result))))
                    (* 1000.0 (monk-result-duration result))
                    (car (monk-result-origin result))
                    seq
@@ -286,6 +280,40 @@ Each is an alist (ts tag run_id data), with data parsed."
               (list (cons 'ts (nth 0 row)) (cons 'tag (nth 1 row)) (cons 'run_id (nth 2 row))
                     (cons 'data (and (nth 3 row) (monk-event-parse (nth 3 row))))))
             rows)))
+
+(defun monk-history-store-facts (m)
+  "Write the facts of machine M and their time into the facts table."
+  (sqlite-execute (monk-history-db)
+                  "INSERT OR REPLACE INTO facts (machine, gathered, facts) VALUES (?, ?, ?)"
+                  (list (oref m name)
+                        (monk-event--time (or (oref m gathered) (current-time)))
+                        (monk-event--json (monk-event--jsonable (oref m facts))))))
+
+(defun monk-history-load-facts (m)
+  "Return (FACTS . GATHERED) for machine M from the facts table, or nil."
+  (pcase (car (sqlite-select (monk-history-db)
+                             "SELECT gathered, facts FROM facts WHERE machine = ?"
+                             (list (oref m name))))
+    (`(,gathered ,facts)
+     (cons (mapcar (lambda (cell) (cons (car cell) (cdr cell)))
+                   (json-parse-string facts :object-type 'alist :null-object nil :false-object :false))
+           (parse-iso8601-time-string gathered)))))
+
+(defun monk-history-flush-facts (m)
+  "Remove the cached facts of machine M."
+  (sqlite-execute (monk-history-db) "DELETE FROM facts WHERE machine = ?" (list (oref m name))))
+
+(defun monk-history-facts-age (name)
+  "Return the age in seconds of the cached facts of machine NAME, or nil."
+  (pcase (car (sqlite-select (monk-history-db) "SELECT gathered FROM facts WHERE machine = ?" (list name)))
+    (`(,gathered) (float-time (time-since (parse-iso8601-time-string gathered))))))
+
+(defun monk-history-install-fact-cache ()
+  "Make the history database the fact cache."
+  (setq monk-fact-cache-functions
+        (list (cons 'store #'monk-history-store-facts)
+              (cons 'load #'monk-history-load-facts)
+              (cons 'flush #'monk-history-flush-facts))))
 
 (defun monk-history--on-progress (event data)
   "Record the run when EVENT is `run-end'.  DATA carries :run."
@@ -471,7 +499,14 @@ Machines are stand-ins named from the row; facts are empty."
                                          :null-object nil :false-object :false))
                    (error nil)))
    :comment (alist-get 'comment row)
-   :diff (alist-get 'diff row)
+   :diff (let ((raw (alist-get 'diff row)))
+           (and raw
+                (monk-event-diff-to-entries
+                 (condition-case nil
+                     (json-parse-string raw :object-type 'alist :array-type 'array
+                                        :null-object nil :false-object :false)
+                   ;; an older row holds the rendered text itself
+                   (error raw)))))
    :duration (/ (or (alist-get 'duration_ms row) 0) 1000.0)
    :origin (and (alist-get 'source row)
                 (cons (alist-get 'source row) (alist-get 'name row)))))
@@ -502,6 +537,7 @@ until, dry_run, changed, limit, offset."
                    rows)))
 
 (monk-history-mode 1)
+(monk-history-install-fact-cache)
 
 (provide 'monk-history)
 ;;; monk-history.el ends here

@@ -42,6 +42,10 @@
 ;;   (in X LIST)            X is an element of LIST
 ;;   (starts-with S P) (ends-with S P) (contains S P) (match S REGEXP)
 ;;   (size X)               length of a string or list
+;;   (get X KEY...)         walk alist X by KEYs; nil when a key is absent
+;;   (machine-fact HOST KEY) (machine-var HOST KEY) (machine-class HOST SYM)
+;;                          read another inventory machine, from its
+;;                          facts as known (live or cached); never a connection
 ;;   (list ...)             a literal list
 ;;   (+ A B) (- A B) (* A B) (/ A B) (% A B)
 ;;
@@ -93,8 +97,11 @@
 (defconst monk-cell-operators
   '(class group fact var name local classes groups facts vars has
     and or not if = /= < <= > >= in starts-with ends-with contains match
-    size list + - * / %)
-  "Every operator a CELL form can use.")
+    size list + - * / %
+    rc stdout stderr get machine-fact machine-var machine-class)
+  "Every operator a CELL form can use.
+`rc', `stdout', and `stderr' read a command result under
+`monk-cell-eval-with'; against a machine they are nil.")
 
 (defun monk-cell--arity (form min &optional max)
   "Signal unless FORM has between MIN and MAX arguments.  MAX nil: no bound."
@@ -146,10 +153,27 @@
       ('% (if (zerop b) (signal 'monk-guard-error (list "division by zero")) (mod a b)))))
    (t (signal 'monk-guard-error (list (format "%s cannot combine %S and %S" op a b))))))
 
+(defvar monk-cell--environment nil
+  "Alist of (NAME . VALUE) that zero-argument forms read before the machine.
+Bound by `monk-cell-eval-with', so a predicate can say (rc) or
+\(stdout) about a command result.")
+
+(defun monk-cell-eval-with (form environment)
+  "Evaluate CELL FORM with ENVIRONMENT, an alist of (NAME . VALUE), and no machine.
+A form (NAME) whose NAME is in ENVIRONMENT yields its value.  Machine
+forms signal, because there is no machine."
+  (let ((monk-cell--environment environment))
+    (monk-cell-eval nil form)))
+
 (defun monk-cell-eval (m form)
   "Evaluate CELL FORM against machine M.  Return its value.
-Signal `monk-guard-error' for a form that is not CELL."
+Signal `monk-guard-error' for a form that is not CELL.  Inside
+`monk-cell-eval-with', a zero-argument form named in the environment
+reads it instead."
   (cond
+   ((and monk-cell--environment (consp form) (null (cdr form))
+         (assq (car form) monk-cell--environment))
+    (cdr (assq (car form) monk-cell--environment)))
    ((or (stringp form) (numberp form) (eq form t) (null form)) form)
    ((not (consp form))
     (signal 'monk-guard-error
@@ -167,6 +191,7 @@ Signal `monk-guard-error' for a form that is not CELL."
       ('groups (monk-cell--arity form 0 0) (monk-cell--slot m 'groups))
       ('facts (monk-cell--arity form 0 0) (monk-cell--slot m 'facts))
       ('vars (monk-cell--arity form 0 0) (monk-cell--slot m 'vars))
+      ((or 'rc 'stdout 'stderr) (monk-cell--arity form 0 0) nil)
       ('has
        (monk-cell--arity form 1 1)
        (pcase (cadr form)
@@ -226,6 +251,28 @@ Signal `monk-guard-error' for a form that is not CELL."
                    (length value)
                  (signal 'monk-guard-error (list (format "size needs a string or list, got %S" value))))))
       ('list (mapcar (lambda (x) (monk-cell-eval m x)) (cdr form)))
+      ((or 'machine-fact 'machine-var 'machine-class)
+       (monk-cell--arity form 2 2)
+       (let* ((host (monk-cell-eval m (nth 1 form)))
+              (other (and (boundp 'monk-inventory)
+                          (seq-find (lambda (x) (string-equal-ignore-case (monk-cell--slot x 'name)
+                                                                          (format "%s" host)))
+                                    (symbol-value 'monk-inventory)))))
+         (unless other
+           (signal 'monk-guard-error (list (format "%s: no inventory machine named %s" (car form) host))))
+         (let ((key (let ((k (nth 2 form))) (if (stringp k) (intern k) k))))
+           (pcase (car form)
+             ('machine-fact (monk-machine-fact other key))
+             ('machine-var (monk-machine-var other key))
+             ('machine-class (and (monk-class-p other key) t))))))
+      ('get (monk-cell--arity form 2)
+            (let ((value (monk-cell-eval m (nth 1 form))))
+              (dolist (key (cddr form))
+                (let ((k (cond ((symbolp key) key) ((stringp key) (intern key))
+                               (t (signal 'monk-guard-error (list (format "get needs symbol or string keys, got %S" key)))))))
+                  (setq value (and (listp value) (consp (car-safe value))
+                                   (or (cdr (assq k value)) (cdr (assoc (symbol-name k) value)))))))
+              value))
       ((and (or '+ '- '* '/ '%) op)
        (monk-cell--arity form 2 2)
        (monk-cell--arith op (monk-cell-eval m (nth 1 form)) (monk-cell-eval m (nth 2 form))))
@@ -245,12 +292,14 @@ and wrong arities at policy load time."
    (t
     (pcase (car form)
       ((or 'class 'group 'fact 'var) (monk-cell--arity form 1 1) (monk-cell--key form))
-      ((or 'name 'local 'classes 'groups 'facts 'vars) (monk-cell--arity form 0 0))
+      ((or 'name 'local 'classes 'groups 'facts 'vars 'rc 'stdout 'stderr) (monk-cell--arity form 0 0))
       ('has (monk-cell--arity form 1 1)
             (unless (memq (car-safe (cadr form)) '(fact var))
               (signal 'monk-guard-error
                       (list (format "has needs (fact KEY) or (var KEY), got %S" (cadr form))))))
       ((or 'not 'size) (monk-cell--arity form 1 1) (monk-cell-check (cadr form)))
+      ('get (monk-cell--arity form 2) (monk-cell-check (cadr form)))
+      ((or 'machine-fact 'machine-var 'machine-class) (monk-cell--arity form 2 2) (monk-cell-check (cadr form)))
       ('if (monk-cell--arity form 2 3) (mapc #'monk-cell-check (cdr form)))
       ((or 'and 'or 'list) (mapc #'monk-cell-check (cdr form)))
       (_ (monk-cell--arity form 2 2) (mapc #'monk-cell-check (cdr form))))
@@ -553,6 +602,10 @@ SYM) form, so the report can name the class."
     (pcase base
       ('(facts) (list 'fact sym))
       ('(vars) (list 'var sym))
+      ;; deeper: facts.local.monk.role -> (get (fact local) monk role)
+      (`(fact ,_) (list 'get base sym))
+      (`(var ,_) (list 'get base sym))
+      (`(get . ,rest) (append (list 'get) rest (list sym)))
       (_ (monk-cel--error "Only facts and vars have members, not %s" (monk-cell-format base))))))
 
 (defun monk-cel--method (receiver name arguments)
@@ -671,6 +724,7 @@ Parentheses appear only where CEL precedence needs them."
       (`(var ,k) (format "vars.%s" k))
       (`(,(and single (or 'name 'local 'classes 'groups 'facts 'vars))) (symbol-name single))
       (`(has ,inner) (format "has(%s)" (monk-cell-to-cel inner)))
+    (`(get ,base . ,keys) (concat (monk-cell-to-cel base) "." (mapconcat #'symbol-name keys ".")))
       (`(size ,inner) (format "size(%s)" (monk-cell-to-cel inner)))
       (`(not ,inner) (concat "!" (monk-cell--cel-child inner self)))
       (`(and . ,parts)

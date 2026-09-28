@@ -67,6 +67,11 @@
 (require 'monk-system)
 (require 'monk-watch)
 (require 'monk-event)
+(require 'monk-cli)
+;; Every agent run goes to the history database when this Emacs has
+;; SQLite; the ledger is written in any case.
+(when (and (fboundp 'sqlite-available-p) (sqlite-available-p))
+  (require 'monk-history))
 
 (defgroup monk-agent nil
   "Standalone Monk agent."
@@ -82,19 +87,50 @@
 (defconst monk-agent-loop-interval 1.0
   "Seconds between wakeups of the batch loop.")
 
-(defcustom monk-agent-ledger-file
-  (if (zerop (user-uid))
-      "/var/lib/monk/events.ndjson"
-    (expand-file-name "monk/events.ndjson"
-                      (or (getenv "XDG_STATE_HOME") "~/.local/state")))
-  "Where the agent appends its events."
-  :type 'file)
+(defcustom monk-agent-ledger-file nil
+  "Where the agent appends its events.
+Nil means events.ndjson under `monk-home-directory', next to the
+history database."
+  :type '(choice (const nil) file))
+
+(defun monk-agent-ledger-path ()
+  "Return the ledger path."
+  (expand-file-name (or monk-agent-ledger-file
+                        (concat (monk-home-directory) "events.ndjson"))))
+
+(defcustom monk-agent-log-level 'warn
+  "`monk-log-level' while the agent loop runs.
+The agent prints its own lines per change and per run, so `info'
+logging repeats them.  Set to `info' to see passes and probes."
+  :type '(choice (const debug) (const info) (const warn) (const nil)))
 
 (defcustom monk-agent-full-interval 3600
   "Seconds between full converges.
 Drift watching covers owned paths; a full converge covers the rest:
 packages, cron, services, and paths whose parent did not exist yet."
   :type 'number)
+
+(defcustom monk-agent-splay 0
+  "Maximum random delay in seconds before the first and each full converge.
+Spreads a fleet's runs out so a shared server does not see them all
+at once.  Ansible's `ansible-pull --sleep'.  Zero means no delay."
+  :type 'natnum)
+
+(defcustom monk-agent-policy-repo nil
+  "Directory of the git checkout the policy is loaded from, or nil.
+When set, the agent fetches and fast-forwards it before each full
+converge.  When the checkout did not move and
+`monk-agent-only-if-changed' is non-nil, the full converge is skipped;
+the drift watch still runs.  Ansible's `ansible-pull -o'."
+  :type '(choice (const nil) directory))
+
+(defcustom monk-agent-only-if-changed nil
+  "When non-nil, a timed full converge runs only after the policy repo moved.
+The first converge on start always runs.  See `monk-agent-policy-repo'."
+  :type 'boolean)
+
+(defvar monk-agent--policy-revision nil
+  "The revision of `monk-agent-policy-repo' at the last converge.")
 
 (defconst monk-agent-socket-path "/run/monk/agent.sock"
   "Unix socket the query endpoint listens on.")
@@ -158,7 +194,7 @@ failed etcd call is logged and does not fail the run."
 
 (defun monk-agent-record (run)
   "Append the events of RUN to the ledger and journald."
-  (let ((file (expand-file-name monk-agent-ledger-file)))
+  (let ((file (monk-agent-ledger-path)))
     (make-directory (file-name-directory file) t)
     (monk-run-write-events run file)
     (dolist (event (monk-run-events run))
@@ -188,39 +224,132 @@ failed etcd call is logged and does not fail the run."
                                  (ok . ,(if (or (null run) (monk-run-ok-p run)) t :false)))
                                monk-agent--etcd-lease)))))
 
+(defcustom monk-agent-print-changes t
+  "When non-nil, the agent prints one line per changed or failed result.
+The summary line is printed in any case."
+  :type 'boolean)
+
 (defun monk-agent--report (run &optional _verbose)
-  "The agent's report function: record RUN, publish it, print one line."
+  "The agent's report function: record RUN, publish it, print the summary.
+Changed and failed results were printed as they finished by
+`monk-cli'; on a terminal they scrolled above the status line."
   (monk-agent-record run)
   (monk-agent--etcd (lambda () (monk-etcd-publish-run run)))
   (monk-agent--announce run)
-  (message "monk-agent: %s" (monk-run-summary run)))
+  (unless (and monk-agent-print-changes (memq #'monk-cli--progress monk-progress-functions))
+    (when monk-agent-print-changes
+      (dolist (r (monk-run-results run))
+        (when (or (monk-result-changed-p r) (monk-result-failed-p r))
+          (monk-cli-print-result r)))))
+  (monk-cli-print-line (format "%s %s  %s" (monk-cli--color "1" "monk-agent")
+                               (format-time-string "%T")
+                               (monk-cli-summary-line run))))
 
 ;;;; Loop
 
-(defun monk-agent--full-converge (policy)
-  "Converge the whole local POLICY and record it."
-  (let ((monk-watch--running t))
-    (monk-run-report (monk-converge (monk-local-machine) policy))))
+(defvar monk-inventory)
+(declare-function monk-inventory-find "monk-inventory" (name))
+
+(defun monk-agent-machine ()
+  "Return the machine the agent manages: this host.
+When an inventory is loaded and names this host, that entry is used,
+so inventory variables, groups, and their classes apply, as they do
+from a controller.  Otherwise a bare local machine."
+  (or (and (bound-and-true-p monk-inventory)
+           (fboundp 'monk-inventory-find)
+           (monk-inventory-find (car (split-string (system-name) "\\."))))
+      (monk-local-machine)))
+
+(defvar monk-agent--machine nil
+  "The machine of the running agent.")
+
+(defun monk-agent-splay-seconds ()
+  "Return a random delay in [0, `monk-agent-splay'] seconds, or 0."
+  (if (> monk-agent-splay 0) (random (1+ monk-agent-splay)) 0))
+
+(defun monk-agent-policy-revision ()
+  "Return the HEAD revision of `monk-agent-policy-repo', or nil without one."
+  (and monk-agent-policy-repo
+       (file-directory-p monk-agent-policy-repo)
+       (condition-case err
+           (monk--git-in monk-agent-policy-repo "rev-parse" "HEAD")
+         (error (monk-log 'warn "policy repo: %s" (error-message-string err)) nil))))
+
+(defun monk-agent-update-policy-repo ()
+  "Fetch and fast-forward `monk-agent-policy-repo'.
+Return `changed' when HEAD moved, `same' when it did not, and nil
+when there is no repo or the update failed.  A failed fetch is
+logged; the converge then runs with the policy already on disk."
+  (when monk-agent-policy-repo
+    (let ((before (monk-agent-policy-revision)))
+      (condition-case err
+          (progn
+            (monk--git-in monk-agent-policy-repo "pull" "--ff-only" "--quiet")
+            (let ((after (monk-agent-policy-revision)))
+              (setq monk-agent--policy-revision after)
+              (if (equal before after) 'same 'changed)))
+        (error (monk-log 'warn "policy repo update: %s" (error-message-string err)) nil)))))
+
+(defun monk-agent--full-converge (policy &optional timed)
+  "Converge the whole local POLICY and record it.
+With TIMED, this is a scheduled converge: wait a splay first, update
+the policy repo, and when `monk-agent-only-if-changed' is set and the
+repo did not move, skip the converge."
+  (when timed
+    (let ((delay (monk-agent-splay-seconds)))
+      (when (> delay 0)
+        (monk-log 'info "splay: %ds" delay)
+        (sleep-for delay))))
+  (let ((update (monk-agent-update-policy-repo)))
+    (when (eq update 'changed)
+      (monk-cli-print-line (format "policy repo moved to %s" (substring monk-agent--policy-revision 0 12)))
+      (when monk-agent-policy-file
+        (load monk-agent-policy-file nil t)))
+    (if (and timed monk-agent-only-if-changed monk-agent-policy-repo (not (eq update 'changed)))
+        (monk-log 'info "policy repo unchanged; full converge skipped")
+      (let ((monk-watch--running t))
+        (monk-run-report (monk-converge (or monk-agent--machine (monk-agent-machine)) policy))))))
 
 (defun monk-agent-stop ()
   "Make the agent loop return after the current iteration."
   (setq monk-agent--running nil))
 
-(defun monk-agent-main ()
-  "Run the standalone agent until `monk-agent-stop' or a signal.
-Uses `monk-batch-policy', set by the policy file loaded before this."
-  (let ((policy (or monk-batch-policy
+(defun monk-agent-main (&optional policy)
+  "Run the standalone agent until `monk-agent-stop', SIGTERM, or SIGINT.
+POLICY defaults to `monk-batch-policy', set by the policy file loaded
+before this.  Callable as `emacs --batch -l POLICY-FILE -f monk-agent-main'
+or from a wrapper that picks the policy itself.  Converges on start,
+then watches for drift in autopilot, then converges in full every
+`monk-agent-full-interval' seconds.  An interrupt (SIGINT) in a
+terminal stops it cleanly: the watch is torn down and the last run
+is already recorded."
+  (let ((policy (or policy monk-batch-policy
                     (signal 'monk-policy-error (list "monk-batch-policy is not set"))))
         (monk-report-function #'monk-agent--report)
+        (monk-log-level monk-agent-log-level)
         (monk-watch-mode 'autopilot)
-        (m (monk-local-machine)))
-    (setq monk-agent--running t)
-    (monk-log 'info "agent start on %s, ledger %s" (oref m name) monk-agent-ledger-file)
+        (m (monk-agent-machine)))
+    (setq monk-agent--running t
+          monk-agent--machine m)
+    (monk-cli-enable)
+    ;; In batch, SIGINT (C-c) raises `quit' out of `accept-process-output',
+    ;; and SIGTERM runs `kill-emacs-hook'.  Both must end the loop, not
+    ;; leave a half-torn watch.
+    (add-hook 'kill-emacs-hook #'monk-agent-stop)
+    (monk-cli-print-line
+     (format "%s start on %s, ledger %s, full converge every %ss%s"
+             (monk-cli--color "1" "monk-agent") (oref m name)
+             (abbreviate-file-name (monk-agent-ledger-path)) monk-agent-full-interval
+             (if monk-cli--tty "" "  (no terminal: progress off)")))
+    (let ((delay (monk-agent-splay-seconds)))
+      (when (> delay 0)
+        (monk-cli-print-line (format "splay: first converge in %ds" delay))
+        (sleep-for delay)))
     (monk-agent--full-converge policy)
     (monk-watch-start m policy)
     (setq monk-agent--full-timer
           (run-at-time monk-agent-full-interval monk-agent-full-interval
-                       #'monk-agent--full-converge policy))
+                       #'monk-agent--full-converge policy t))
     (when monk-agent-etcd
       (require 'monk-etcd)
       (setq monk-agent--etcd-timer
@@ -233,15 +362,19 @@ Uses `monk-batch-policy', set by the policy file loaded before this."
                                 (setq monk-agent--etcd-lease nil)
                                 (monk-agent--announce nil))))))))
     (unwind-protect
-        (while monk-agent--running
-          ;; Timers and file notifications fire inside this wait.
-          (accept-process-output nil monk-agent-loop-interval))
+        (condition-case nil
+            (while monk-agent--running
+              ;; Timers and file notifications fire inside this wait.
+              (accept-process-output nil monk-agent-loop-interval))
+          (quit (monk-cli-print-line "monk-agent: interrupted")))
+      (remove-hook 'kill-emacs-hook #'monk-agent-stop)
       (dolist (timer (list monk-agent--full-timer monk-agent--etcd-timer))
         (when timer (cancel-timer timer)))
       (setq monk-agent--full-timer nil
             monk-agent--etcd-timer nil)
       (monk-watch-stop)
-      (monk-log 'info "agent stop"))))
+      (monk-cli-disable)
+      (monk-cli-print-line "monk-agent: stop"))))
 
 ;;;; systemd units
 
@@ -360,7 +493,7 @@ endpoint, and common keys.  Call inside a policy."
 
 (defun monk-agent--ledger-tail (n)
   "Return the last N lines of the ledger as strings, oldest first."
-  (let ((file (expand-file-name monk-agent-ledger-file)))
+  (let ((file (monk-agent-ledger-path)))
     (if (not (file-exists-p file))
         nil
       (with-temp-buffer
@@ -389,7 +522,7 @@ endpoint, and common keys.  Call inside a policy."
         `((op . "status") (ok . t)
           (host . ,(system-name))
           (agent_active . ,(if (monk-agent--service-active-p) t :false))
-          (ledger . ,(expand-file-name monk-agent-ledger-file))
+          (ledger . ,(monk-agent-ledger-path))
           (last_run . ,(monk-agent--last-run-end)))))
       ("tail"
        (dolist (line (monk-agent--ledger-tail (or (alist-get 'n request) monk-agent-tail-default)))
@@ -417,7 +550,7 @@ endpoint, and common keys.  Call inside a policy."
                           (monk-agent--respond
                            (monk-event-result (plist-get data :result) live nil)))))
                      monk-progress-functions))
-              (run (monk-converge (monk-local-machine) policy :dry-run (equal op "plan"))))
+              (run (monk-converge (monk-agent-machine) policy :dry-run (equal op "plan"))))
          (monk-run-report run)
          (monk-agent--respond (monk-event-run 'run-end run))))
       (_

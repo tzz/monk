@@ -26,6 +26,7 @@
 ;;; Code:
 
 (require 'monk)
+(require 'monk-cell)
 (require 'vc-git)
 (require 'monk-file)
 (require 'format-spec)
@@ -118,8 +119,8 @@ treating them as disabled would repair forever.")
 
 (cl-defmethod monk-diff ((r monk-cron-resource) (m monk-machine) _changes)
   (let ((current (monk--cron-read r m)))
-    (monk--unified-diff current (monk--cron-compute r current)
-                        (format "crontab:%s" (or (oref r user) "self")))))
+    (list (monk-diff-content current (monk--cron-compute r current)
+                             (format "crontab:%s" (or (oref r user) "self"))))))
 
 (cl-defmethod monk-repair ((r monk-cron-resource) (m monk-machine) _changes)
   (let ((new (monk--cron-compute r (monk--cron-read r m))))
@@ -128,18 +129,13 @@ treating them as disabled would repair forever.")
       (monk-exec-string m "crontab" "-" :input new))
     (format "%s entry" (if (eq (oref r state) 'absent) "removed" "set"))))
 
-(defun monk-cron (name schedule job &rest args)
-  "Ensure the crontab has entry NAME running JOB on SCHEDULE.
-SCHEDULE is the five time fields as one string.  ARGS: :user :state
-and common keys."
-  (monk-add-resource
-   (apply #'monk-cron-resource
-          :name name
-          (monk--resource-plist args
-                                :schedule schedule
-                                :job job
-                                :user (plist-get args :user)
-                                :state (or (plist-get args :state) 'present)))))
+(monk-define-resource monk-cron monk-cron-resource
+  "Ensure the crontab has entry NAME running JOB on SCHEDULE."
+  ((name :type string :doc "Identifies the entry; written as a comment above it.")
+   (schedule :type string :doc "The five time fields as one string.")
+   (job :type string :doc "The command."))
+  ((user :type string :doc "Whose crontab; nil means the login user.  Needs sudo for others.")
+   (state :type symbol :default present :choices (present absent))))
 
 ;;;; git
 
@@ -235,17 +231,12 @@ non-zero exit."
 Watching the whole checkout would fire on every edit inside it."
   (list (concat (file-name-as-directory (oref r name)) ".git")))
 
-(defun monk-git (path repo &rest args)
-  "Ensure a git checkout of REPO at PATH.  ARGS: :branch :update and common keys."
-  (monk-add-resource
-   (apply #'monk-git-resource
-          :name path
-          (monk--resource-plist args
-                                :repo repo
-                                :branch (plist-get args :branch)
-                                :update (if (plist-member args :update)
-                                            (plist-get args :update)
-                                          t)))))
+(monk-define-resource monk-git monk-git-resource
+  "Ensure a git checkout of REPO at PATH."
+  ((path :type path :doc "The checkout directory.")
+   (repo :type string :doc "Remote URL."))
+  ((branch :type string :doc "Branch to check out; default `monk-git-default-branch'.")
+   (update :type boolean :default t :doc "Fast-forward an existing checkout on each run.")))
 
 ;;;; user-group
 
@@ -263,12 +254,13 @@ Watching the whole checkout would fire on every edit inside it."
   (monk-exec-string m "usermod" "-aG" (oref r group) (oref r user) :sudo t)
   (format "added %s to %s" (oref r user) (oref r group)))
 
-(defun monk-user-group (user group &rest args)
-  "Ensure USER is a member of GROUP.  ARGS: common keys."
-  (monk-add-resource
-   (apply #'monk-user-group-resource
-          :name (format "%s:%s" user group)
-          (monk--resource-plist args :user user :group group :sudo t))))
+(monk-define-resource monk-user-group monk-user-group-resource
+  "Ensure USER is a member of GROUP."
+  ((user :type string :doc "Login name.")
+   (group :type string :doc "Group name."))
+  ()
+  :sudo t
+  :name-form (format "%s:%s" user group))
 
 ;;;; sysctl
 
@@ -307,12 +299,13 @@ Watching the whole checkout would fire on every edit inside it."
 (cl-defmethod monk-resource-paths ((_r monk-sysctl-resource))
   (list monk-sysctl-config-file))
 
-(defun monk-sysctl (name value &rest args)
-  "Ensure kernel parameter NAME is VALUE.  ARGS: common keys."
-  (monk-add-resource
-   (apply #'monk-sysctl-resource
-          :name name
-          (monk--resource-plist args :value (format "%s" value) :sudo t))))
+(monk-define-resource monk-sysctl monk-sysctl-resource
+  "Ensure kernel parameter NAME is VALUE, live and in the sysctl config."
+  ((name :type string :doc "The parameter, for example net.core.somaxconn.")
+   (value :type any :doc "The value; printed with %s."))
+  ()
+  :sudo t
+  :init ((setq args (plist-put args :value (format "%s" value)))))
 
 ;;;; systemd-unit
 
@@ -376,10 +369,10 @@ Watching the whole checkout would fire on every edit inside it."
 
 (cl-defmethod monk-diff ((r monk-systemd-unit-resource) (m monk-machine) changes)
   (when (plist-get changes :content)
-    (monk--unified-diff (monk-file-read m (monk--systemd-unit-path r)
-                                        (not (oref r user-unit)))
-                        (oref r content)
-                        (monk--systemd-unit-path r))))
+    (list (monk-diff-content (monk-file-read m (monk--systemd-unit-path r)
+                                             (not (oref r user-unit)))
+                             (oref r content)
+                             (monk--systemd-unit-path r)))))
 
 (cl-defmethod monk-repair ((r monk-systemd-unit-resource) (m monk-machine) changes)
   (let ((notes nil))
@@ -415,21 +408,13 @@ Watching the whole checkout would fire on every edit inside it."
 (cl-defmethod monk-resource-paths ((r monk-systemd-unit-resource))
   (and (oref r content) (list (monk--systemd-unit-path r))))
 
-(defun monk-systemd-unit (name &rest args)
-  "Ensure systemd unit NAME.
-ARGS: :content :enabled :started :user-unit and common keys."
-  (monk-add-resource
-   (apply #'monk-systemd-unit-resource
-          :name name
-          (monk--resource-plist args
-                                :content (plist-get args :content)
-                                :enabled (if (plist-member args :enabled)
-                                             (plist-get args :enabled)
-                                           t)
-                                :started (if (plist-member args :started)
-                                             (plist-get args :started)
-                                           t)
-                                :user-unit (plist-get args :user-unit)))))
+(monk-define-resource monk-systemd-unit monk-systemd-unit-resource
+  "Ensure systemd unit NAME: its file, its enablement, and its active state."
+  ((name :type string :doc "Unit name with suffix, for example foo.service."))
+  ((content :type string :doc "Unit file content.  Nil leaves the file alone.")
+   (enabled :type boolean :default t)
+   (started :type boolean :default t)
+   (user-unit :type boolean :doc "A user unit, managed with systemctl --user.")))
 
 ;;;; launchd
 
@@ -507,9 +492,9 @@ numbers, t, nil (false), lists of strings (arrays), or alists (dicts)."
 
 (cl-defmethod monk-diff ((r monk-launchd-resource) (m monk-machine) changes)
   (when (plist-get changes :content)
-    (monk--unified-diff (monk-file-read m (monk--launchd-path r) (oref r daemon))
-                        (monk-launchd-plist (oref r name) (oref r plist))
-                        (monk--launchd-path r))))
+    (list (monk-diff-content (monk-file-read m (monk--launchd-path r) (oref r daemon))
+                             (monk-launchd-plist (oref r name) (oref r plist))
+                             (monk--launchd-path r)))))
 
 (cl-defmethod monk-repair ((r monk-launchd-resource) (m monk-machine) changes)
   (let* ((sudo (oref r daemon))
@@ -534,15 +519,39 @@ numbers, t, nil (false), lists of strings (arrays), or alists (dicts)."
 (cl-defmethod monk-resource-paths ((r monk-launchd-resource))
   (list (monk--launchd-path r)))
 
-(defun monk-launchd (label &rest args)
-  "Ensure launchd job LABEL.  ARGS: :plist ALIST, :loaded, :daemon, common keys."
-  (monk-add-resource
-   (apply #'monk-launchd-resource
-          :name label
-          (monk--resource-plist args
-                                :plist (plist-get args :plist)
-                                :loaded (if (plist-member args :loaded) (plist-get args :loaded) t)
-                                :daemon (plist-get args :daemon)))))
+(monk-define-resource monk-launchd monk-launchd-resource
+  "Ensure launchd job LABEL: its plist file and its loaded state."
+  ((label :type string :doc "The job label, for example org.monk.agent."))
+  ((plist :type alist :doc "The job as an alist; see `monk-launchd-plist'.  Nil: file not managed.")
+   (loaded :type boolean :default t)
+   (daemon :type boolean :doc "A system daemon under /Library/LaunchDaemons, else a user agent.")))
+
+;;;; service: generic over the machine's service manager
+
+(defun monk-service (name &rest args)
+  "Ensure service NAME through the machine's service manager.
+Dispatches on the `service-mgr' fact: systemd gives `monk-systemd-unit'
+\(NAME gets .service when it has no suffix), launchd gives
+`monk-launchd' (NAME is the label).  ARGS: :enabled :started for
+systemd, :loaded :plist for launchd, :user-unit or :daemon, and common
+keys; keys the other manager does not take are dropped.  Ansible's
+`service'."
+  (let ((manager (monk-machine-fact (monk-current-machine) 'service-mgr))
+        (rest (copy-sequence args)))
+    (pcase manager
+      ("systemd"
+       (cl-remf rest :loaded) (cl-remf rest :plist) (cl-remf rest :daemon)
+       (apply #'monk-systemd-unit
+              (if (string-match-p "\\." name) name (concat name ".service"))
+              rest))
+      ("launchd"
+       (cl-remf rest :enabled) (cl-remf rest :started) (cl-remf rest :user-unit) (cl-remf rest :content)
+       (when (plist-member rest :started)
+         (setq rest (plist-put rest :loaded (plist-get rest :started))))
+       (apply #'monk-launchd name rest))
+      (_ (apply #'monk-unsupported name
+                (format "service: no supported service manager (service-mgr is %s)" manager)
+                (monk--common-initargs args))))))
 
 ;;;; command
 
@@ -560,13 +569,40 @@ numbers, t, nil (false), lists of strings (arrays), or alists (dicts)."
            :documentation "After the command ran: a list (PROGRAM . ARGS) that must exit
 zero, or a function of the machine that returns nil when all is well
 and a reason string otherwise.  Salt's check_cmd.  A non-zero exit or
-a reason fails the resource, with the output as the comment."))
+a reason fails the resource, with the output as the comment.")
+   (changed-when :initarg :changed-when
+                 :initform nil
+                 :documentation "Decides `repaired' against `kept' from the command's own output.
+A function of the `monk-exec', or a CELL form over (rc), (stdout),
+(stderr).  The command then runs on every pass, as a query, and its
+result is what the predicate says.  Ansible's changed_when.")
+   (failed-when :initarg :failed-when
+                :initform nil
+                :documentation "Decides failure instead of the exit code.  Same forms as
+`changed-when'.  Ansible's failed_when."))
   "A command that runs unless CREATES exists or UNLESS-COMMAND succeeds.
 Without either guard the command is always kept and runs only as a
-watch action, so `:watch' makes it a handler in the Ansible sense.")
+watch action, so `:watch' makes it a handler in the Ansible sense.
+With CHANGED-WHEN it runs every pass and reports what the predicate
+decides.")
+
+(defun monk-command-predicate (predicate exec)
+  "Evaluate PREDICATE against EXEC, a `monk-exec'.  Return non-nil when it holds.
+PREDICATE is a function of EXEC, or a CELL form where (rc) is the exit
+code, (stdout) the output, and (stderr) the same output, because
+Monk merges the streams."
+  (cond
+   ((functionp predicate) (funcall predicate exec))
+   (t (let ((rc (monk-exec-exit-code exec))
+            (out (string-trim (monk-exec-output exec))))
+        (monk-cell-eval-with predicate
+                             `((rc . ,rc) (stdout . ,out) (stderr . ,out)))))))
 
 (cl-defmethod monk-check ((r monk-command-resource) (m monk-machine))
   (cond
+   ;; A query command runs every pass; the predicate decides after.
+   ((oref r changed-when)
+    (list :run (cons (oref r program) (oref r args)) :query t))
    ((and (null (oref r creates)) (null (oref r unless-command)))
     nil)
    ((and (oref r creates)
@@ -580,8 +616,24 @@ watch action, so `:watch' makes it a handler in the Ansible sense.")
    (t (list :run (cons (oref r program) (oref r args))))))
 
 (cl-defmethod monk-repair ((r monk-command-resource) (m monk-machine) _changes)
-  (let ((output (apply #'monk-exec-string m (oref r program)
-                       (append (oref r args) (list :sudo (oref r sudo))))))
+  (let* ((exec (apply #'monk-exec m (oref r program)
+                      (append (oref r args) (list :sudo (oref r sudo)))))
+         (output (string-trim (monk-exec-output exec)))
+         (failed (if (oref r failed-when)
+                     (monk-command-predicate (oref r failed-when) exec)
+                   (not (monk-exec-ok-p exec)))))
+    (when failed
+      (signal 'monk-exec-error
+              (list (oref m name) (monk-exec-command exec) (monk-exec-exit-code exec)
+                    (if (oref r failed-when)
+                        (format "failed-when held: %s" (truncate-string-to-width output 200))
+                      output))))
+    (when (and (oref r changed-when)
+               (not (monk-command-predicate (oref r changed-when) exec)))
+      ;; Ran, nothing changed: tell the runner to record kept.
+      (signal 'monk-command-unchanged
+              (list (if (string-empty-p output) "ran, unchanged"
+                      (truncate-string-to-width output 200)))))
     (if (string-empty-p output) "ran" (truncate-string-to-width output 200))))
 
 (cl-defmethod monk-default-watch-action ((_r monk-command-resource))
@@ -608,21 +660,19 @@ watch action, so `:watch' makes it a handler in the Ansible sense.")
                  (string-trim (monk-exec-output exec))))))
     (other (format ":verify must be a function or (PROGRAM . ARGS), not %S" other))))
 
-(defun monk-command (name program &rest args)
-  "Ensure the effect of PROGRAM.  NAME identifies the resource.
-ARGS: :args LIST, :creates PATH, :unless (PROGRAM . ARGS), :verify
-\(PROGRAM . ARGS) or a function of the machine, and common keys.
-Without :creates or :unless the command runs only when a watched ref
-changed."
-  (monk-add-resource
-   (apply #'monk-command-resource
-          :name name
-          (monk--resource-plist args
-                                :program program
-                                :args (plist-get args :args)
-                                :creates (plist-get args :creates)
-                                :unless-command (plist-get args :unless)
-                                :verify (plist-get args :verify)))))
+(monk-define-resource monk-command monk-command-resource
+  "Ensure the effect of PROGRAM.
+Without :creates, :unless, or :changed-when the command is always kept
+and runs only as a watch action, so with :watch it is a handler."
+  ((name :type string :doc "Identifies the resource.")
+   (program :type string :doc "The program."))
+  ((args :type list :doc "Arguments.")
+   (creates :type path :doc "When this path exists, the command is kept.")
+   (unless :type list :slot unless-command :doc "(PROGRAM . ARGS); zero exit means kept.")
+   (verify :type any :doc "(PROGRAM . ARGS) that must exit zero after the command, or a function of the machine that returns nil or a reason.")
+   (changed-when :type any :doc "Function of the exec, or CELL over (rc) (stdout) (stderr): the command runs every pass and is repaired only when this holds.")
+   (failed-when :type any :doc "Function of the exec, or CELL over (rc) (stdout) (stderr): replaces the exit-code rule."))
+  :exclusive ((changed-when creates) (changed-when unless)))
 
 (provide 'monk-system)
 ;;; monk-system.el ends here

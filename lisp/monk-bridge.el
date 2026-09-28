@@ -89,6 +89,46 @@
 The status words are listed so that a diff line with a bar in it
 does not match.")
 
+(defgroup monk-bridge nil
+  "Monk's bridges to Ansible and Salt."
+  :group 'monk)
+
+(defcustom monk-ansible-library nil
+  "Directory that holds the `ansible' Python package, or nil.
+For example the `lib' directory of an Ansible checkout, or the
+site-packages directory an `ansible-core' install went to.  When set,
+`monk-ansible' runs modules directly: a zip of `ansible/module_utils',
+`ansible/_vendor', and `ansible/modules' is built here once, copied to
+the target once, and each module runs as `python3 -m
+ansible.modules.NAME' with its arguments as JSON on stdin.  No
+controller Ansible, no inventory, no tmpdir, 0.1s per call instead of
+1 to 3s.  Nil runs the `ansible' command on the target instead."
+  :type '(choice (const nil) directory))
+
+(defcustom monk-ansible-python "python3"
+  "The Python interpreter on the target for direct module runs."
+  :type 'string)
+
+(defconst monk-ansible-payload-cache "~/.cache/monk"
+  "Directory on the target that keeps the module library zip.")
+
+(defconst monk-ansible-payload-members
+  '("ansible/__init__.py" "ansible/release.py" "ansible/_vendor" "ansible/module_utils" "ansible/modules")
+  "Paths under `monk-ansible-library' that go into the payload zip.")
+
+(defconst monk-ansible-args-key "ANSIBLE_MODULE_ARGS"
+  "Top-level key of the JSON a module reads.")
+
+(defconst monk-ansible-internal-args
+  '((_ansible_check_mode . t) (_ansible_diff . t))
+  "Internal arguments that turn on check mode and diff output.")
+
+(defconst monk-ansible-new-secrets-key '_ansible_new_secrets
+  "Result key whose values must be masked and which is dropped.")
+
+(defvar monk-ansible--payload nil
+  "(PATH . SHA) of the payload zip built from `monk-ansible-library', or nil.")
+
 (defconst monk-salt-program "salt-call"
   "The Salt local command.")
 
@@ -166,6 +206,139 @@ last line that starts with `{' is tried alone."
    ((vectorp value) (vconcat (mapcar #'monk-bridge--jsonable value)))
    (t (format "%s" value))))
 
+;;;; Ansible: direct module runs
+
+(defun monk-ansible-payload ()
+  "Return (PATH . SHA) of the module library zip, building it when needed.
+The zip lives next to the history database, named after the SHA-256
+of the file list and sizes under `monk-ansible-library', so a changed
+checkout gives a new zip and an unchanged one costs a directory walk.
+Built by `zip' on the controller, which every platform Monk runs on
+has."
+  (unless monk-ansible-library
+    (signal 'monk-policy-error (list "monk-ansible-library is not set")))
+  (let* ((root (file-name-as-directory (expand-file-name monk-ansible-library)))
+         (files (apply #'append
+                       (mapcar (lambda (member)
+                                 (let ((full (concat root member)))
+                                   (cond ((file-directory-p full)
+                                          (seq-remove (lambda (f) (string-match-p "__pycache__\\|\\.pyc\\'" f))
+                                                      (directory-files-recursively full "" nil)))
+                                         ((file-exists-p full) (list full))
+                                         (t (signal 'monk-policy-error
+                                                    (list "monk-ansible-library lacks" member))))))
+                               monk-ansible-payload-members)))
+         (sha (secure-hash 'sha256
+                           (mapconcat (lambda (f) (format "%s %s" (file-relative-name f root)
+                                                          (file-attribute-size (file-attributes f))))
+                                      (sort files #'string<) "\n")))
+         (path (expand-file-name (format "ansible-modlib-%s.zip" (substring sha 0 16))
+                                 (monk-home-directory))))
+    (unless (file-exists-p path)
+      (make-directory (file-name-directory path) t)
+      (let ((default-directory root)
+            (list-file (make-temp-file "monk-zip")))
+        (unwind-protect
+            (progn
+              (with-temp-file list-file
+                (insert (mapconcat (lambda (f) (file-relative-name f root)) files "\n") "\n"))
+              (with-temp-buffer
+                (unless (zerop (call-process "zip" list-file t nil "-q" "-@" path))
+                  (signal 'monk-exec-error (list "controller" (list "zip" path) 1 (buffer-string))))))
+          (delete-file list-file))))
+    (setq monk-ansible--payload (cons path sha))))
+
+(defun monk-ansible-payload-on (m)
+  "Return the path of the module library zip on M, copying it once per run.
+The zip is `monk-ansible-payload-cache'/ansible-modlib-SHA.zip on the
+target; a file that exists with that name is the right one, so the
+copy happens once per SHA and the check once per run and machine."
+  (pcase-let* ((`(,local . ,sha) (or monk-ansible--payload (monk-ansible-payload)))
+               (key (cons (oref m name) (cons 'ansible-payload sha))))
+    (or (monk-run-context-get key)
+        (let* ((remote (format "%s/ansible-modlib-%s.zip" monk-ansible-payload-cache (substring sha 0 16)))
+               (full (monk-machine-path m remote)))
+          (unless (file-exists-p full)
+            (make-directory (file-name-directory full) t)
+            (copy-file local full t))
+          ;; Python does not expand `~' in PYTHONPATH.
+          (monk-run-context-put key (monk-machine-local-path (expand-file-name full)))))))
+
+(defun monk-ansible-module-args (args check)
+  "Return the JSON text a module reads for ARGS.
+With CHECK, ask for a dry run with diff."
+  (monk-bridge--json-string
+   (list (cons (intern monk-ansible-args-key)
+               (append args (and check monk-ansible-internal-args))))))
+
+(defun monk-ansible-normalize (data exit-code)
+  "Return module result DATA as the controller would see it.
+Copies `_parse_returned_data' and `remove_internal_keys': a non-zero
+EXIT-CODE with no `failed' key is a failure, a missing `changed' is
+false, `_ansible_new_secrets' is dropped and its values masked
+everywhere, and other `_ansible_*' keys are dropped.  Return an alist
+with `failed' and `changed' always present."
+  (let* ((secrets (alist-get monk-ansible-new-secrets-key data))
+         (mask (lambda (value)
+                 (if (and secrets (stringp value))
+                     (seq-reduce (lambda (text secret)
+                                   (if (and (stringp secret) (not (string-empty-p secret)))
+                                       (string-replace secret "********" text)
+                                     text))
+                                 secrets value)
+                   value)))
+         (out (seq-remove (lambda (cell) (string-prefix-p "_ansible_" (symbol-name (car cell)))) data)))
+    (setq out (mapcar (lambda (cell) (cons (car cell) (funcall mask (cdr cell)))) out))
+    (unless (assq 'failed out)
+      (push (cons 'failed (if (and exit-code (not (zerop exit-code))) t :false)) out))
+    (unless (assq 'changed out)
+      (push (cons 'changed :false) out))
+    out))
+
+(defun monk-ansible-run-module (m module args check &optional sudo)
+  "Run Ansible MODULE with ARGS on M through the payload zip.
+With CHECK, in check mode with diff.  With SUDO, as root.  Return the
+normalized result alist.  Signal `monk-exec-error' when the output
+holds no JSON object, as the controller does with `module_stdout'."
+  (let* ((payload (monk-ansible-payload-on m))
+         (process-environment (cons (concat "PYTHONPATH=" payload) process-environment))
+         (exec (monk-exec m monk-ansible-python "-m" (concat "ansible.modules." module)
+                          :input (monk-ansible-module-args args check) :sudo sudo))
+         (data (monk-bridge--parse-json (monk-exec-output exec))))
+    (unless data
+      (signal 'monk-exec-error
+              (list (oref m name) (monk-exec-command exec) (monk-exec-exit-code exec)
+                    (format "module result deserialization failed: %s"
+                            (string-trim (monk-exec-output exec))))))
+    (monk-ansible-normalize data (monk-exec-exit-code exec))))
+
+(defun monk-ansible-result-diff (data path)
+  "Return the diff in module result DATA as `monk-diff-entry' list, or nil.
+A string diff is rendered text.  An alist with string `before' and
+`after' is content; with alist values, attributes.  A list of such
+alists gives one entry each.  PATH labels entries without headers."
+  (let ((diff (alist-get 'diff data)))
+    (cond
+     ((null diff) nil)
+     ((stringp diff) (list (monk-diff-entry-create :before nil :after diff :kind 'rendered)))
+     ((and (consp diff) (consp (car diff)) (consp (caar diff)))
+      (apply #'append (mapcar (lambda (d) (monk-ansible-result-diff (list (cons 'diff d)) path)) diff)))
+     ((consp diff)
+      (let ((before (alist-get 'before diff)) (after (alist-get 'after diff))
+            (bh (or (alist-get 'before_header diff) path))
+            (ah (or (alist-get 'after_header diff) path)))
+        (cond
+         ((or (stringp before) (stringp after))
+          (list (monk-diff-entry-create :before (or before "") :after (or after "")
+                                        :before-header bh :after-header ah :kind 'content)))
+         ((or (consp before) (consp after))
+          (list (monk-diff-entry-create
+                 :before before
+                 :after (seq-remove (lambda (cell) (equal (cdr cell) (alist-get (car cell) before))) after)
+                 :before-header bh :after-header ah :kind 'attributes)))
+         (t nil))))
+     (t nil))))
+
 ;;;; Ansible
 
 (defclass monk-ansible-resource (monk-resource)
@@ -242,39 +415,66 @@ of such alists."
               (alist-get 'before diff) (alist-get 'after diff)))
      (t nil))))
 
+(defun monk-ansible--direct-changes (r data)
+  "Return the change plist for a direct run of R that returned DATA."
+  (cond
+   ((eq (alist-get 'failed data) t)
+    (signal 'monk-resource-error
+            (list (format "ansible %s: %s" (oref r module) (or (alist-get 'msg data) "no message")))))
+   ;; A module without check mode says skipped in check mode; newer
+   ;; ones say changed false with a message, which reads as kept.
+   ((eq (alist-get 'skipped data) t) (list :ansible 'no-check-mode))
+   ((eq (alist-get 'changed data) t) (list :ansible (or (alist-get 'msg data) t)))
+   (t nil)))
+
+(defun monk-ansible--path (r)
+  "Return the path argument of R for diff headers, or its name."
+  (or (alist-get 'path (oref r args)) (alist-get 'dest (oref r args)) (oref r name)))
+
 (cl-defmethod monk-check ((r monk-ansible-resource) (m monk-machine))
-  (let* ((outcome (monk--ansible-run r m t))
-         (data (plist-get outcome :data))
-         (changes (monk-ansible--changes (plist-get outcome :status) data)))
-    ;; Keep the diff from this call so `monk-diff' does not run the
-    ;; module a second time.
-    (if (and changes (monk-ansible--diff-string data))
-        (plist-put changes :diff (monk-ansible--diff-string data))
-      changes)))
+  (if monk-ansible-library
+      (let* ((data (monk-ansible-run-module m (oref r module) (oref r args) t (oref r sudo)))
+             (changes (monk-ansible--direct-changes r data))
+             (diff (and changes (monk-ansible-result-diff data (monk-ansible--path r)))))
+        (if diff (plist-put changes :diff diff) changes))
+    (let* ((outcome (monk--ansible-run r m t))
+           (data (plist-get outcome :data))
+           (changes (monk-ansible--changes (plist-get outcome :status) data)))
+      ;; Keep the diff from this call so `monk-diff' does not run the
+      ;; module a second time.
+      (if (and changes (monk-ansible--diff-string data))
+          (plist-put changes :diff (monk-ansible--diff-string data))
+        changes))))
 
 (cl-defmethod monk-diff ((_r monk-ansible-resource) (_m monk-machine) changes)
   (plist-get changes :diff))
 
 (cl-defmethod monk-repair ((r monk-ansible-resource) (m monk-machine) _changes)
-  (let* ((outcome (monk--ansible-run r m nil))
-         (status (plist-get outcome :status))
-         (data (plist-get outcome :data)))
-    (when (member status (list monk-ansible-status-failed monk-ansible-status-unreachable))
-      (signal 'monk-resource-error
-              (list (format "ansible %s: %s" status (or (alist-get 'msg data) "no message")))))
-    (format "%s %s" (oref r module) (or (alist-get 'msg data) (downcase status)))))
+  (if monk-ansible-library
+      (let ((data (monk-ansible-run-module m (oref r module) (oref r args) nil (oref r sudo))))
+        (when (eq (alist-get 'failed data) t)
+          (signal 'monk-resource-error
+                  (list (format "ansible %s: %s" (oref r module) (or (alist-get 'msg data) "no message")))))
+        (format "%s %s" (oref r module)
+                (or (alist-get 'msg data) (if (eq (alist-get 'changed data) t) "changed" "ok"))))
+    (let* ((outcome (monk--ansible-run r m nil))
+           (status (plist-get outcome :status))
+           (data (plist-get outcome :data)))
+      (when (member status (list monk-ansible-status-failed monk-ansible-status-unreachable))
+        (signal 'monk-resource-error
+                (list (format "ansible %s: %s" status (or (alist-get 'msg data) "no message")))))
+      (format "%s %s" (oref r module) (or (alist-get 'msg data) (downcase status))))))
 
-(defun monk-ansible (name module args &rest rest)
-  "Ensure the state that Ansible MODULE with ARGS describes.
-NAME identifies the resource.  ARGS is an alist of (KEY . VALUE).
-REST: :become and common keys."
-  (monk-add-resource
-   (apply #'monk-ansible-resource
-          :name name
-          (monk--resource-plist rest
-                                :module module
-                                :args args
-                                :become (plist-get rest :become)))))
+(cl-defmethod monk-resource-available-p ((_r monk-ansible-resource) (m monk-machine))
+  "Direct runs need the interpreter on M; CLI runs need `ansible'."
+  (monk-program-available-p m (if monk-ansible-library monk-ansible-python monk-ansible-program)))
+
+(monk-define-resource monk-ansible monk-ansible-resource
+  "Ensure the state that Ansible MODULE with ARGS describes."
+  ((name :type string :doc "Identifies the resource.")
+   (module :type string :doc "Module name, for example file or lineinfile.")
+   (args :type alist :doc "Module arguments as (KEY . VALUE)."))
+  ((become :type boolean :doc "Run the module with --become.")))
 
 ;;;; Salt
 
@@ -284,7 +484,10 @@ REST: :become and common keys."
              :documentation "State function, for example file.symlink.")
    (args :initarg :args
          :initform nil
-         :documentation "Alist of state arguments.  `name' is added from NAME."))
+         :documentation "Alist of state arguments.  `name' is added from NAME.")
+   (id :initarg :id
+       :initform nil
+       :documentation "SLS id when it differs from the name; kept for round trips."))
   "One Salt state function call on the target machine.")
 
 (defun monk-salt--call (m arguments &optional sudo)
@@ -650,16 +853,13 @@ CELL `=' does not, so check values against `monk-machine-describe'."
           (signal 'monk-guard-error (list (format "matcher: unexpected %s" (car tokens)))))
         (monk-cell-check form)))))
 
-(defun monk-salt (name function args &rest rest)
+(monk-define-resource monk-salt monk-salt-resource
   "Ensure the state that Salt FUNCTION with ARGS describes for NAME.
-NAME is the state name argument and the resource name.  ARGS is an
-alist of (KEY . VALUE).  REST: :id to keep an SLS id that differs from
-the name, and common keys.  Independent salt resources on a machine
-run as one `state.high' call."
-  (monk-add-resource
-   (apply #'monk-salt-resource
-          :name name
-          (monk--resource-plist rest :function function :args args))))
+Independent salt resources on a machine run as one `state.high' call."
+  ((name :type string :doc "The state name argument and the resource name.")
+   (function :type string :doc "State function, for example file.symlink.")
+   (args :type alist :doc "State arguments as (KEY . VALUE)."))
+  ((id :type string :doc "An SLS id that differs from the name, kept for import round trips.")))
 
 (provide 'monk-bridge)
 ;;; monk-bridge.el ends here

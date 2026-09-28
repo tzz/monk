@@ -166,16 +166,13 @@ this returns nil, and the caller proceeds as before."
     (format "installed %s%s" (string-join (plist-get changes :install) " ")
             (if trusted (format " (after brew trust %s)" trusted) ""))))
 
-(defun monk-brew (name packages &rest args)
-  "Ensure Homebrew PACKAGES are installed.  NAME identifies the set.
-ARGS: :cask and common keys."
-  (monk-add-resource
-   (apply #'monk-brew-resource
-          :name name
-          (monk--resource-plist args
-                                :packages packages
-                                :cask (plist-get args :cask)
-                                :classes (append '(darwin) (plist-get args :classes))))))
+(monk-define-resource monk-brew monk-brew-resource
+  "Ensure Homebrew PACKAGES are installed, in one call.
+Independent brew resources on a machine aggregate into one install."
+  ((name :type string :doc "Identifies the set.")
+   (packages :type list :doc "Formula or cask names; aliases and taps count."))
+  ((cask :type boolean :doc "Treat the names as casks."))
+  :classes (darwin))
 
 ;;;; brew-tap
 
@@ -196,13 +193,11 @@ ARGS: :cask and common keys."
       "tapped and trusted"
     "tapped"))
 
-(defun monk-brew-tap (name &rest args)
-  "Ensure Homebrew tap NAME is present.  ARGS: common keys."
-  (monk-add-resource
-   (apply #'monk-brew-tap-resource
-          :name name
-          (monk--resource-plist args
-                                :classes (append '(darwin) (plist-get args :classes))))))
+(monk-define-resource monk-brew-tap monk-brew-tap-resource
+  "Ensure Homebrew tap NAME is present and trusted."
+  ((name :type string :doc "The tap, for example user/repo."))
+  ()
+  :classes (darwin))
 
 ;;;; apt
 
@@ -265,16 +260,31 @@ ARGS: :cask and common keys."
     (and mine (list :install mine
                     :degree (monk-set-degree (length (oref member packages)) (length mine))))))
 
-(defun monk-apt (name packages &rest args)
-  "Ensure Debian PACKAGES are installed.  NAME identifies the set.
-ARGS: common keys."
-  (monk-add-resource
-   (apply #'monk-apt-resource
-          :name name
-          (monk--resource-plist args
-                                :packages packages
-                                :sudo t
-                                :classes (append '(debian) (plist-get args :classes))))))
+(monk-define-resource monk-apt monk-apt-resource
+  "Ensure Debian PACKAGES are installed, in one call.
+Independent apt resources on a machine aggregate into one install."
+  ((name :type string :doc "Identifies the set.")
+   (packages :type list :doc "Package names."))
+  ()
+  :classes (debian)
+  :sudo t)
+
+;;;; package: generic over the machine's package manager
+
+(defun monk-package (name packages &rest args)
+  "Ensure PACKAGES are installed through the machine's package manager.
+NAME identifies the set.  Dispatches on the `pkg-mgr' fact of the
+machine being compiled: homebrew gives `monk-brew', apt gives
+`monk-apt'.  ARGS: :cask (brew only) and common keys.  A machine with
+another manager gets a resource that reports skipped with the reason,
+so the policy still compiles everywhere.  Ansible's `package'."
+  (let ((manager (monk-machine-fact (monk-current-machine) 'pkg-mgr)))
+    (pcase manager
+      ("homebrew" (apply #'monk-brew name packages :classes nil args))
+      ("apt" (apply #'monk-apt name packages :classes nil
+                    (let ((rest (copy-sequence args))) (cl-remf rest :cask) rest)))
+      (_ (apply #'monk-unsupported name (format "package: no supported package manager (pkg-mgr is %s)" manager)
+                args)))))
 
 ;;;; osx-default
 
@@ -327,18 +337,15 @@ ARGS: common keys."
          (monk--osx-default-args (oref r value-type) (oref r value)))
   (format "wrote %s" (oref r key)))
 
-(defun monk-osx-default (domain key value &rest args)
-  "Ensure macOS default DOMAIN KEY is VALUE.
-ARGS: :type (string int float bool array) and common keys."
-  (monk-add-resource
-   (apply #'monk-osx-default-resource
-          :name (format "%s:%s" domain key)
-          (monk--resource-plist args
-                                :domain domain
-                                :key key
-                                :value value
-                                :value-type (or (plist-get args :type) 'string)
-                                :classes (append '(darwin) (plist-get args :classes))))))
+(monk-define-resource monk-osx-default monk-osx-default-resource
+  "Ensure macOS default DOMAIN KEY is VALUE."
+  ((domain :type string :doc "Preferences domain, for example com.apple.finder.")
+   (key :type string :doc "The key.")
+   (value :type any :doc "The value, as `defaults write' takes it."))
+  ((type :type symbol :default string :choices (string int float bool array) :slot value-type
+         :doc "How `defaults' types the value."))
+  :classes (darwin)
+  :name-form (format "%s:%s" domain key))
 
 (provide 'monk-package)
 ;;; monk-package.el ends here

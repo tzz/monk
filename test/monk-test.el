@@ -168,7 +168,7 @@
       (should-not (file-exists-p (concat dir "f")))
       (should (monk-run-dry-run run))
       (should (= 1 (monk-run-passes run)))
-      (should (string-match-p "\\+x" (monk-result-diff (monk-test-result run (concat dir "f"))))))))
+      (should (string-match-p "\\+x" (monk-result-diff-text (monk-test-result run (concat dir "f"))))))))
 
 (ert-deftest monk-test-convergence-second-run-is-kept ()
   (monk-test-with-tmpdir dir
@@ -473,14 +473,39 @@ This is the Salt execution model.  Only dependents skip."
       (let* ((run (monk-test-converge (lambda (_m) (monk-file dst :source src))))
              (result (monk-test-result run dst)))
         (should (eq 'repaired (monk-result-status result)))
-        (should (string-match-p "^\\+two$" (monk-result-diff result)))
+        (should (string-match-p "^\\+two$" (monk-result-diff-text result)))
         (should (equal "one\ntwo\n" (with-temp-buffer (insert-file-contents dst) (buffer-string))))))))
 
 (ert-deftest monk-test-file-content-error-signals-when-neither ()
-  "A file with neither content nor source fails at check time."
+  "A file with neither content nor source is refused when the policy compiles."
   (monk-test-with-tmpdir dir
-    (let ((run (monk-test-converge (lambda (_m) (monk-file (concat dir "x"))))))
-      (should (eq 'failed (monk-test-status run (concat dir "x")))))))
+    (let ((err (should-error (monk-test-converge (lambda (_m) (monk-file (concat dir "x"))))
+                             :type 'monk-argument-error)))
+      (should (string-match-p "one of :content, :source is required" (cadr err))))))
+
+(ert-deftest monk-test-declared-parameters ()
+  "Constructors validate their keywords: unknown, type, choices, required, exclusive."
+  (let ((m (monk-test-machine)))
+    ;; unknown keyword, Ansible's words
+    (let ((err (should-error (monk-compile m (lambda (_m) (monk-directory "~/d" :mdoe #o700)))
+                             :type 'monk-argument-error)))
+      (should (string-match-p "Unsupported parameter for monk-directory: :mdoe\\.  Supported parameters include: :group, :mode, :owner" (cadr err))))
+    ;; type
+    (should-error (monk-compile m (lambda (_m) (monk-directory "~/d" :mode "0700"))) :type 'monk-argument-error)
+    (should-error (monk-compile m (lambda (_m) (monk-directory 7))) :type 'monk-argument-error)
+    ;; choices
+    (should-error (monk-compile m (lambda (_m) (monk-line-in-file "~/f" "x" :state 'gone))) :type 'monk-argument-error)
+    ;; exclusive
+    (should-error (monk-compile m (lambda (_m) (monk-file "~/f" :content "a" :source "/b"))) :type 'monk-argument-error)
+    ;; an explicit nil for an optional typed parameter is "not given"
+    (should (equal "master" (or (oref (car (monk-compile m (lambda (_m) (monk-git "~/r" "u" :branch nil)))) branch)
+                                monk-git-default-branch)))
+    ;; defaults fill in; common keys pass; docstring is generated
+    (let ((r (car (monk-compile m (lambda (_m) (monk-symlink "~/l" "~/t" :classes '(x)))))))
+      (should (eq t (oref r force)))
+      (should (equal '(x) (oref r classes))))
+    (should (string-match-p ":force BOOLEAN (default t)" (documentation 'monk-symlink)))
+    (should (assq 'monk-file monk-resource-specs))))
 
 (ert-deftest monk-test-edit-line ()
   (should (equal "a\nb\n" (monk-edit-line "a\n" "b")))
@@ -1224,6 +1249,139 @@ A :degree threshold on a require lets a follower run anyway."
                  (monk-exec-create :exit-code 0 :output "{\"local\": {}}"))))
       (should-error (monk-check r m) :type 'monk-resource-error))))
 
+;;;; Watch: symlinked directories
+
+(ert-deftest monk-test-watch-index-resolves-symlinked-directories ()
+  "An event on the real path of a file under a symlinked directory finds its node.
+Found live: ~/autodist was a link, fswatch reported the target tree,
+and the edit was silently unmanaged."
+  (monk-test-with-tmpdir dir
+    (make-directory (concat dir "real/files") t)
+    (make-symbolic-link (concat dir "real") (concat dir "link"))
+    (with-temp-file (concat dir "real/files/zshrc") (insert "x"))
+    (let* ((m (monk-test-machine))
+           (nodes (monk--nodes-for (list m)
+                                   (lambda (_m)
+                                     (monk-file (concat dir "link/files/zshrc") :content "x"))))
+           (w (monk-watch-create :machines (list m) :policy #'ignore
+                                 :path-index (monk-watch--build-index nodes))))
+      ;; indexed under the real directory
+      (should (assoc (file-name-as-directory (file-truename (concat dir "real/files")))
+                     (monk-watch-path-index w)))
+      ;; both spellings of the event map to the node
+      (should (= 1 (length (monk-watch--nodes-for-file w (concat dir "real/files/zshrc")))))
+      (should (= 1 (length (monk-watch--nodes-for-file w (concat dir "link/files/zshrc")))))
+      ;; a managed symlink keeps its own name as the indexed path
+      (let* ((nodes2 (monk--nodes-for (list m) (lambda (_m) (monk-symlink (concat dir "sl") (concat dir "real")))))
+             (w2 (monk-watch-create :machines (list m) :policy #'ignore
+                                    :path-index (monk-watch--build-index nodes2))))
+        (should (seq-some (lambda (e) (assoc (concat (directory-file-name (file-truename dir)) "/sl") (cdr e)))
+                          (monk-watch-path-index w2)))))))
+
+;;;; Watch: what fswatch is pointed at
+
+(ert-deftest monk-test-watch-fswatch-paths-flat-and-trees ()
+  "Owned files give their parent, flat; owned subtrees give themselves, walked.
+A parent inside a walked tree is dropped, and ~ itself is never walked."
+  (require 'monk-sync)
+  (monk-test-with-tmpdir dir
+    (make-directory (concat dir "home/.config/app") t)
+    (make-directory (concat dir "home/src/plugins") t)
+    (with-temp-file (concat dir "home/.zshrc") (insert "x"))
+    (with-temp-file (concat dir "home/.config/app/conf") (insert "x"))
+    (let* ((m (monk-test-machine (append (list (cons 'home (concat dir "home"))) monk-test-fake-facts)))
+           (nodes (monk--nodes-for (list m)
+                                   (lambda (_m)
+                                     (monk-file "~/.zshrc" :content "x")
+                                     (monk-file "~/.config/app/conf" :content "x")
+                                     (monk-directory "~/src/plugins")
+                                     (monk-rsync "push" '("~/.zshrc" "~/src/plugins/") "/tmp/o/" :archive t))))
+           (w (monk-watch-create :machines (list m) :policy #'ignore
+                                 :path-index (monk-watch--build-index nodes))))
+      (pcase-let ((`(,flat . ,trees) (monk-watch--fswatch-paths w)))
+        (should (equal (list (directory-file-name (concat dir "home"))
+                             (concat dir "home/.config/app"))
+                       flat))
+        (should (equal (list (concat dir "home/src/plugins")) trees))))))
+
+;;;; Watch selection by shared paths
+
+(ert-deftest monk-test-select-nodes-follows-shared-paths ()
+  "A resource that owns a changed resource's path is selected with it."
+  (require 'monk-sync)
+  (let* ((m (monk-test-machine))
+         (nodes (monk--nodes-for (list m)
+                                 (lambda (_m)
+                                   (monk-file "~/autodist/zshrc" :content "x\n")
+                                   (monk-symlink "~/.zshrc" "~/autodist/zshrc")
+                                   (monk-rsync "push" '("~/.zshrc") "/tmp/x/" :follow-links t)
+                                   (monk-directory "~/unrelated"))))
+         (selected (monk-select-nodes nodes (list (cons "testbox" "~/autodist/zshrc")))))
+    (should (equal '("~/autodist/zshrc" "~/.zshrc" "push")
+                   (mapcar (lambda (n) (oref (monk-node-resource n) name)) selected)))))
+
+;;;; CLI progress
+
+(ert-deftest monk-test-cli-tty-detection-and-format ()
+  "Off a terminal nothing is rewritten; the helpers pad and elide by display width."
+  (require 'monk-cli)
+  ;; the test runner's stderr is a pipe or a file, never a tty
+  (should-not (monk-cli-stderr-tty-p))
+  (should (equal "abc   " (monk-cli-pad "abc" 6)))
+  (should (equal "abcdef" (monk-cli-pad "abcdef" 3)))
+  (let ((monk-cli--utf8 t))
+    (should (equal "abcdefgh" (monk-cli-elide "abcdefgh" 8)))
+    (should (equal "abc…ijk" (monk-cli-elide "abcdefghijk" 7)))
+    (should (= 7 (string-width (monk-cli-elide "~/.config/very/long/path/name" 7)))))
+  (let ((monk-cli--utf8 nil))
+    (should (equal "ab...jk" (monk-cli-elide "abcdefghijk" 7))))
+  ;; no tty: glyphs still, but no SGR
+  (let ((monk-cli--tty nil) (monk-cli--utf8 t) (monk-cli-color 'auto))
+    (should (equal "✓" (monk-cli-glyph monk-status-kept)))
+    (should-not (string-match-p "\e" (monk-cli-glyph monk-status-failed))))
+  (let ((monk-cli--tty t) (monk-cli--utf8 nil) (monk-cli-color t))
+    (should (equal "\e[31m!!\e[0m" (monk-cli-glyph monk-status-failed))))
+  (let ((monk-cli--tty t) (monk-cli-color 'auto))
+    (cl-letf (((symbol-function 'getenv) (lambda (v) (cond ((equal v "NO_COLOR") "1") ((equal v "TERM") "xterm")))))
+      (should-not (monk-cli-color-p)))
+    (cl-letf (((symbol-function 'getenv) (lambda (v) (cond ((equal v "TERM") "dumb")))))
+      (should-not (monk-cli-color-p)))
+    (cl-letf (((symbol-function 'getenv) (lambda (v) (cond ((equal v "TERM") "xterm")))))
+      (should (monk-cli-color-p)))))
+
+(ert-deftest monk-test-cli-progress-prints-changes-and-sizes-columns ()
+  "Without a tty the hook prints changed and failed results as aligned lines."
+  (require 'monk-cli)
+  (monk-test-with-tmpdir dir
+    (let* ((lines nil)
+           (monk-log-level nil)
+           (machines (monk-test-machines "a" "much-longer-name")))
+      (cl-letf (((symbol-function 'message) (lambda (fmt &rest args) (push (apply #'format fmt args) lines))))
+        (unwind-protect
+            (progn
+              (monk-cli-enable)
+              (should-not monk-cli--tty)
+              (monk-orchestrate machines
+                                (lambda (m)
+                                  (monk-directory (concat dir (oref m name)))
+                                  (monk-directory dir)
+                                  (monk-line-in-file (concat dir "absent-" (oref m name)) "x"))
+                                :passes 1))
+          (monk-cli-disable)))
+      (setq lines (nreverse lines))
+      ;; machine column sized to the longest name: both rows align
+      (let ((rows (seq-filter (lambda (l) (string-match-p "directory" l)) lines)))
+        (should (= 2 (length rows)))
+        (should (= (string-search "directory" (car rows)) (string-search "directory" (cadr rows)))))
+      (should (= 16 monk-cli--machine-width))
+      (should (= 2 (seq-count (lambda (l) (string-match-p "line-in-file.*absent" l)) lines)))
+      ;; kept results do not print: the shared dir itself was kept on both machines
+      (should-not (seq-some (lambda (l) (string-match-p (concat (regexp-quote (directory-file-name dir)) "  ") l)) lines))
+      (should (= 2 (seq-count (lambda (l) (string-match-p "directory" l)) lines)))
+      ;; nothing rewrote the line
+      (should-not (seq-some (lambda (l) (or (string-search "\r" l) (string-search "\e[2K" l))) lines))
+      (should (string-match-p "2 failed  1 pass" (monk-cli-summary-line (monk-orchestrate machines (lambda (m) (monk-line-in-file (concat dir "gone-" (oref m name)) "x")) :passes 1)))))))
+
 ;;;; rsync and launchd
 
 (ert-deftest monk-test-rsync-parse-itemize ()
@@ -1234,7 +1392,77 @@ A :degree threshold on a require lets a follower run anyway."
                         "sending incremental file list\n\nNumber of files: 1,204 (reg: 3, dir: 2)\n"))))
     (should (= 1204 total))
     (should (equal '(">f+++++++++ a" ">f.st...... d/b" "*deleting   gone") changed)))
-  (should (null (cdr (monk-rsync-parse-itemize ">f+++++++++ a\n")))))
+  (should (null (cdr (monk-rsync-parse-itemize ">f+++++++++ a\n"))))
+  ;; protocol 31 prints 12 flag columns; found live on macOS, where
+  ;; every line was dropped and a mode change went unseen
+  ;; and `T' alone (identical content, time would be stamped) is not
+  ;; drift: without -t it repeats on every run and flapped live
+  (should (equal '("<f..Tp...... config" ".d...p...... config.d/")
+                 (car (monk-rsync-parse-itemize
+                       "<f..Tp...... config\n.d...p...... config.d/\n<f..T....... config.d/w\n.d..T....... old/\n"))))
+  ;; a mode-only or owner-only difference on a directory is drift; time-only is not
+  (should (equal '(".d...p..... config.d/" ".d.....o... other/")
+                 (car (monk-rsync-parse-itemize ".d...p..... config.d/\n.d..t...... d/\n.d.....o... other/\n"))))
+  ;; a mode-only difference on a symlink is not drift: Linux cannot set
+  ;; it and a Mac source reports it on every run (found live, tpm)
+  (should (equal '(".L..tp...... a -> b" "cL++++++++++ new -> x")
+                 (car (monk-rsync-parse-itemize
+                       (concat ".L...p...... tmux-resurrect/run_tests -> lib/tmux-test/run_tests\n"
+                               ".L..tp...... a -> b\n"
+                               "cL++++++++++ new -> x\n"))))))
+
+(ert-deftest monk-test-rsync-archive-omits-ownership ()
+  ":archive is -rlptD, never -o -g: a user cannot chown and the run would flap."
+  (require 'monk-sync)
+  (let* ((m (monk-test-machine))
+         (r (monk-rsync-resource :name "x" :sources '("/s/") :destination "/d/" :archive t :delete t)))
+    (should (equal '("-rlptD" "--delete" "/s/" "/d/") (monk--rsync-arguments r m)))
+    (should (equal '("-r" "-L" "-p" "-t" "/s/" "/d/")
+                   (monk--rsync-arguments
+                    (monk-rsync-resource :name "y" :sources '("/s/") :destination "/d/"
+                                         :recursive t :follow-links t :perms t)
+                    m)))))
+
+(ert-deftest monk-test-rsync-perms-converges-with-old-mtimes ()
+  "A source older than its identical copy does not repair forever."
+  (skip-unless (executable-find "rsync"))
+  (require 'monk-sync)
+  (monk-test-with-tmpdir dir
+    (let* ((src (concat dir "src/")) (dst (concat dir "dst/"))
+           (policy (lambda (_m) (monk-rsync "t" (list src) dst :recursive t :follow-links t :perms t))))
+      (make-directory src) (make-directory dst)
+      (with-temp-file (concat src "f") (insert "x\n"))
+      (copy-file (concat src "f") (concat dst "f"))
+      (set-file-times (concat src "f") (encode-time '(0 0 0 1 1 2020 nil nil t)))
+      (let ((run (monk-test-converge policy)))
+        (should (eq 'repaired (monk-test-status run "t")))
+        (should (monk-run-converged-p run))
+        (should (= 2 (monk-run-passes run))))
+      (should (eq 'kept (monk-test-status (monk-test-converge policy :passes 1) "t"))))))
+
+(ert-deftest monk-test-rsync-perms-carries-directory-mode ()
+  "With :perms, a 0755 destination directory becomes 0700 like the source."
+  (skip-unless (executable-find "rsync"))
+  (require 'monk-sync)
+  (monk-test-with-tmpdir dir
+    (let* ((src (concat dir "src/config.d"))
+           (dst (concat dir "dst/"))
+           (policy (lambda (_m) (monk-rsync "cfg" (list src) dst :recursive t :follow-links t :perms t))))
+      (make-directory src t)
+      (make-directory (concat dst "config.d") t)
+      (with-temp-file (concat src "/work") (insert "x\n"))
+      (with-temp-file (concat dst "config.d/work") (insert "x\n"))
+      (set-file-modes src #o700)
+      (set-file-modes (concat dst "config.d") #o755)
+      (let ((run (monk-test-converge policy :passes 1)))
+        (should (eq 'repaired (monk-test-status run "cfg")))
+        (should (= #o700 (logand #o777 (file-modes (concat dst "config.d"))))))
+      (should (eq 'kept (monk-test-status (monk-test-converge policy :passes 1) "cfg")))
+      ;; without :perms the same difference is invisible, which is the Makefile's behavior
+      (set-file-modes (concat dst "config.d") #o755)
+      (should (eq 'kept (monk-test-status
+                         (monk-test-converge (lambda (_m) (monk-rsync "cfg" (list src) dst :recursive t)) :passes 1)
+                         "cfg"))))))
 
 (ert-deftest monk-test-rsync-local-roundtrip ()
   "rsync to a local destination: would-repair, repaired with a degree, then kept."
@@ -1259,7 +1487,8 @@ A :degree threshold on a require lets a follower run anyway."
         (should (file-exists-p (concat dst "stale"))))
       (let ((run (monk-converge m policy)))
         (should (eq 'repaired (monk-test-status run "mirror")))
-        (should (string-match-p "synced 4 items" (monk-result-comment (monk-test-result run "mirror"))))
+        ;; rsync names the deletion first, then the three copies; three shown
+        (should (string-match-p "stale, a, d/ -> .*dst/ (\\+1 more)" (monk-result-comment (monk-test-result run "mirror"))))
         (should (equal "b\n" (with-temp-buffer (insert-file-contents (concat dst "d/b")) (buffer-string))))
         (should-not (file-exists-p (concat dst "stale")))
         (should (= 2 (monk-run-passes run))))
@@ -1922,7 +2151,7 @@ this suite reports inotify and delivers nothing."
         (should (equal '("testbox") (mapcar (lambda (m) (oref m name)) (monk-run-machines back))))
         (should (= 2 (length (monk-run-results back))))
         (should (eq 'repaired (monk-result-status copy)))
-        (should (equal (monk-result-diff orig) (monk-result-diff copy)))
+        (should (equal (monk-result-diff-text orig) (monk-result-diff-text copy)))
         (should (equal (monk-result-comment orig) (monk-result-comment copy)))
         (should (= 1.0 (monk-result-degree copy)))
         ;; changes come back as the plist every consumer expects
@@ -2694,7 +2923,8 @@ refuses to run from a side window."
                   ("" . error)
                   ("facts.arch ==" . error)
                   ("foo == 1" . error)
-                  ("facts.a.b" . error)
+                  ("facts.a.b" . (get (fact a) b))
+                  ("facts.local.monk.role == 'ws'" . (= (get (fact local) monk role) "ws"))
                   ("classes.arch" . error)
                   ("frob(1)" . error)
                   ("name.frob(1)" . error)
@@ -2720,7 +2950,8 @@ refuses to run from a side window."
                   ((in "x" (list "x" "y")) . "'x' in ['x', 'y']")
                   ((starts-with (name) "it's") . "name.startsWith('it\\'s')")
                   ((has (var disk)) . "has(vars.disk)")
-                  ((not (not (local))) . "!!local")))
+                  ((not (not (local))) . "!!local")
+                  ((= (get (fact local) monk role) "ws") . "facts.local.monk.role == 'ws'")))
     (should (equal (cdr case) (monk-cell-to-cel (car case))))
     (should (equal (car case) (monk-cel-parse (cdr case))))))
 
@@ -2829,6 +3060,444 @@ refuses to run from a side window."
         (should (search-forward "repaired" nil t)))
       (kill-buffer detail)
       (kill-buffer (monk-ui--buffer)))))
+
+;;;; Generic package and service; derived groups; cross-host CELL
+
+(ert-deftest monk-test-package-and-service-dispatch ()
+  "monk-package and monk-service pick the resource type from the manager facts."
+  (let* ((mac (monk-test-machine (append '((pkg-mgr . "homebrew") (service-mgr . "launchd")) monk-test-fake-facts)))
+         (deb (monk-test-machine (append '((pkg-mgr . "apt") (service-mgr . "systemd")) monk-test-fake-facts)))
+         (odd (monk-test-machine (append '((pkg-mgr . nil) (service-mgr . nil)) monk-test-fake-facts)))
+         (policy (lambda (_m)
+                   (monk-package "tools" '("jq"))
+                   (monk-service "sshd" :started t))))
+    (should (equal '(monk-brew-resource monk-launchd-resource)
+                   (mapcar #'eieio-object-class-name (monk-compile mac policy))))
+    (should (equal '(monk-apt-resource monk-systemd-unit-resource)
+                   (mapcar #'eieio-object-class-name (monk-compile deb policy))))
+    (should (equal "sshd.service" (oref (cadr (monk-compile deb policy)) name)))
+    (should (eq t (oref (cadr (monk-compile mac policy)) loaded)))
+    (let ((rs (monk-compile odd policy)))
+      (should (equal '(monk-unsupported-resource monk-unsupported-resource)
+                     (mapcar #'eieio-object-class-name rs)))
+      (should (string-match-p "no supported package manager" (monk-resource-available-p (car rs) odd))))
+    ;; the manager facts become classes
+    (should (memq 'homebrew (oref mac classes)))
+    (should (memq 'systemd (oref deb classes)))))
+
+(ert-deftest monk-test-probe-managers ()
+  "The managers probe reads one sh -c and prefers brew and launchd on Darwin."
+  (let ((m (monk-test-machine)))
+    (cl-letf (((symbol-function 'monk-exec-string)
+               (lambda (_m &rest _) "apt-get\nsystemctl\n")))
+      (should (equal '((pkg-mgr . "apt") (service-mgr . "systemd")) (monk--probe-managers m))))
+    (let ((mac (monk-test-machine '((kernel . "Darwin")))))
+      (cl-letf (((symbol-function 'monk-exec-string)
+                 (lambda (_m &rest _) "brew\napt-get\n")))
+        (should (equal '((pkg-mgr . "homebrew") (service-mgr . "launchd")) (monk--probe-managers mac)))))
+    (cl-letf (((symbol-function 'monk-exec-string) (lambda (_m &rest _) "")))
+      (should (equal '((pkg-mgr . nil) (service-mgr . nil)) (monk--probe-managers m))))))
+
+(ert-deftest monk-test-derived-groups ()
+  "monk-group and monk-keyed-groups put machines into groups from their facts."
+  (let ((monk-inventory nil) (monk-inventory-derived nil))
+    (monk-inventory-define '(w :hosts ((foxy) (moi :address "m") (kamen :address "k"))))
+    (dolist (spec '(("foxy" "Darwin" "MacOS" 50) ("moi" "Darwin" "MacOS" 300) ("kamen" "Linux" "Raspbian" 8)))
+      (let ((m (monk-inventory-find (car spec))))
+        (oset m facts `((kernel . ,(nth 1 spec)) (distribution . ,(nth 2 spec)) (disk . ,(nth 3 spec))))
+        (oset m classes (monk-hard-classes m))))
+    (monk-group 'big-disk '(> (fact disk) 100))
+    (monk-group 'macs-derived "facts.kernel == 'Darwin'")
+    (monk-keyed-groups '(fact distribution) "distro")
+    (should (equal '(w macs-derived distro_macos) (oref (monk-inventory-find 'foxy) groups)))
+    (should (equal '(w big-disk macs-derived distro_macos) (oref (monk-inventory-find 'moi) groups)))
+    (should (equal '(w distro_raspbian) (oref (monk-inventory-find 'kamen) groups)))
+    ;; groups are classes and selectors
+    (should (memq 'distro_raspbian (oref (monk-inventory-find 'kamen) classes)))
+    (should (equal '("moi") (mapcar (lambda (m) (oref m name)) (monk-inventory-select 'big-disk))))
+    ;; facts arriving later apply the rules through the hook
+    (let ((late (monk-inventory-find 'foxy)))
+      (oset late facts '((kernel . "Darwin") (distribution . "MacOS") (disk . 500)))
+      (run-hook-with-args 'monk-facts-ready-functions late)
+      (should (memq 'big-disk (oref late groups))))
+    (monk-inventory-clear-derived)
+    (should (equal '(w) (oref (monk-inventory-find 'moi) groups)))))
+
+(ert-deftest monk-test-cell-cross-host-reads ()
+  "machine-fact, machine-var, and machine-class read another inventory machine."
+  (let ((monk-inventory nil))
+    (monk-inventory-define '(w :hosts ((db :address "d" :vars ((role . "primary"))) (web))))
+    (let ((db (monk-inventory-find 'db)) (web (monk-inventory-find 'web)))
+      (oset db facts '((kernel . "Linux") (address . "10.0.0.5")))
+      (oset db classes (monk-hard-classes db))
+      (oset web facts '((kernel . "Linux")))
+      (oset web classes (monk-hard-classes web))
+      (should (equal "10.0.0.5" (monk-cell-eval web '(machine-fact "db" address))))
+      (should (equal "primary" (monk-cell-eval web '(machine-var "db" role))))
+      (should (monk-cell-eval web '(machine-class "db" linux)))
+      (should (monk-cell-eval web '(= (machine-fact "db" address) "10.0.0.5")))
+      (should-error (monk-cell-eval web '(machine-fact "nope" x)) :type 'monk-guard-error)
+      (should (equal '(machine-fact "db" address) (monk-cell-check '(machine-fact "db" address)))))))
+
+;;;; facts.d and nested access
+
+(ert-deftest monk-test-facts-d-local-fact ()
+  "JSON, INI, and executable .fact files become (fact local); CELL reaches inside."
+  (monk-test-with-tmpdir dir
+    (let ((d (concat dir "facts.d/")))
+      (make-directory d)
+      (with-temp-file (concat d "monk.fact") (insert "{\"role\": \"workstation\", \"tier\": 2}"))
+      (with-temp-file (concat d "site.fact") (insert "[general]\nregion = eu\n[rack]\nrow=3\n"))
+      (with-temp-file (concat d "dyn.fact") (insert "#!/bin/sh\necho '{\"load\": 0.5}'\n"))
+      (set-file-modes (concat d "dyn.fact") #o755)
+      (with-temp-file (concat d "bad.fact") (insert "not json = and not ini\n"))
+      (let* ((monk-facts-d-directories (list d))
+             (m (monk-local-machine :name "fd")))
+        (cl-letf (((symbol-function 'monk--probe-uname) (lambda (_m) '((kernel . "Linux") (arch . "x") (hostname . "h") (nodename . "h"))))
+                  ((symbol-function 'monk--probe-os) (lambda (_m) nil))
+                  ((symbol-function 'monk--probe-env) (lambda (_m) nil)))
+          (let ((monk-fact-cache-functions nil)) (monk-gather-facts m)))
+        (let ((local (monk-machine-fact m 'local)))
+          (should (equal "workstation" (cdr (assq 'role (cdr (assq 'monk local))))))
+          (should (equal 2 (cdr (assq 'tier (cdr (assq 'monk local))))))
+          (should (equal "eu" (cdr (assq 'region (cdr (assq 'general (cdr (assq 'site local))))))))
+          (should (equal "3" (cdr (assq 'row (cdr (assq 'rack (cdr (assq 'site local))))))))
+          (should (equal 0.5 (cdr (assq 'load (cdr (assq 'dyn local))))))
+          ;; unparseable is kept as its own (empty) alist, not an error
+          (should (assq 'bad local)))
+        (should (monk-cell-eval m '(= (get (fact local) monk role) "workstation")))
+        (should (monk-cell-eval m (monk-cell-guard "facts.local.monk.role == 'workstation'")))
+        (should-not (monk-cell-eval m (monk-cell-guard "facts.local.monk.role == 'other'")))
+        (should (monk-cell-eval m '(= (get (fact local) site rack row) "3")))
+        (should (null (monk-cell-eval m '(get (fact local) nope deeper))))
+        (should (equal "facts.local.monk.role" (monk-cell-to-cel '(get (fact local) monk role))))))))
+
+;;;; Fact cache
+
+(ert-deftest monk-test-fact-cache-round-trip-and-ttl ()
+  "Live facts are stored; a fresh cache spares gathering; a stale one does not."
+  (monk-test-with-history
+    (let* ((m (monk-local-machine :name "cached"))
+           (gathers 0)
+           (monk-log-level nil))
+      (cl-letf (((symbol-function 'monk--probe-uname)
+                 (lambda (_m) (cl-incf gathers) '((kernel . "Linux") (arch . "x") (nodename . "n") (hostname . "n"))))
+                ((symbol-function 'monk--probe-os) (lambda (_m) '((os-family . "Debian"))))
+                ((symbol-function 'monk--probe-env) (lambda (_m) '((home . "/h") (user . "u")))))
+        ;; first compile gathers and stores
+        (monk--nodes-for (list m) (lambda (_m) (monk-directory "~/d")))
+        (should (= 1 gathers))
+        (should (eq 'live (oref m facts-source)))
+        (should (monk-machine-facts-fresh-p m))
+        (should (string-empty-p (monk-ui-facts-badge m)))
+        (should (equal "Linux" (alist-get 'kernel (car (monk-history-load-facts m)))))
+        ;; a new machine object for the same host loads from the cache, no gather
+        (let ((m2 (monk-local-machine :name "cached")))
+          (monk--nodes-for (list m2) (lambda (_m) (monk-directory "~/d")))
+          (should (= 1 gathers))
+          (should (eq 'cache (oref m2 facts-source)))
+          (should (monk-machine-facts-fresh-p m2))
+          (should (memq 'debian (oref m2 classes)))
+          (should (string-prefix-p "·" (monk-ui-facts-badge m2))))
+        ;; past the TTL the cache is ignored and facts are gathered again
+        (let ((m3 (monk-local-machine :name "cached"))
+              (monk-fact-ttl 0))
+          (monk--nodes-for (list m3) (lambda (_m) (monk-directory "~/d")))
+          (should (= 2 gathers))
+          (should (eq 'live (oref m3 facts-source))))
+        ;; a stale entry shows as stale when loaded by force
+        (let ((m4 (monk-local-machine :name "cached")))
+          (let ((monk-fact-ttl most-positive-fixnum)) (monk-facts-load m4))
+          (let ((monk-fact-ttl 0))
+            (should-not (monk-machine-facts-fresh-p m4))
+            (should (string-prefix-p "!" (monk-ui-facts-badge m4)))))
+        ;; flush forgets both
+        (monk-facts-flush (list m))
+        (should (null (oref m facts)))
+        (should (null (monk-history-load-facts m)))
+        (should (equal "?" (substring-no-properties (monk-ui-facts-badge m))))))))
+
+(ert-deftest monk-test-fact-cache-serves-unreachable-machine ()
+  "A machine that is off compiles with its last known facts, marked stale."
+  (monk-test-with-history
+    (let* ((monk-log-level nil)
+           (dead (monk-test-dead-machine "dead")))
+      ;; seed the cache as if it had answered yesterday
+      (oset dead gathered (time-subtract (current-time) (* 2 86400)))
+      (monk-history-store-facts dead)
+      (let ((again (monk-machine :name "dead" :address "dead.invalid")))
+        (let ((run (monk-test-with-dead-exec '("dead")
+                     (monk-orchestrate (list again)
+                                       (lambda (_m) (monk-apt "pkgs" '("jq") :classes nil))
+                                       :passes 1))))
+          ;; classes came from the cache: debian from the fake facts
+          (should (memq 'debian (oref again classes)))
+          (should (eq 'cache (oref again facts-source)))
+          (should-not (monk-machine-facts-fresh-p again))
+          (should (string-prefix-p "!" (monk-ui-facts-badge again)))
+          (should (equal '("dead") (mapcar #'car (monk-run-unreachable run)))))))))
+
+;;;; Structured diffs
+
+(ert-deftest monk-test-structured-diff-content-and-attributes ()
+  "A file whose content and mode both differ carries two entries; each renders."
+  (monk-test-with-tmpdir dir
+    (let* ((f (concat dir "f")))
+      (with-temp-file f (insert "old\n"))
+      (set-file-modes f #o644)
+      (let* ((run (monk-plan (monk-test-machine) (lambda (_m) (monk-file f :content "new\n" :mode #o600))))
+             (r (monk-test-result run f))
+             (entries (monk-diff-entries (monk-result-diff r)))
+             (text (monk-result-diff-text r)))
+        (should (= 2 (length entries)))
+        (should (eq 'content (monk-diff-entry-kind (car entries))))
+        (should (eq 'attributes (monk-diff-entry-kind (cadr entries))))
+        (should (equal '((mode . 420)) (monk-diff-entry-before (cadr entries))))
+        (should (string-match-p "^-old$" text))
+        (should (string-match-p "^\\+new$" text))
+        (should (string-match-p "mode: 0644 → 0600" text))
+        ;; the event carries Ansible's shape and comes back equal
+        (let* ((event (monk-event-result r run 1 0))
+               (data (alist-get 'diff event))
+               (back (monk-event-diff-to-entries data)))
+          (should (= 2 (length data)))
+          (should (equal "old\n" (alist-get 'before (aref data 0))))
+          (should (equal "content" (alist-get 'kind (aref data 0))))
+          (should (equal "attributes" (alist-get 'kind (aref data 1))))
+          (should (equal text (monk-diff-render back))))
+        ;; a mode-only change on a directory has only the attributes entry
+        (let* ((d (concat dir "d")))
+          (make-directory d) (set-file-modes d #o755)
+          (let ((dr (monk-test-result (monk-plan (monk-test-machine) (lambda (_m) (monk-directory d :mode #o700))) d)))
+            (should (= 1 (length (monk-diff-entries (monk-result-diff dr)))))
+            (should (string-match-p "mode: 0755 → 0700" (monk-result-diff-text dr)))))))))
+
+(ert-deftest monk-test-diff-accepts-plain-string ()
+  "An older or foreign diff string still renders and round-trips."
+  (let ((r (monk-result-create :machine "m" :name "x" :type "t" :status 'repaired
+                               :diff "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n")))
+    (should (equal (monk-result-diff r) (monk-result-diff-text r)))
+    (should (equal (monk-result-diff-text r)
+                   (monk-diff-render (monk-event-diff-to-entries (monk-event-diff (monk-result-diff r))))))))
+
+;;;; changed-when, failed-when, until, no-log
+
+(ert-deftest monk-test-command-changed-when ()
+  "A query command runs every pass; the predicate decides kept or repaired."
+  (monk-test-with-tmpdir dir
+    (let* ((marker (concat dir "flag"))
+           (policy (lambda (_m)
+                     ;; prints "changed" the first time, "same" after, and records the calls
+                     (monk-command "q" "sh"
+                                   :args (list "-c" (format "echo run >> %s.log; if [ -e %s ]; then echo same; else touch %s; echo changed; fi"
+                                                            marker marker marker))
+                                   :changed-when '(= (stdout) "changed"))))
+           (first (monk-test-converge policy)))
+      (should (eq 'repaired (monk-test-status first "q")))
+      (should (equal "changed" (monk-result-comment (monk-test-result first "q"))))
+      ;; pass two ran it again and saw "same" -> kept; converged in 2 passes
+      (should (= 2 (monk-run-passes first)))
+      (should (= 2 (with-temp-buffer (insert-file-contents (concat marker ".log")) (count-lines 1 (point-max)))))
+      (let ((second (monk-test-converge policy :passes 1)))
+        (should (eq 'kept (monk-test-status second "q")))
+        (should (equal "same" (monk-result-comment (monk-test-result second "q")))))
+      ;; a function predicate works too, and sees the exec
+      (should (eq 'kept (monk-test-status
+                         (monk-test-converge (lambda (_m) (monk-command "f" "true"
+                                                                        :changed-when (lambda (exec) (not (monk-exec-ok-p exec)))))
+                                             :passes 1)
+                         "f"))))))
+
+(ert-deftest monk-test-command-failed-when ()
+  "failed-when replaces the exit-code rule in both directions."
+  (let ((run (monk-test-converge
+              (lambda (_m)
+                ;; exits 1 but that is fine
+                (monk-command "ok-nonzero" "sh" :args '("-c" "echo fine; exit 1") :creates "~/never"
+                              :failed-when '(contains (stdout) "ERROR"))
+                ;; exits 0 but says ERROR
+                (monk-command "bad-zero" "sh" :args '("-c" "echo ERROR: disk") :creates "~/never"
+                              :failed-when '(contains (stdout) "ERROR"))
+                ;; rc form
+                (monk-command "rc" "sh" :args '("-c" "exit 3") :creates "~/never"
+                              :failed-when '(> (rc) 5)))
+              :passes 1)))
+    (should (eq 'repaired (monk-test-status run "ok-nonzero")))
+    (should (eq 'failed (monk-test-status run "bad-zero")))
+    (should (string-match-p "failed-when held: ERROR: disk" (monk-result-comment (monk-test-result run "bad-zero"))))
+    (should (eq 'repaired (monk-test-status run "rc")))))
+
+(ert-deftest monk-test-command-predicate-errors-and-exclusive ()
+  (should-error (monk-compile (monk-test-machine)
+                              (lambda (_m) (monk-command "x" "true" :creates "~/a" :changed-when '(= (rc) 0))))
+                :type 'monk-argument-error)
+  ;; a broken predicate fails the resource, with the reason
+  (let ((run (monk-test-converge (lambda (_m) (monk-command "p" "true" :changed-when '(frob))) :passes 1)))
+    (should (eq 'failed (monk-test-status run "p")))
+    (should (string-match-p "Unknown CELL operator frob" (monk-result-comment (monk-test-result run "p"))))))
+
+(ert-deftest monk-test-retry-until-predicate ()
+  "An :until function stops the retries when it says so."
+  (monk-test-with-tmpdir dir
+    (let* ((tries 0)
+           (waits nil))
+      (cl-letf (((symbol-function 'sit-for) (lambda (secs &rest _) (push secs waits) t)))
+        (let ((run (monk-test-converge
+                    (lambda (_m)
+                      (monk-command "poll" "sh"
+                                    :args (list "-c" (format "echo $(( $(cat %s/n 2>/dev/null || echo 0) + 1 )) > %s/n; cat %s/n" dir dir dir))
+                                    :changed-when '(= (stdout) "3")
+                                    :retry (list :attempts 5 :interval 0
+                                                 :until (lambda (result) (eq (monk-result-status result) 'repaired)))))
+                    :passes 1)))
+          (ignore tries)
+          (should (eq 'repaired (monk-test-status run "poll")))
+          (should (string-match-p "attempt 3 of 5" (monk-result-comment (monk-test-result run "poll")))))))))
+
+(ert-deftest monk-test-no-log-censors-everything ()
+  "A :no-log resource's changes, diff, and comment never reach an event or report."
+  (monk-test-with-tmpdir dir
+    (let* ((secret "hunter2-very-secret")
+           (monk-log-level nil)
+           (run (monk-test-converge
+                 (lambda (_m)
+                   (monk-file (concat dir "creds") :content (concat secret "\n") :no-log t)
+                   (monk-line-in-file (concat dir "absent") secret :no-log t))
+                 :passes 1))
+           (r (monk-test-result run (concat dir "creds")))
+           (f (seq-find (lambda (r) (string-prefix-p (concat dir "absent#no-log-") (monk-result-name r)))
+                        (monk-run-results run))))
+      (should (eq 'repaired (monk-result-status r)))
+      (should (monk-result-censored r))
+      (should (equal monk-censored (monk-result-comment r)))
+      (should (null (monk-result-diff r)))
+      (should (equal '(:censored t) (monk-result-changes r)))
+      (should (eq 'failed (monk-result-status f)))
+      (should (string-match-p "censored" (monk-result-comment f)))
+      ;; nothing leaks through the event, the text report, or the describe line
+      (let ((text (mapconcat #'monk-event-line (monk-run-events run) "")))
+        (should-not (string-search secret text))
+        (should (string-search "\"censored\":true" text)))
+      (should-not (string-search secret (monk-run-report-string run t)))
+      (should (equal monk-censored (monk-describe-changes (monk-result-changes r))))
+      ;; the file itself was written
+      (should (equal (concat secret "\n")
+                     (with-temp-buffer (insert-file-contents (concat dir "creds")) (buffer-string))))
+      ;; and the round trip keeps the flag
+      (should (monk-result-censored
+               (monk-event-to-result (monk-event-parse (monk-event-line (monk-event-result r run 1 0)))))))))
+
+;;;; Unreachable machines
+
+(defun monk-test-dead-machine (name &optional ignore)
+  "Return a remote machine NAME whose every command fails like a dead ssh host."
+  (let ((m (monk-machine :name name :address (concat name ".invalid")
+                         :ignore-unreachable ignore)))
+    (oset m facts monk-test-fake-facts)
+    (oset m classes (monk-hard-classes m))
+    m))
+
+(defmacro monk-test-with-dead-exec (dead-names &rest body)
+  "Run BODY with `monk-exec' failing with ssh exit 255 for machines in DEAD-NAMES."
+  (declare (indent 1))
+  `(cl-letf* ((real (symbol-function 'monk-exec))
+              ((symbol-function 'monk-exec)
+               (lambda (m program &rest args)
+                 (if (member (oref m name) ,dead-names)
+                     (monk-exec-create :command (cons program args) :exit-code 255
+                                       :output "ssh: connect to host dead.invalid port 22: No route to host")
+                   (apply real m program args))))
+              ((symbol-function 'file-attributes)
+               (let ((real-fa (symbol-function 'file-attributes)))
+                 (lambda (file &optional id)
+                   (if (and (stringp file) (string-match-p "dead\\.invalid" file))
+                       (signal 'file-error (list "Opening remote file" "No route to host" file))
+                     (funcall real-fa file id))))))
+     ,@body))
+
+(ert-deftest monk-test-unreachable-error-p ()
+  (should (monk-unreachable-error-p '(monk-exec-error "h" ("ssh") 255 "x")))
+  (should (monk-unreachable-error-p '(file-error "Opening" "No route to host" "/ssh:h:/x")))
+  (should (monk-unreachable-error-p '(file-error "ssh: connect to host h port 22: Connection refused")))
+  (should-not (monk-unreachable-error-p '(monk-exec-error "h" ("brew") 1 "Error: nope")))
+  (should-not (monk-unreachable-error-p '(file-error "Opening" "Permission denied" "/x")))
+  (should-not (monk-unreachable-error-p '(monk-resource-error "bad"))))
+
+(ert-deftest monk-test-unreachable-machine-marks-all-its-nodes ()
+  "A machine that does not answer gets unreachable results, once per resource,
+the other machine converges, cross-machine dependents skip with the host named,
+the run is not ok, and the exit code says 4."
+  (monk-test-with-tmpdir dir
+    (let* ((live (car (monk-test-machines "live")))
+           (dead (monk-test-dead-machine "dead"))
+           (monk-log-level nil)
+           (run (monk-test-with-dead-exec '("dead")
+                  (monk-orchestrate
+                   (list dead live)
+                   (lambda (m)
+                     (monk-command (format "probe-%s" (oref m name)) "true" :creates "~/never")
+                     (monk-command (format "second-%s" (oref m name)) "true" :creates "~/never")
+                     (when (equal (oref m name) "live")
+                       (monk-directory (concat dir "after-dead") :require '((dead . "probe-dead")))
+                       (monk-directory (concat dir "free"))))
+                   :passes 2))))
+      (should (eq monk-status-unreachable (monk-result-status (monk-run-result run '("dead" . "probe-dead")))))
+      (should (eq monk-status-unreachable (monk-result-status (monk-run-result run '("dead" . "second-dead")))))
+      ;; real TRAMP answered for the :creates check; either text is right, one line
+      (let ((c (monk-result-comment (monk-run-result run '("dead" . "second-dead")))))
+        (should (string-match-p "No route to host\\|Tramp failed to connect" c))
+        (should-not (string-search "\n" c)))
+      (should (eq monk-status-repaired (monk-result-status (monk-run-result run (cons "live" (concat dir "free"))))))
+      (should (eq monk-status-skipped (monk-result-status (monk-run-result run (cons "live" (concat dir "after-dead"))))))
+      (should (string-match-p "dead is unreachable" (monk-result-comment (monk-run-result run (cons "live" (concat dir "after-dead"))))))
+      (should (equal '("dead") (mapcar #'car (monk-run-unreachable run))))
+      (should-not (monk-run-ok-p run))
+      (should (= 4 (monk-run-exit-code run)))
+      (should (= 2 (monk-run-count run monk-status-unreachable)))
+      (should (string-match-p "2 unreachable" (monk-run-summary run))))))
+
+(ert-deftest monk-test-unreachable-ignored-machine-keeps-run-ok ()
+  (let* ((dead (monk-test-dead-machine "laptop" t))
+         (monk-log-level nil)
+         (run (monk-test-with-dead-exec '("laptop")
+                (monk-orchestrate (list dead)
+                                  (lambda (_m) (monk-command "p" "true" :creates "~/never"))
+                                  :passes 1))))
+    (should (eq monk-status-unreachable (monk-result-status (monk-run-result run '("laptop" . "p")))))
+    (should (monk-run-ok-p run))
+    (should (= 0 (monk-run-exit-code run)))))
+
+(ert-deftest monk-test-unreachable-at-fact-time ()
+  "A machine that dies before facts are gathered still gets nodes, all unreachable."
+  (let* ((dead (monk-machine :name "dead" :address "dead.invalid"))
+         (monk-log-level nil)
+         (run (monk-test-with-dead-exec '("dead")
+                (monk-orchestrate (list dead) (lambda (_m) (monk-command "p" "true" :creates "~/never")) :passes 1))))
+    (should (equal '("dead") (mapcar #'car (monk-run-unreachable run))))
+    (should (eq monk-status-unreachable (monk-result-status (monk-run-result run '("dead" . "p")))))
+    (should (= 4 (monk-run-exit-code run)))))
+
+(ert-deftest monk-test-unreachable-exit-code-combines ()
+  (monk-test-with-tmpdir dir
+    (let* ((live (car (monk-test-machines "live")))
+           (dead (monk-test-dead-machine "dead"))
+           (monk-log-level nil)
+           (run (monk-test-with-dead-exec '("dead")
+                  (monk-orchestrate (list dead live)
+                                    (lambda (m)
+                                      (monk-command "p" "true" :creates "~/never")
+                                      (when (equal (oref m name) "live")
+                                        (monk-line-in-file (concat dir "absent") "x")))
+                                    :passes 1))))
+      (should (= 6 (monk-run-exit-code run)))
+      (should (equal 6 (alist-get 'exit_code (monk-event-run 'run-end run))))
+      (should (equal ["dead"] (alist-get 'unreachable (monk-event-run 'run-end run)))))))
+
+(ert-deftest monk-test-inventory-ignore-unreachable-var ()
+  (let ((monk-inventory nil))
+    (monk-inventory-define '(w :hosts ((a :vars ((ignore_unreachable . t))) (b))))
+    (should (monk-machine-ignores-unreachable-p (monk-inventory-find 'a)))
+    (should-not (monk-machine-ignores-unreachable-p (monk-inventory-find 'b)))))
 
 ;;;; Salt items: tags, result hook, watch suppression, folds
 
@@ -3646,6 +4315,346 @@ refuses to run from a side window."
       (goto-char (point-min))
       (should (search-forward "Unknown name frob" nil t)))
     (kill-buffer monk-ui-query-buffer-name)))
+
+;;;; Ansible C: tags, serial, max-fail-percentage, check-policy, agent, direct modules
+
+(ert-deftest monk-test-tags-select ()
+  "Ansible's evaluate_tags table."
+  ;; no selection: everything runs
+  (should (monk-tags-select-p nil nil nil))
+  (should (monk-tags-select-p '(ssh) nil nil))
+  ;; only
+  (should (monk-tags-select-p '(ssh) '(ssh) nil))
+  (should-not (monk-tags-select-p '(ssh) '(dns) nil))
+  (should-not (monk-tags-select-p nil '(dns) nil))
+  (should (monk-tags-select-p '(always) '(dns) nil))
+  (should-not (monk-tags-select-p '(never) '(all) nil))
+  (should (monk-tags-select-p '(never slow) '(slow) nil))
+  (should (monk-tags-select-p '(ssh) '(all) nil))
+  (should (monk-tags-select-p nil '(all) nil))
+  (should (monk-tags-select-p '(ssh) '(tagged) nil))
+  (should-not (monk-tags-select-p nil '(tagged) nil))
+  (should (monk-tags-select-p nil '(untagged) nil))
+  ;; skip
+  (should-not (monk-tags-select-p '(ssh) nil '(ssh)))
+  (should (monk-tags-select-p '(always) nil '(all)))
+  (should-not (monk-tags-select-p '(always) nil '(all always)))
+  (should-not (monk-tags-select-p '(ssh) nil '(tagged)))
+  (should (monk-tags-select-p nil nil '(tagged)))
+  ;; only then skip
+  (should-not (monk-tags-select-p '(ssh slow) '(ssh) '(slow))))
+
+(ert-deftest monk-test-tags-feed-only ()
+  "Tag selection narrows the run; requisites still pull dependencies in."
+  (monk-test-with-tmpdir dir
+    (let* ((m (monk-test-machine))
+           (monk-log-level nil)
+           (policy (lambda (_m)
+                     (monk-directory (concat dir "base") :tags '(base))
+                     (monk-file (concat dir "conf") :content "x" :require (list (concat dir "base")) :tags '(ssh))
+                     (monk-directory (concat dir "other") :tags '(dns))
+                     (monk-directory (concat dir "plain"))
+                     (monk-directory (concat dir "must") :tags '(always))))
+           (run (monk-orchestrate (list m) policy :tags '(ssh))))
+      (should (eq 'repaired (monk-test-status run (concat dir "conf"))))
+      (should (eq 'skipped (monk-test-status run (concat dir "base"))))
+      (should (eq 'skipped (monk-test-status run (concat dir "other"))))
+      (should (eq 'skipped (monk-test-status run (concat dir "plain"))))
+      (should (eq 'repaired (monk-test-status run (concat dir "must"))))
+      (should (equal '(ssh) (plist-get (monk-run-options run) :tags))))
+    (let* ((m (monk-test-machine))
+           (monk-log-level nil)
+           (run (monk-orchestrate (list m)
+                                  (lambda (_m)
+                                    (monk-directory (concat dir "s1") :tags '(slow))
+                                    (monk-directory (concat dir "s2")))
+                                  :skip-tags '(slow))))
+      (should (eq 'skipped (monk-test-status run (concat dir "s1"))))
+      (should (eq 'repaired (monk-test-status run (concat dir "s2")))))
+    ;; a selection that matches nothing runs nothing, not everything
+    (let* ((m (monk-test-machine))
+           (monk-log-level nil)
+           (run (monk-orchestrate (list m)
+                                  (lambda (_m) (monk-directory (concat dir "n1")))
+                                  :tags '(nothing-has-this))))
+      (should (eq 'skipped (monk-test-status run (concat dir "n1")))))))
+
+(ert-deftest monk-test-serial-batches ()
+  (should (= 1 (monk-serial-count "25%" 4)))
+  (should (= 1 (monk-serial-count "10%" 4)))
+  (should (= 3 (monk-serial-count 3 4)))
+  (should-error (monk-serial-count "x" 4) :type 'monk-policy-error)
+  (let ((ms '(a b c d e f g)))
+    (should (equal '((a b c d e f g)) (monk-serial-batches ms nil)))
+    (should (equal '((a b) (c d) (e f) (g)) (monk-serial-batches ms 2)))
+    (should (equal '((a) (b c) (d e f g)) (monk-serial-batches ms '(1 2 0))))
+    (should (equal '((a) (b c) (d e f g)) (monk-serial-batches ms '(1 "30%" "100%"))))
+    (should (equal '((a) (b c) (d e) (f g)) (monk-serial-batches ms '(1 2))))))
+
+(ert-deftest monk-test-serial-run-stops-over-threshold ()
+  "Batches run in order; one that fails past the threshold stops the rest."
+  (monk-test-with-tmpdir dir
+    (let* ((machines (monk-test-machines "a" "b" "c" "d"))
+           (monk-log-level nil)
+           (order nil)
+           (policy (lambda (m)
+                     (when (equal (oref m name) "a")
+                       (monk-line-in-file (concat dir "missing") "x"))
+                     (monk-command (concat "touch-" (oref m name)) "sh"
+                                   :args (list "-c" (format "echo %s >> %s" (oref m name) (concat dir "order")))
+                                   :changed-when (lambda (_e) t))
+                     (monk-directory (concat dir (oref m name)))))
+           (run (monk-orchestrate machines policy :serial 1 :max-fail-percentage 50 :passes 1)))
+      (ignore order)
+      (should (equal '(("a") ("b") ("c") ("d")) (monk-run-batches run)))
+      (should (= 1 (monk-run-stopped-at-batch run)))
+      (should-not (monk-run-ok-p run))
+      (should (eq monk-status-failed (monk-result-status (monk-run-result run (cons "a" (concat dir "missing#x"))))))
+      (should (file-directory-p (concat dir "a")))
+      (should-not (file-directory-p (concat dir "b")))
+      (should (equal monk-skip-batch (monk-result-comment (monk-run-result run (cons "b" (concat dir "b"))))))
+      (should (equal monk-skip-batch (monk-result-comment (monk-run-result run (cons "d" (concat dir "d"))))))
+      (should (equal "a\n" (with-temp-buffer (insert-file-contents (concat dir "order")) (buffer-string)))))
+    ;; under the threshold every batch runs, and a plan never stops
+    (let* ((machines (monk-test-machines "a" "b" "c" "d"))
+           (monk-log-level nil)
+           (policy (lambda (m)
+                     (when (equal (oref m name) "a")
+                       (monk-line-in-file (concat dir "missing") "x"))
+                     (monk-directory (concat dir "2-" (oref m name)))))
+           (run (monk-orchestrate machines policy :serial 2 :max-fail-percentage 50 :passes 1)))
+      (should (equal '(("a" "b") ("c" "d")) (monk-run-batches run)))
+      (should-not (monk-run-stopped-at-batch run))
+      (should (file-directory-p (concat dir "2-d"))))
+    (let* ((machines (monk-test-machines "a" "b"))
+           (monk-log-level nil)
+           (run (monk-orchestrate machines
+                                  (lambda (m)
+                                    (when (equal (oref m name) "a")
+                                      (monk-line-in-file (concat dir "missing") "x"))
+                                    (monk-directory (concat dir "3-" (oref m name))))
+                                  :serial 1 :max-fail-percentage 0 :dry-run t)))
+      (should-not (monk-run-stopped-at-batch run))
+      (should (eq monk-status-would-repair (monk-result-status (monk-run-result run (cons "b" (concat dir "3-b")))))))))
+
+(ert-deftest monk-test-serial-cross-batch-require ()
+  "A resource in batch two can require one from batch one."
+  (monk-test-with-tmpdir dir
+    (let* ((machines (monk-test-machines "a" "b"))
+           (monk-log-level nil)
+           (run (monk-orchestrate machines
+                                  (lambda (m)
+                                    (if (equal (oref m name) "a")
+                                        (monk-directory (concat dir "first"))
+                                      (monk-directory (concat dir "second")
+                                                      :require (list (cons 'a (concat dir "first"))))))
+                                  :serial 1)))
+      (should (eq monk-status-repaired (monk-result-status (monk-run-result run (cons "a" (concat dir "first"))))))
+      (should (eq monk-status-repaired (monk-result-status (monk-run-result run (cons "b" (concat dir "second"))))))
+      (should (monk-run-ok-p run)))))
+
+(ert-deftest monk-test-check-policy ()
+  "Compile only: lists resources and tags, reports errors and bad refs, no connection."
+  (monk-test-with-tmpdir dir
+    (let* ((m (monk-test-machine))
+           (monk-log-level nil)
+           (gathers 0)
+           (report (cl-letf (((symbol-function 'monk-gather-facts) (lambda (_m) (cl-incf gathers))))
+                     (monk-check-policy m (lambda (_m)
+                                            (monk-directory (concat dir "a") :tags '(base))
+                                            (monk-file (concat dir "b") :content "x" :tags '(ssh base)))
+                                        :tags '(ssh)))))
+      (should (= 0 gathers))
+      (should (monk-check-policy-ok-p report))
+      (should (= 2 (length (plist-get report :nodes))))
+      (should (equal '(base ssh) (plist-get report :tags)))
+      (should (equal (list (cons "testbox" (concat dir "b"))) (plist-get report :selected)))
+      (let ((text (monk-check-policy-string report)))
+        (should (string-match-p "== testbox: 2 resource" text))
+        (should (string-match-p "\\[ssh base\\]" text))
+        (should (string-match-p "^tags: base ssh" text))))
+    (let ((report (monk-check-policy (monk-test-machine)
+                                     (lambda (_m) (monk-directory (concat dir "a") :require '("nope"))))))
+      (should-not (monk-check-policy-ok-p report))
+      (should (string-match-p "nope" (car (plist-get report :unresolved)))))
+    (let ((report (monk-check-policy (monk-test-machine)
+                                     (lambda (_m) (monk-directory (concat dir "a") :when '(frob))))))
+      (should-not (monk-check-policy-ok-p report))
+      (should (equal "testbox" (caar (plist-get report :errors))))
+      (should (string-match-p "error: testbox:" (monk-check-policy-string report))))))
+
+(ert-deftest monk-test-agent-splay-and-policy-repo ()
+  (require 'monk-agent)
+  (let ((monk-agent-splay 0))
+    (should (= 0 (monk-agent-splay-seconds))))
+  (let ((monk-agent-splay 5))
+    (dotimes (_ 20) (should (<= 0 (monk-agent-splay-seconds) 5))))
+  (should-not (let ((monk-agent-policy-repo nil)) (monk-agent-update-policy-repo)))
+  (monk-test-with-tmpdir dir
+    (let ((monk-log-level nil))
+      ;; a directory that is not a repo: the update fails softly
+      (let ((monk-agent-policy-repo dir))
+        (should-not (monk-agent-update-policy-repo)))
+      ;; a real repo with an upstream: same, then changed
+      (let* ((upstream (concat dir "up/"))
+             (clone (concat dir "clone")))
+        (make-directory upstream)
+        (monk--git-in upstream "init" "-q" "-b" "main")
+        (monk--git-in upstream "-c" "user.email=t@example.invalid" "-c" "user.name=t"
+                      "commit" "-q" "--allow-empty" "-m" "one")
+        (monk--git-in dir "clone" "-q" upstream clone)
+        (let ((monk-agent-policy-repo clone))
+          (should (eq 'same (monk-agent-update-policy-repo)))
+          (monk--git-in upstream "-c" "user.email=t@example.invalid" "-c" "user.name=t"
+                        "commit" "-q" "--allow-empty" "-m" "two")
+          (should (eq 'changed (monk-agent-update-policy-repo)))
+          (should (equal (monk--git-in upstream "rev-parse" "HEAD") monk-agent--policy-revision)))))))
+
+(ert-deftest monk-test-agent-only-if-changed-skips ()
+  "A timed converge runs only after the policy repo moved when asked."
+  (require 'monk-agent)
+  (let ((converges 0)
+        (monk-agent-only-if-changed t)
+        (monk-agent-policy-repo "/nonexistent-repo")
+        (monk-agent-splay 0)
+        (monk-log-level nil))
+    (cl-letf (((symbol-function 'monk-converge) (lambda (&rest _) (cl-incf converges) (monk-run-create)))
+              ((symbol-function 'monk-run-report) #'identity)
+              ((symbol-function 'monk-agent-update-policy-repo) (lambda () 'same)))
+      (monk-agent--full-converge #'ignore)      ; start: always
+      (should (= 1 converges))
+      (monk-agent--full-converge #'ignore t)    ; timed, unchanged: skipped
+      (should (= 1 converges))
+      (cl-letf (((symbol-function 'monk-agent-update-policy-repo) (lambda () 'changed))
+                ((symbol-function 'monk-cli-print-line) #'ignore))
+        (setq monk-agent--policy-revision "0123456789abcdef")
+        (monk-agent--full-converge #'ignore t)
+        (should (= 2 converges)))
+      (let ((monk-agent-only-if-changed nil))
+        (monk-agent--full-converge #'ignore t)
+        (should (= 3 converges))))))
+
+(ert-deftest monk-test-ansible-direct-normalize-and-diff ()
+  (require 'monk-bridge)
+  ;; rc != 0 without failed is failed; missing changed is false
+  (let ((out (monk-ansible-normalize '((msg . "x")) 1)))
+    (should (eq t (alist-get 'failed out)))
+    (should (eq :false (alist-get 'changed out))))
+  (should (eq :false (alist-get 'failed (monk-ansible-normalize '((changed . t)) 0))))
+  ;; secrets are masked and internal keys dropped
+  (let ((out (monk-ansible-normalize '((msg . "token is hunter2") (_ansible_new_secrets . ("hunter2"))
+                                       (_ansible_no_log . t) (changed . :false))
+                                     0)))
+    (should (equal "token is ********" (alist-get 'msg out)))
+    (should-not (assq '_ansible_new_secrets out))
+    (should-not (assq '_ansible_no_log out)))
+  ;; diff shapes
+  (let ((content (monk-ansible-result-diff
+                  '((diff (before . "a\n") (after . "b\n") (before_header . "/x (content)"))) "/x")))
+    (should (= 1 (length content)))
+    (should (eq 'content (monk-diff-entry-kind (car content))))
+    (should (string-match-p "^-a$" (monk-diff-render content))))
+  (let ((attrs (monk-ansible-result-diff
+                '((diff (before (path . "/x") (mode . "0644")) (after (path . "/x") (mode . "0600")))) "/x")))
+    (should (eq 'attributes (monk-diff-entry-kind (car attrs))))
+    ;; the unchanged path is dropped from after so only mode renders
+    (should (equal '((mode . "0600")) (monk-diff-entry-after (car attrs))))
+    (should (string-match-p "mode: 0644 → 0600" (monk-diff-render attrs))))
+  (should (= 2 (length (monk-ansible-result-diff
+                        '((diff ((before . "a") (after . "b")) ((before . "c") (after . "d")))) "/x"))))
+  (should (eq 'rendered (monk-diff-entry-kind (car (monk-ansible-result-diff '((diff . "--- x\n+++ y\n")) "/x")))))
+  (should-not (monk-ansible-result-diff '((changed . t)) "/x"))
+  ;; the module args JSON
+  (should (equal "{\"ANSIBLE_MODULE_ARGS\":{\"path\":\"/x\",\"create\":true,\"_ansible_check_mode\":true,\"_ansible_diff\":true}}"
+                 (monk-ansible-module-args '((path . "/x") (create . t)) t)))
+  (should (equal "{\"ANSIBLE_MODULE_ARGS\":{\"path\":\"/x\"}}"
+                 (monk-ansible-module-args '((path . "/x")) nil))))
+
+(ert-deftest monk-test-ansible-direct-run ()
+  "Direct module runs through a faked exec: check, diff, repair, failure, garbage."
+  (require 'monk-bridge)
+  (let* ((m (monk-test-machine))
+         (monk-log-level nil)
+         (monk-ansible-library "/fake/lib")
+         (monk-ansible--payload (cons "/fake/zip" "abc"))
+         (sent nil) (env nil)
+         (r (car (monk-compile m (lambda (_m)
+                                   (monk-ansible "x" "lineinfile" '((path . "/x") (line . "b=2"))))))))
+    (should (equal '((path . "/x") (line . "b=2")) (oref r args)))
+    (cl-letf (((symbol-function 'monk-ansible-payload-on) (lambda (_m) "/home/u/.cache/monk/z.zip"))
+              ((symbol-function 'monk-exec)
+               (lambda (_m program &rest args)
+                 (setq sent (plist-get (cdr (member "ansible.modules.lineinfile" args)) :input)
+                       env (getenv "PYTHONPATH"))
+                 (should (equal "python3" program))
+                 (monk-exec-create
+                  :exit-code 0
+                  :output "\n{\"changed\": true, \"msg\": \"line added\", \"diff\": {\"before\": \"\", \"after\": \"b=2\\n\", \"before_header\": \"/x (content)\", \"after_header\": \"/x (content)\"}}\n"))))
+      (let ((changes (monk-check r m)))
+        (should (equal "line added" (plist-get changes :ansible)))
+        (should (string-match-p "_ansible_check_mode\":true" sent))
+        (should (equal "/home/u/.cache/monk/z.zip" env))
+        (should (string-match-p "^\\+b=2$" (monk-diff-render (monk-diff r m changes)))))
+      (should (equal "lineinfile line added" (monk-repair r m nil)))
+      (should-not (string-match-p "_ansible_check_mode" sent)))
+    (cl-letf (((symbol-function 'monk-ansible-payload-on) (lambda (_m) "/z.zip"))
+              ((symbol-function 'monk-exec)
+               (lambda (&rest _) (monk-exec-create :exit-code 0 :output "\n{\"changed\": false}\n"))))
+      (should-not (monk-check r m)))
+    (cl-letf (((symbol-function 'monk-ansible-payload-on) (lambda (_m) "/z.zip"))
+              ((symbol-function 'monk-exec)
+               (lambda (&rest _) (monk-exec-create :exit-code 0 :output "\n{\"changed\": false, \"skipped\": true, \"msg\": \"would run\"}\n"))))
+      (should (eq 'no-check-mode (plist-get (monk-check r m) :ansible))))
+    (cl-letf (((symbol-function 'monk-ansible-payload-on) (lambda (_m) "/z.zip"))
+              ((symbol-function 'monk-exec)
+               (lambda (&rest _) (monk-exec-create :exit-code 1 :output "\n{\"failed\": true, \"msg\": \"missing required arguments: path\"}\n"))))
+      (should-error (monk-check r m) :type 'monk-resource-error)
+      (should-error (monk-repair r m nil) :type 'monk-resource-error))
+    (cl-letf (((symbol-function 'monk-ansible-payload-on) (lambda (_m) "/z.zip"))
+              ((symbol-function 'monk-exec)
+               (lambda (&rest _) (monk-exec-create :exit-code 1 :output "Traceback: boom"))))
+      (should-error (monk-check r m) :type 'monk-exec-error))))
+
+(ert-deftest monk-test-ansible-payload-build ()
+  "The payload zip is built from the library once, named by content."
+  (require 'monk-bridge)
+  (skip-unless (executable-find "zip"))
+  (monk-test-with-tmpdir dir
+    (let ((lib (concat dir "lib/")))
+      (dolist (member monk-ansible-payload-members)
+        (let ((full (concat lib member)))
+          (if (string-suffix-p ".py" member)
+              (progn (make-directory (file-name-directory full) t)
+                     (with-temp-file full (insert "# stub\n")))
+            (make-directory full t)
+            (with-temp-file (concat full "/x.py") (insert "x = 1\n"))
+            (make-directory (concat full "/__pycache__") t)
+            (with-temp-file (concat full "/__pycache__/x.pyc") (insert "junk")))))
+      (let ((monk-ansible-library lib)
+            (monk-ansible--payload nil)
+            (process-environment (cons (concat monk-home-environment-variable "=" dir "home") process-environment)))
+        (pcase-let ((`(,path . ,sha) (monk-ansible-payload)))
+          (should (file-exists-p path))
+          (should (string-prefix-p (concat dir "home/ansible-modlib-") path))
+          (should (= 64 (length sha)))
+          (let ((mtime (file-attribute-modification-time (file-attributes path))))
+            (should (equal (cons path sha) (monk-ansible-payload)))
+            (should (equal mtime (file-attribute-modification-time (file-attributes path)))))
+          (with-temp-buffer
+            (call-process "unzip" nil t nil "-l" path)
+            (should (search-backward "ansible/modules/x.py" nil t))
+            (goto-char (point-min))
+            (should-not (search-forward "__pycache__" nil t))))
+        ;; a machine gets the zip under its cache once
+        (let* ((m (monk-test-machine))
+               (monk--current-run (monk-run-create)))
+          (let ((monk-ansible-payload-cache (concat dir "target/.cache/monk")))
+            (let ((remote (monk-ansible-payload-on m)))
+              (should (file-exists-p remote))
+              (should (string-prefix-p (concat dir "target/.cache/monk/ansible-modlib-") remote))
+              (should (equal remote (monk-ansible-payload-on m))))))))
+    (let ((monk-ansible-library nil))
+      (should-error (monk-ansible-payload) :type 'monk-policy-error))))
 
 (provide 'monk-test)
 ;;; monk-test.el ends here

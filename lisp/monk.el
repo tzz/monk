@@ -94,6 +94,11 @@
   "Resource was not evaluated: a guard, class, or requisite did not match.")
 (defconst monk-status-would-repair 'would-repair
   "Dry run: resource would be changed.")
+(defconst monk-status-unreachable 'unreachable
+  "The machine could not be reached, so the resource was not tried.
+Ansible's `dark'.  Not a failure of the policy: excluded from the
+degree, counted on its own, and the rest of that machine is not
+attempted in this run.")
 (defconst monk-status-pending 'pending
   "Resource has not run yet.  Used by progress displays.")
 (defconst monk-status-running 'running
@@ -101,8 +106,33 @@
 
 (defconst monk-statuses
   (list monk-status-kept monk-status-repaired monk-status-partial
-        monk-status-failed monk-status-skipped monk-status-would-repair)
+        monk-status-failed monk-status-skipped monk-status-would-repair
+        monk-status-unreachable)
   "All statuses a finished result can carry, in display order.")
+
+(defconst monk-home-environment-variable "MONK_HOME"
+  "Environment variable that names the Monk state directory.")
+
+(defconst monk-home-root-directory "/etc/monk"
+  "Monk state directory when Emacs runs as root.")
+
+(defun monk-home-directory ()
+  "Return the directory for Monk state on this host.
+$MONK_HOME wins.  Root uses `monk-home-root-directory'.  Anyone else
+uses $XDG_DATA_HOME/monk or ~/.local/share/monk."
+  (file-name-as-directory
+   (or (getenv monk-home-environment-variable)
+       (if (zerop (user-uid))
+           monk-home-root-directory
+         (expand-file-name "monk" (or (getenv "XDG_DATA_HOME") "~/.local/share"))))))
+
+(defcustom monk-fact-ttl 86400
+  "Seconds for which cached facts count as fresh.
+A machine whose facts in the cache are younger than this is not
+contacted for facts at compile time, so plans, queries, and mock runs
+work while it is off.  Ansible's fact_caching_timeout, one day.
+Nil turns the cache off."
+  :type '(choice (const nil) natnum))
 
 (defcustom monk-max-passes 6
   "Upper bound on convergence passes in one run.
@@ -117,9 +147,10 @@ limits the cycle length Monk can name: with 6 passes a cycle of up to
 :attempts is the total number of tries.  :interval is the wait in
 seconds before try two.  Each later wait is the previous one times
 :backoff.  :splay adds a random 0..SPLAY seconds to each wait.
-:until is `success' (stop on kept or repaired) or `failure' (stop on
-the first failure, for a resource expected to fail).  Salt's defaults,
-plus :backoff."
+:until is `success' (stop on kept or repaired), `failure' (stop on the
+first failure, for a resource expected to fail), or a function of the
+result that returns non-nil when done.  Salt's defaults, plus
+:backoff and the predicate form from Ansible's until."
   :type 'plist)
 
 (defcustom monk-retry-max-interval 300
@@ -187,6 +218,7 @@ Each is called with two arguments: EVENT, one of `run-start',
 (define-error 'monk-inventory-error "Monk inventory error" 'monk-error)
 (define-error 'monk-requisite-error "Monk requisite error" 'monk-error)
 (define-error 'monk-guard-error "Monk guard error" 'monk-error)
+(define-error 'monk-command-unchanged "Monk command ran without change" 'monk-error)
 (define-error 'monk-cel-error "Monk CEL error" 'monk-guard-error)
 
 ;; monk-cell.el evaluates :when guards.  It declares the machine
@@ -205,6 +237,10 @@ Each is called with two arguments: EVENT, one of `run-start',
        (>= (alist-get level monk--log-levels 0)
            (alist-get monk-log-level monk--log-levels 0))))
 
+(defvar monk-batch-print-function (lambda (line) (message "%s" line))
+  "How a batch Emacs prints one log line.
+`monk-cli' sets this to keep its status line intact.")
+
 (defun monk-log (level format-string &rest args)
   "Log FORMAT-STRING with ARGS at LEVEL to `monk-log-buffer-name'."
   (when (monk--log-enabled-p level)
@@ -214,7 +250,7 @@ Each is called with two arguments: EVENT, one of `run-start',
         (insert (format-time-string "%FT%T ")
                 (upcase (symbol-name level)) " " line "\n"))
       (when (and noninteractive (not (eq level 'debug)))
-        (message "%s" line)))))
+        (funcall monk-batch-print-function line)))))
 
 (defun monk-progress (event &rest data)
   "Send EVENT with plist DATA to `monk-progress-functions'."
@@ -234,7 +270,72 @@ Each is called with two arguments: EVENT, one of `run-start',
   comment
   diff
   (duration 0.0)
-  origin)               ; (FILE . NAME): where the resource was defined
+  origin                ; (FILE . NAME): where the resource was defined
+  censored)             ; non-nil when :no-log removed changes, diff, and comment
+
+(cl-defstruct (monk-diff-entry (:constructor monk-diff-entry-create)
+                               (:copier nil))
+  "One before/after pair of a result's diff.  Ansible's diff shape.
+BEFORE and AFTER are strings for content, or alists for attributes
+such as mode and owner.  The headers name what the two sides are,
+usually the path and a tag such as `mode'.  KIND is `content' or
+`attributes'."
+  before after
+  before-header after-header
+  (kind 'content))
+
+(defun monk-diff-content (before after path)
+  "Return a content diff entry from BEFORE to AFTER for PATH."
+  (monk-diff-entry-create :before (or before "") :after (or after "")
+                          :before-header path :after-header path :kind 'content))
+
+(defun monk-diff-attributes (path before after)
+  "Return an attributes diff entry for PATH between alists BEFORE and AFTER."
+  (monk-diff-entry-create :before before :after after
+                          :before-header path :after-header path :kind 'attributes))
+
+(defun monk-diff-entries (diff)
+  "Return DIFF as a list of `monk-diff-entry'.
+Accepts the old shape too: a unified-diff string becomes one entry
+whose rendering is that string."
+  (cond
+   ((null diff) nil)
+   ((stringp diff) (list (monk-diff-entry-create :before nil :after diff :kind 'rendered)))
+   ((monk-diff-entry-p diff) (list diff))
+   (t diff)))
+
+(declare-function monk--unified-diff "monk-file" (old new label))
+
+(defun monk-diff-render-entry (entry)
+  "Return ENTRY as text: a unified diff, or `key: a → b' lines for attributes."
+  (pcase (monk-diff-entry-kind entry)
+    ('rendered (monk-diff-entry-after entry))
+    ('attributes
+     (let ((before (monk-diff-entry-before entry))
+           (after (monk-diff-entry-after entry)))
+       (concat (format "--- a/%s (attributes)\n+++ b/%s (attributes)\n"
+                       (monk-diff-entry-before-header entry) (monk-diff-entry-after-header entry))
+               (mapconcat (lambda (cell)
+                            (let ((old (cdr (assq (car cell) before))))
+                              (format "%s: %s → %s" (car cell)
+                                      (if (integerp old) (format "%04o" old) (or old "unset"))
+                                      (if (integerp (cdr cell)) (format "%04o" (cdr cell)) (cdr cell)))))
+                          after "\n"))))
+    (_ (require 'monk-file)
+       (monk--unified-diff (monk-diff-entry-before entry) (monk-diff-entry-after entry)
+                           (or (monk-diff-entry-before-header entry) "")))))
+
+(defun monk-diff-render (diff)
+  "Return DIFF, entries or a string, as one text block, or nil when empty."
+  (let ((parts (delq nil (mapcar (lambda (e)
+                                   (let ((text (monk-diff-render-entry e)))
+                                     (and text (not (string-empty-p text)) text)))
+                                 (monk-diff-entries diff)))))
+    (and parts (mapconcat (lambda (p) (if (string-suffix-p "\n" p) p (concat p "\n"))) parts ""))))
+
+(defun monk-result-diff-text (result)
+  "Return the rendered diff of RESULT, or nil."
+  (monk-diff-render (monk-result-diff result)))
 
 (defun monk-result-changed-p (result)
   "Return non-nil when RESULT repaired or would repair."
@@ -264,6 +365,9 @@ Each is called with two arguments: EVENT, one of `run-start',
   (context (make-hash-table :test #'equal))  ; per-run cache, see `monk-run-context-get'
   (mock nil)            ; compile and order only; nothing is checked
   (rescued nil)         ; keys whose failure an :onfail handler with :handled t covered
+  (unreachable nil)     ; alist of (MACHINE-NAME . REASON) for machines that did not answer
+  (batches nil)         ; lists of machine names when :serial split the run
+  (stopped-at-batch nil) ; index of the batch whose failures stopped the rest
   (last-pass-repaired 0)
   (repaired-by-pass nil)
   (start-time (current-time))
@@ -372,15 +476,49 @@ With MACHINE, a name string, count only that machine."
              (monk-run-results run)))
 
 (defun monk-run-ok-p (run)
-  "Return non-nil when no result in RUN failed.
+  "Return non-nil when no result in RUN failed and every machine answered.
 A failure that an :onfail handler with :handled t covered is rescued
-and does not count.  See `monk-run-rescued'."
-  (not (seq-some (lambda (r)
-                   (and (monk-result-failed-p r)
-                        (not (member (monk-result-key r) (monk-run-rescued run)))))
-                 (monk-run-results run))))
+and does not count.  An unreachable machine counts unless it has
+`ignore-unreachable'.  A run that stopped at a batch is not ok.  See
+`monk-run-rescued', `monk-run-unreachable'."
+  (and (not (monk-run-stopped-at-batch run))
+       (not (seq-some (lambda (r)
+                        (and (monk-result-failed-p r)
+                             (not (member (monk-result-key r) (monk-run-rescued run)))))
+                      (monk-run-results run)))
+       (not (seq-some (lambda (cell)
+                        (let ((m (seq-find (lambda (m) (equal (oref m name) (car cell)))
+                                           (monk-run-machines run))))
+                          (not (and m (monk-machine-ignores-unreachable-p m)))))
+                      (monk-run-unreachable run)))))
+
+(declare-function monk-machine-ignores-unreachable-p "monk" (m))
+
+(defun monk-run-unreachable-p (run machine-name)
+  "Return the reason MACHINE-NAME was unreachable in RUN, or nil."
+  (cdr (assoc machine-name (monk-run-unreachable run))))
+
+(defun monk-run-exit-code (run)
+  "Return the exit code a batch entry point gives for RUN.
+Ansible's bit-safe codes: 0 when ok, 2 when a resource failed, 4 when
+a machine was unreachable, 6 for both.  Rescued failures and machines
+with `ignore-unreachable' do not count."
+  (logior (if (seq-some (lambda (r) (and (monk-result-failed-p r)
+                                         (not (member (monk-result-key r) (monk-run-rescued run)))))
+                        (monk-run-results run))
+              2 0)
+          (if (seq-some (lambda (cell)
+                          (let ((m (seq-find (lambda (m) (equal (oref m name) (car cell)))
+                                             (monk-run-machines run))))
+                            (not (and m (monk-machine-ignores-unreachable-p m)))))
+                        (monk-run-unreachable run))
+              4 0)))
 
 ;;;; Run context
+
+(defvar monk--unreachable-at-compile nil
+  "Alist of (MACHINE-NAME . REASON) found unreachable while gathering facts.
+Set by `monk--nodes-for', read by `monk--run-nodes' into the run.")
 
 (defvar monk--current-run nil
   "The run in progress, for `monk-run-context-get' inside resources.")
@@ -449,10 +587,86 @@ That means two or more resources disagree about the same state."
    (classes :initarg :classes
             :initform nil
             :documentation "List of class symbols.  Filled by `monk-gather-facts'.")
+   (gathered :initarg :gathered
+             :initform nil
+             :documentation "When the facts were gathered, a time value, or nil.
+Set by `monk-gather-facts' and by the cache when it fills the facts.")
+   (facts-source :initarg :facts-source
+                 :initform nil
+                 :documentation "`live' when this session gathered the facts, `cache' when they
+came from the history database, nil when there are none.")
    (origin :initarg :origin
            :initform nil
-           :documentation "Where the inventory defined this machine: (FILE . NAME)."))
+           :documentation "Where the inventory defined this machine: (FILE . NAME).")
+   (ignore-unreachable :initarg :ignore-unreachable
+                       :initform nil
+                       :documentation "When non-nil, this machine being unreachable does not make
+the run not ok.  A laptop that is often away.  The inventory variable
+`ignore_unreachable' sets it."))
   "A machine that Monk manages.")
+
+(defvar monk-facts-ready-functions nil
+  "Functions called with a machine once its facts are in, live or from the cache.
+monk-inventory uses it to apply derived groups.")
+
+(defvar monk-fact-cache-functions nil
+  "Functions that store and load facts: (STORE M) and (LOAD M).
+An alist with keys `store' and `load'.  monk-history installs the
+SQLite-backed pair when it loads.  LOAD returns (FACTS . GATHERED) or
+nil.")
+
+(defun monk-facts-store (m)
+  "Store the facts of M through `monk-fact-cache-functions'."
+  (let ((store (alist-get 'store monk-fact-cache-functions)))
+    (when store
+      (condition-case err
+          (funcall store m)
+        (error (monk-log 'warn "%s: fact cache store failed: %s" (oref m name)
+                         (error-message-string err)))))))
+
+(defun monk-facts-load (m)
+  "Fill M's facts from the cache when they are fresh.  Return non-nil when done."
+  (let ((load (alist-get 'load monk-fact-cache-functions)))
+    (when (and load monk-fact-ttl)
+      (pcase (condition-case err
+                 (funcall load m)
+               (error (monk-log 'warn "%s: fact cache load failed: %s" (oref m name)
+                                (error-message-string err))
+                      nil))
+        (`(,facts . ,gathered)
+         (when (and facts gathered
+                    (< (float-time (time-since gathered)) monk-fact-ttl))
+           (oset m facts facts)
+           (oset m gathered gathered)
+           (oset m facts-source 'cache)
+           (oset m classes (monk-hard-classes m))
+           (run-hook-with-args 'monk-facts-ready-functions m)
+           t))))))
+
+(defun monk-facts-flush (&optional machines)
+  "Forget the facts of MACHINES, default `monk-inventory', in memory and cache.
+The next compile gathers them again.  Ansible's --flush-cache."
+  (interactive)
+  (let ((flush (alist-get 'flush monk-fact-cache-functions)))
+    (dolist (m (or machines (bound-and-true-p monk-inventory)))
+      (oset m facts nil)
+      (oset m gathered nil)
+      (oset m facts-source nil)
+      (when flush (funcall flush m)))))
+
+(cl-defmethod monk-machine-facts-age ((m monk-machine))
+  "Return the age of M's facts in seconds, or nil when none were gathered."
+  (and (oref m gathered) (float-time (time-since (oref m gathered)))))
+
+(cl-defmethod monk-machine-facts-fresh-p ((m monk-machine))
+  "Return non-nil when M's facts are live from this session or within the TTL."
+  (or (eq (oref m facts-source) 'live)
+      (let ((age (monk-machine-facts-age m)))
+        (and age monk-fact-ttl (< age monk-fact-ttl)))))
+
+(cl-defmethod monk-machine-ignores-unreachable-p ((m monk-machine))
+  "Return non-nil when M being unreachable must not fail a run."
+  (oref m ignore-unreachable))
 
 (cl-defmethod monk-machine-local-p ((m monk-machine))
   "Return non-nil when M is the local host."
@@ -703,9 +917,88 @@ the remote user."
     (list (cons 'home (monk-exec-string m "sh" "-c" "echo $HOME"))
           (cons 'user (monk-exec-string m "id" "-un")))))
 
+(defconst monk-facts-d-directories
+  '("~/.config/monk/facts.d" "/etc/monk/facts.d" "/etc/ansible/facts.d")
+  "Directories whose *.fact files become the `local' fact, in order.
+A later file with the same name overrides an earlier one.  Ansible's
+facts.d, read too, so a machine that already publishes local facts
+for Ansible needs nothing new.")
+
+(defun monk--parse-fact-file (text)
+  "Return TEXT as an alist: JSON when it parses, else INI sections."
+  (or (condition-case nil
+          (let ((parsed (json-parse-string text :object-type 'alist :null-object nil :false-object :false)))
+            (and (listp parsed) parsed))
+        (error nil))
+      ;; INI: [section] then key=value; keys outside a section go under `general'
+      (let ((section 'general) (result nil))
+        (dolist (line (split-string text "\n" t))
+          (let ((line (string-trim line)))
+            (cond
+             ((or (string-empty-p line) (string-prefix-p "#" line) (string-prefix-p ";" line)))
+             ((string-match "\\`\\[\\(.+\\)\\]\\'" line)
+              (setq section (intern (match-string 1 line))))
+             ((string-match "\\`\\([^=]+?\\)\\s-*=\\s-*\\(.*\\)\\'" line)
+              (let ((key (intern (match-string 1 line))) (value (match-string 2 line)))
+                (setf (alist-get key (alist-get section result)) value))))))
+        (mapcar (lambda (cell) (cons (car cell) (nreverse (cdr cell)))) (nreverse result)))))
+
+(defun monk--probe-local (m)
+  "Return the `local' fact of M from its facts.d files.
+Each FILE.fact contributes (FILE . VALUE).  An executable file is
+run and its output parsed; other files are read.  JSON first, INI
+second.  A file that fails to parse contributes its error string, so
+the problem is visible in the inspector rather than silent."
+  (let ((local nil))
+    (dolist (dir monk-facts-d-directories)
+      (let ((full (monk-machine-path m dir)))
+        (when (file-directory-p full)
+          (dolist (file (directory-files full t "\\.fact\\'"))
+            (let* ((name (intern (file-name-sans-extension (file-name-nondirectory file))))
+                   (text (condition-case err
+                             (if (file-executable-p file)
+                                 (monk-exec-string m (monk-machine-local-path file))
+                               (with-temp-buffer (insert-file-contents file) (buffer-string)))
+                           (error (format "error: %s" (error-message-string err))))))
+              (setf (alist-get name local)
+                    (if (string-prefix-p "error:" text) text (monk--parse-fact-file text))))))))
+    (and local (list (cons 'local (nreverse local))))))
+
+(defconst monk-package-managers
+  '((homebrew "brew") (apt "apt-get") (dnf "dnf") (yum "yum") (pacman "pacman")
+    (zypper "zypper") (apk "apk") (pkg "pkg"))
+  "Package managers Monk knows, as (NAME PROGRAM), in detection order.
+Ansible's pkg_mgr names where they exist.")
+
+(defconst monk-service-managers
+  '((launchd "launchctl") (systemd "systemctl") (openrc "rc-service") (sysv "service"))
+  "Service managers Monk knows, as (NAME PROGRAM), in detection order.")
+
+(defun monk--probe-managers (m)
+  "Return the `pkg-mgr' and `service-mgr' facts of M by looking for programs.
+One `sh -c' per machine lists which of the known programs exist, so
+the probe costs one round trip.  Ansible's pkg_mgr and service_mgr."
+  (let* ((programs (delete-dups (append (mapcar #'cadr monk-package-managers)
+                                        (mapcar #'cadr monk-service-managers))))
+         (script (mapconcat (lambda (p) (format "command -v %s >/dev/null 2>&1 && echo %s" p p))
+                            programs "; "))
+         (found (split-string (or (ignore-errors (monk-exec-string m "sh" "-c" (concat script "; true"))) "")
+                              "\n" t))
+         (pkg (car (seq-find (lambda (entry) (member (cadr entry) found)) monk-package-managers)))
+         (svc (car (seq-find (lambda (entry) (member (cadr entry) found)) monk-service-managers))))
+    ;; On macOS, launchd is the service manager even though systemctl
+    ;; may exist through a port; and brew wins over a stray apt.
+    (when (equal (monk-machine-fact m 'kernel) "Darwin")
+      (setq svc 'launchd)
+      (when (member "brew" found) (setq pkg 'homebrew)))
+    (list (cons 'pkg-mgr (and pkg (symbol-name pkg)))
+          (cons 'service-mgr (and svc (symbol-name svc))))))
+
 (monk-register-fact-probe 'uname #'monk--probe-uname)
 (monk-register-fact-probe 'os #'monk--probe-os)
 (monk-register-fact-probe 'env #'monk--probe-env)
+(monk-register-fact-probe 'managers #'monk--probe-managers)
+(monk-register-fact-probe 'local #'monk--probe-local)
 
 (defun monk--class-symbol (string)
   "Return a class symbol for STRING."
@@ -714,7 +1007,7 @@ the remote user."
 (cl-defmethod monk-hard-classes ((m monk-machine))
   "Return classes derived from the facts of M."
   (let ((classes nil))
-    (dolist (key '(kernel os-family distribution distribution-release arch))
+    (dolist (key '(kernel os-family distribution distribution-release arch pkg-mgr service-mgr))
       (let ((value (monk-machine-fact m key)))
         (when (and (stringp value) (not (string-empty-p value)))
           (push (monk--class-symbol value) classes))))
@@ -735,9 +1028,16 @@ the remote user."
         (dolist (fact (funcall (cdr probe) m))
           (setf (alist-get (car fact) (oref m facts)) (cdr fact)))
       (error
+       ;; A machine that does not answer is not a broken probe.
+       (when (monk-unreachable-error-p err)
+         (signal (car err) (cdr err)))
        (monk-log 'warn "%s: fact probe %s failed: %s"
                  (oref m name) (car probe) (error-message-string err)))))
   (oset m classes (monk-hard-classes m))
+  (oset m gathered (current-time))
+  (oset m facts-source 'live)
+  (monk-facts-store m)
+  (run-hook-with-args 'monk-facts-ready-functions m)
   m)
 
 (cl-defmethod monk-machine-describe ((m monk-machine))
@@ -839,6 +1139,18 @@ machine.  Other machines go on.  Salt's failhard, per resource, off by default."
             :initform nil
             :documentation "On an :onfail handler: when the handler succeeds, the failures
 it handles count as rescued, not against the run.")
+   (tags :initarg :tags
+         :initform nil
+         :documentation "Symbols that select this resource from the command line.
+`always' runs unless skipped by name; `never' runs only when named.
+See `monk-tags-select-p'.  Ansible's tags.")
+   (no-log :initarg :no-log
+           :initform nil
+           :documentation "When non-nil, the result's changes, diff, and comment are replaced
+by `monk-censored' before anything records or shows them: the
+ledger, the history, etcd, the socket, and the reports.  The status
+and degree stay.  For a resource whose content is a secret.
+Ansible's no_log.")
    (sudo :initarg :sudo
          :initform nil
          :documentation "Perform the resource as root."))
@@ -856,7 +1168,12 @@ of the resource already holds.  This method must not change MACHINE.")
 Return a comment string or nil.")
 
 (cl-defgeneric monk-diff (resource machine changes)
-  "Return a unified diff for CHANGES of RESOURCE on MACHINE, or nil."
+  "Return the diff for CHANGES of RESOURCE on MACHINE, or nil.
+A list of `monk-diff-entry', one per before/after pair: a content
+entry from `monk-diff-content', an attributes entry from
+`monk-diff-attributes' for mode and ownership, or both.  A plain
+unified-diff string is accepted too.  `monk-diff-render' turns any
+of these into text at display time."
   (ignore resource machine changes)
   nil)
 
@@ -991,6 +1308,24 @@ and :not-if functions are opaque, so their reason only names them."
   "Return non-nil when guards and classes of R allow it to run on M."
   (null (monk-resource-skip-reason r m)))
 
+;;;; unsupported: a placeholder that reports why
+
+(defclass monk-unsupported-resource (monk-resource)
+  ((reason :initarg :reason :type string))
+  "A resource a generic constructor could not map on this machine.
+It never runs; its check reports skipped with the reason.")
+
+(cl-defmethod monk-resource-available-p ((r monk-unsupported-resource) (_m monk-machine))
+  (oref r reason))
+
+(cl-defmethod monk-check ((_r monk-unsupported-resource) (_m monk-machine)) nil)
+(cl-defmethod monk-repair ((_r monk-unsupported-resource) (_m monk-machine) _changes) nil)
+
+(defun monk-unsupported (name reason &rest args)
+  "Add a resource NAME that is skipped with REASON.  ARGS: common keys."
+  (monk-add-resource
+   (apply #'monk-unsupported-resource :name name :reason reason (monk--common-initargs args))))
+
 ;;;; Compile phase
 
 (defvar monk--compile-resources nil
@@ -1077,8 +1412,63 @@ root."
 
 (defconst monk--common-keys
   '(:only-if :not-if :classes :when :require :watch :watch-action :onchanges :onfail
-    :prereq :listen :retry :order :fatal :handled :sudo)
+    :prereq :listen :retry :order :fatal :handled :tags :no-log :sudo)
   "Keywords every resource constructor accepts.")
+
+;;;; Tags
+;;
+;; Ansible's tag selection, `Taggable.evaluate_tags', without the
+;; templating: a resource carries symbols, a run names the ones it
+;; wants and the ones it skips.  The reserved names keep their Ansible
+;; meaning so a policy ported from a playbook behaves the same.
+
+(defconst monk-tag-always 'always
+  "A resource with this tag runs unless a skip names it or `all'.")
+(defconst monk-tag-never 'never
+  "A resource with this tag runs only when a selection names it.")
+(defconst monk-tag-all 'all
+  "Selects every resource; as a skip, skips every one but `always'.")
+(defconst monk-tag-tagged 'tagged
+  "Selects every resource that has at least one tag.")
+(defconst monk-tag-untagged 'untagged
+  "Selects every resource that has no tag.")
+
+(defun monk-tags-select-p (tags only skip)
+  "Return non-nil when a resource with TAGS runs under ONLY and SKIP.
+ONLY and SKIP are lists of symbols; nil ONLY selects everything.
+Follows Ansible's `evaluate_tags': `always' runs unless skipped,
+`never' runs only when named, `all', `tagged', and `untagged' select
+by presence of tags."
+  (let* ((tags (or tags (list monk-tag-untagged)))
+         (tagged (not (equal tags (list monk-tag-untagged))))
+         (run t))
+    (when only
+      (setq run (cond
+                 ((memq monk-tag-always tags) t)
+                 ((and (memq monk-tag-all only) (not (memq monk-tag-never tags))) t)
+                 ((seq-intersection tags only) t)
+                 ((and (memq monk-tag-tagged only) tagged (not (memq monk-tag-never tags))) t)
+                 (t nil))))
+    (when (and run skip)
+      (cond
+       ((memq monk-tag-all skip)
+        (when (or (not (memq monk-tag-always tags)) (memq monk-tag-always skip))
+          (setq run nil)))
+       ((seq-intersection tags skip) (setq run nil))
+       ((and (memq monk-tag-tagged skip) tagged) (setq run nil))))
+    run))
+
+(defun monk-tags-select-keys (nodes only skip)
+  "Return the keys of NODES whose resource tags pass ONLY and SKIP."
+  (mapcar #'monk-node-key
+          (seq-filter (lambda (node)
+                        (monk-tags-select-p (oref (monk-node-resource node) tags) only skip))
+                      nodes)))
+
+(defun monk-nodes-tags (nodes)
+  "Return every tag on the resources of NODES, each once, sorted."
+  (sort (seq-uniq (apply #'append (mapcar (lambda (n) (oref (monk-node-resource n) tags)) nodes)))
+        (lambda (a b) (string< (symbol-name a) (symbol-name b)))))
 
 (defun monk--common-initargs (plist)
   "Return the entries of PLIST that `monk-resource' accepts."
@@ -1091,6 +1481,235 @@ root."
 (defun monk--resource-plist (plist &rest own)
   "Return initargs from the common keys in PLIST plus OWN."
   (append own (monk--common-initargs plist)))
+
+;;;; Declared parameters
+;;
+;; A resource constructor declares its parameters, as an Ansible
+;; module declares its argument_spec.  The declaration is data, so
+;; one place validates every call at compile time, fills defaults,
+;; writes the docstring, and feeds the documentation and the
+;; importers.  Before this, a misspelled keyword was silently ignored.
+;;
+;;   (monk-define-resource monk-file monk-file-resource
+;;     "Ensure PATH has the given content."
+;;     ((path :type path :doc "The file."))
+;;     ((content :type string :doc "Exact content.")
+;;      (source :type path :doc "Local file to copy from.")
+;;      (mode :type mode)
+;;      (owner :type string) (group :type string))
+;;     :one-of (content source))
+;;
+;; Positional parameters come first; the first one is the resource
+;; name unless a keyword parameter says `:name t'.  Keyword parameter
+;; specs take :type, :required, :default, :choices, :aliases, :doc,
+;; :no-log, and :slot when the initarg differs from the parameter.
+;; Types: string, path, integer, number, boolean, mode (an integer
+;; or nil), list, alist, symbol, function, any.
+
+(define-error 'monk-argument-error "Monk argument error" 'monk-policy-error)
+
+(defconst monk-parameter-types
+  '(string path integer number boolean mode list alist symbol function any)
+  "Types a declared parameter can name.")
+
+(defun monk--parameter-type-ok-p (type value)
+  "Return non-nil when VALUE fits TYPE, one of `monk-parameter-types'."
+  (pcase type
+    ((or 'string 'path) (stringp value))
+    ('integer (integerp value))
+    ('number (numberp value))
+    ('boolean t)
+    ('mode (or (null value) (integerp value)))
+    ('list (listp value))
+    ('alist (and (listp value) (cl-every #'consp value)))
+    ('symbol (symbolp value))
+    ('function (functionp value))
+    ('any t)
+    (_ (signal 'monk-argument-error (list (format "Unknown parameter type %S" type))))))
+
+(defun monk--spec-key (spec)
+  "Return the keyword for parameter SPEC, whose car is the parameter symbol."
+  (intern (format ":%s" (car spec))))
+
+(defun monk-validate-arguments (constructor args specs &optional one-of exclusive)
+  "Check keyword ARGS of CONSTRUCTOR against SPECS.  Return the filled plist.
+SPECS is a list of (NAME . PLIST) as in `monk-define-resource'.
+Common keys pass through.  ONE-OF is a list of parameter names of
+which at least one must be given; EXCLUSIVE a list of lists that
+must not appear together.  Signal `monk-argument-error' with a
+message in Ansible's words on an unknown key, a missing required
+parameter, a wrong type, or a value outside :choices."
+  (let* ((known (append monk--common-keys (mapcar #'monk--spec-key specs)
+                        (mapcan (lambda (sp) (mapcar (lambda (a) (intern (format ":%s" a)))
+                                                     (plist-get (cdr sp) :aliases)))
+                                specs)))
+         (out nil)
+         (unknown nil))
+    (unless (cl-evenp (length args))
+      (signal 'monk-argument-error
+              (list (format "%s: keyword arguments are not paired: %S" constructor args))))
+    (cl-loop for (key _value) on args by #'cddr
+             do (unless (memq key known) (push key unknown)))
+    (when unknown
+      (signal 'monk-argument-error
+              (list (format "Unsupported parameter%s for %s: %s.  Supported parameters include: %s"
+                            (if (cdr unknown) "s" "") constructor
+                            (mapconcat #'symbol-name (nreverse unknown) ", ")
+                            (mapconcat #'symbol-name
+                                       (sort (copy-sequence (mapcar #'monk--spec-key specs))
+                                             (lambda (a b) (string< (symbol-name a) (symbol-name b))))
+                                       ", ")))))
+    (dolist (sp specs)
+      (let* ((name (car sp))
+             (plist (cdr sp))
+             (key (monk--spec-key sp))
+             (present (or (plist-member args key)
+                          (seq-some (lambda (a) (plist-member args (intern (format ":%s" a))))
+                                    (plist-get plist :aliases))))
+             (value (cond ((plist-member args key) (plist-get args key))
+                          (present (plist-get args (car present)))
+                          (t (plist-get plist :default)))))
+        ;; An explicit nil for an optional parameter means "not given",
+        ;; as Ansible reads None: policies pass (plist-get entry :x)
+        ;; through without checking.  The default then applies.
+        (when (and present (null value) (not (plist-get plist :required))
+                   (not (eq (plist-get plist :type) 'boolean)))
+          (setq present nil
+                value (plist-get plist :default)))
+        (when (and (plist-get plist :required) (not present))
+          (signal 'monk-argument-error
+                  (list (format "%s: missing required parameter :%s" constructor name))))
+        (when (and present (plist-get plist :type)
+                   (not (monk--parameter-type-ok-p (plist-get plist :type) value)))
+          (signal 'monk-argument-error
+                  (list (format "%s: :%s must be %s, got %S" constructor name
+                                (plist-get plist :type) value))))
+        (when (and present (plist-get plist :choices)
+                   (not (member value (plist-get plist :choices))))
+          (signal 'monk-argument-error
+                  (list (format "%s: :%s must be one of %s, got %S" constructor name
+                                (mapconcat (lambda (c) (format "%S" c)) (plist-get plist :choices) ", ")
+                                value))))
+        (when (or present (plist-member plist :default))
+          (setq out (plist-put out (intern (format ":%s" (or (plist-get plist :slot) name))) value)))))
+    (when (and one-of (not (seq-some (lambda (n) (plist-member args (intern (format ":%s" n)))) one-of)))
+      (signal 'monk-argument-error
+              (list (format "%s: one of %s is required" constructor
+                            (mapconcat (lambda (n) (format ":%s" n)) one-of ", ")))))
+    (dolist (group exclusive)
+      (when (> (seq-count (lambda (n) (plist-member args (intern (format ":%s" n)))) group) 1)
+        (signal 'monk-argument-error
+                (list (format "%s: %s are mutually exclusive" constructor
+                              (mapconcat (lambda (n) (format ":%s" n)) group ", "))))))
+    out))
+
+(defun monk--wrap-doc (text &optional indent)
+  "Return TEXT filled to 78 columns, continuation lines after INDENT."
+  (with-temp-buffer
+    (insert text)
+    (let ((fill-column 78)
+          (fill-prefix (or indent "  ")))
+      (fill-region (point-min) (point-max)))
+    (buffer-string)))
+
+(defun monk--parameter-doc (specs)
+  "Return docstring lines that describe SPECS, each wrapped."
+  (mapconcat
+   (lambda (sp)
+     (let ((plist (cdr sp)))
+       (monk--wrap-doc
+        (format ":%s%s%s%s%s%s" (car sp)
+                (if (plist-get plist :type) (format " %s" (upcase (symbol-name (plist-get plist :type)))) "")
+                (if (plist-get plist :required) " (required)" "")
+                (if (plist-member plist :default) (format " (default %S)" (plist-get plist :default)) "")
+                (if (plist-get plist :choices)
+                    (format " one of %s" (mapconcat (lambda (c) (format "%S" c)) (plist-get plist :choices) ", "))
+                  "")
+                (if (plist-get plist :doc) (format ": %s" (plist-get plist :doc)) "")))))
+   specs "\n"))
+
+(defvar monk-resource-specs nil
+  "Alist of (CONSTRUCTOR . (POSITIONAL KEYWORDS)) for every declared resource.
+Read by the documentation and by importers that map a foreign
+module's arguments onto a Monk constructor.")
+
+(defmacro monk-define-resource (name class doc positional keywords &rest options)
+  "Define constructor NAME for resource CLASS with declared parameters.
+DOC is the first docstring line.  POSITIONAL is a list of (PARAM
+&rest PLIST) taken in order; the first is the resource name unless
+one has `:name t'.  KEYWORDS is a list of (PARAM &rest PLIST) as for
+`monk-validate-arguments'; a PLIST may hold :slot INITARG when the
+class initarg differs from the parameter.  OPTIONS: :one-of NAMES,
+:exclusive GROUPS, :classes LIST the type needs, used unless the call
+gives its own :classes, :sudo t to force sudo, :name-form FORM to
+compute the resource name from the parameters instead of taking the
+first positional one, :init FORMS to run with the validated plist
+bound to `args' before the instance is made.  The body of the
+constructor validates, fills defaults, and calls `monk-add-resource'."
+  (declare (indent 2) (doc-string 3))
+  (let* ((one-of (plist-get options :one-of))
+         (exclusive (plist-get options :exclusive))
+         (fixed-classes (plist-get options :classes))
+         (force-sudo (plist-get options :sudo))
+         (init (plist-get options :init))
+         (name-form (plist-get options :name-form))
+         (pos-names (mapcar #'car positional))
+         (name-param (and (not name-form)
+                          (or (car (seq-find (lambda (sp) (plist-get (cdr sp) :name)) positional))
+                              (car pos-names))))
+         (full-doc (concat doc "\n"
+                           (mapconcat (lambda (sp)
+                                        (monk--wrap-doc
+                                         (format "%s%s" (upcase (symbol-name (car sp)))
+                                                 (if (plist-get (cdr sp) :doc)
+                                                     (format ": %s" (plist-get (cdr sp) :doc))
+                                                   ""))))
+                                      positional "\n")
+                           (if positional "\n" "")
+                           (if keywords (concat "Keyword parameters:\n" (monk--parameter-doc keywords) "\n") "")
+                           (monk--wrap-doc
+                            (concat "Common keys: " (mapconcat #'symbol-name monk--common-keys " ") ".")))))
+    `(progn
+       (setf (alist-get ',name monk-resource-specs) (list ',positional ',keywords))
+       (defun ,name (,@pos-names &rest rest)
+         ,full-doc
+         ,@(mapcar (lambda (sp)
+                     `(unless (monk--parameter-type-ok-p ',(or (plist-get (cdr sp) :type) 'any) ,(car sp))
+                        (signal 'monk-argument-error
+                                (list (format "%s: %s must be %s, got %S" ',name ',(car sp)
+                                              ',(or (plist-get (cdr sp) :type) 'any) ,(car sp))))))
+                   positional)
+         ;; A positional parameter may itself be called `args' or
+         ;; `common'; the initargs read it under its own name, so the
+         ;; validated plists bind under names no parameter can take.
+         (let* ((monk--validated-keywords (monk-validate-arguments ',name rest ',keywords ',one-of ',exclusive))
+                (monk--validated-common (monk--common-initargs rest))
+                ,@(mapcar (lambda (sp) `(,(intern (format "monk--positional-%s" (car sp))) ,(car sp)))
+                          (seq-remove (lambda (sp) (eq (car sp) name-param)) positional)))
+           ;; The type's own classes apply unless the call gives
+           ;; :classes itself, which then stands alone: a test or a
+           ;; policy may want brew on a host Monk calls something else.
+           ,@(when fixed-classes
+               `((unless (plist-member rest :classes)
+                   (setq monk--validated-common (plist-put monk--validated-common :classes ',fixed-classes)))))
+           ,@(when force-sudo `((setq monk--validated-common (plist-put monk--validated-common :sudo t))))
+           ;; :init and :name-form read the validated keywords as
+           ;; `args' and the common keys as `common', and may rewrite
+           ;; them.  A positional parameter named `args' is shadowed
+           ;; inside them, which is why the initargs use the copies.
+           (let ((args monk--validated-keywords)
+                 (common monk--validated-common))
+             (ignore args common)
+             ,@init
+             (monk-add-resource
+              (apply #',class :name ,(or name-form name-param)
+                     (append ,@(mapcar (lambda (sp)
+                                         (let ((slot (or (plist-get (cdr sp) :slot) (car sp))))
+                                           (and (not (eq (car sp) name-param))
+                                                `(list ,(intern (format ":%s" slot))
+                                                       ,(intern (format "monk--positional-%s" (car sp)))))))
+                                       positional)
+                             args common)))))))))
 
 ;;;; Requisites
 
@@ -1141,6 +1760,21 @@ SPEC is a resource name string, a cons (SCOPE . NAME), or a plist
 (defconst monk-comment-mocked "not called, mocked"
   "Comment on every result of a mock run.")
 
+(defconst monk-censored "[censored: no-log]"
+  "What replaces the changes, diff, and comment of a :no-log result.")
+
+(defun monk-result-censor (result)
+  "Replace what RESULT reveals with `monk-censored'.  Return RESULT.
+Status, degree, name, machine, and duration stay: they say what
+happened without saying what the content was."
+  (setf (monk-result-changes result) (and (monk-result-changes result) (list :censored t))
+        (monk-result-diff result) nil
+        (monk-result-comment result) (if (monk-result-failed-p result)
+                                         (format "%s failed" monk-censored)
+                                       monk-censored)
+        (monk-result-censored result) t)
+  result)
+
 (defconst monk-skip-not-selected "not selected for this run"
   "Comment on a node that a partial run left alone.")
 
@@ -1151,18 +1785,52 @@ SPEC is a resource name string, a cons (SCOPE . NAME), or a plist
                      (memq node (monk--node-dependencies other nodes))))
               nodes))
 
+(defun monk--node-owned-paths (node)
+  "Return the expanded paths that NODE's resource owns on its machine."
+  (let ((m (monk-node-machine node)))
+    (mapcar (lambda (p) (monk-machine-expand m p))
+            (monk-resource-paths (monk-node-resource node)))))
+
+(defun monk--nodes-sharing-paths (node nodes)
+  "Return the nodes in NODES on the same machine that own a path of NODE.
+A path is shared when it is equal, or when one side owns the subtree
+that contains the other's path.  A sync that reads ~/.zshrc must run
+when the resource that owns ~/.zshrc changed, requisite or not."
+  (let ((paths (monk--node-owned-paths node))
+        (m (monk-node-machine node)))
+    (seq-filter
+     (lambda (other)
+       (and (not (eq other node))
+            (eq (monk-node-machine other) m)
+            (let ((theirs (monk--node-owned-paths other))
+                  (they-own-subtree (monk-resource-owns-subtree-p (monk-node-resource other)))
+                  (we-own-subtree (monk-resource-owns-subtree-p (monk-node-resource node))))
+              (seq-some (lambda (mine)
+                          (seq-some (lambda (their)
+                                      (or (equal mine their)
+                                          (and they-own-subtree
+                                               (string-prefix-p (file-name-as-directory their) mine))
+                                          (and we-own-subtree
+                                               (string-prefix-p (file-name-as-directory mine) their))))
+                                    theirs))
+                        paths))))
+     nodes)))
+
 (defun monk-select-nodes (nodes keys)
-  "Mark as selected the nodes in NODES whose key is in KEYS, and their dependents.
-Dependents close transitively: a resource that watches a changed file
-must run, and so must whatever watches it.  Every other node is
-deselected and will be skipped.  Return the selected nodes."
+  "Select the nodes in NODES whose key is in KEYS, and what depends on them.
+Two kinds of dependents close transitively: resources that name a
+selected one in a requisite, and resources that own one of its paths,
+such as a sync that copies a file another resource writes.  Every
+other node is deselected and will be skipped.  Return the selected."
   (let ((selected nil)
         (frontier (seq-filter (lambda (n) (member (monk-node-key n) keys)) nodes)))
     (while frontier
       (let ((node (pop frontier)))
         (unless (memq node selected)
           (push node selected)
-          (setq frontier (append frontier (monk--node-dependents node nodes))))))
+          (setq frontier (append frontier
+                                 (monk--node-dependents node nodes)
+                                 (monk--nodes-sharing-paths node nodes))))))
     (dolist (node nodes)
       (setf (monk-node-selected node) (and (memq node selected) t)))
     (seq-filter #'monk-node-selected nodes)))
@@ -1247,6 +1915,17 @@ better run than skipped."
                        (error t)))))
             targets))
 
+(defun monk--unreachable-ref (node nodes)
+  "Return the unreachable machine among NODES that a ref of NODE points at, or nil."
+  (catch 'found
+    (dolist (kind '(require watch listen))
+      (dolist (ref (monk-resource-refs (monk-node-resource node) kind))
+        (dolist (target (monk--nodes-for-ref ref node nodes))
+          (let ((r (monk-node-result target)))
+            (when (and r (eq (monk-result-status r) monk-status-unreachable))
+              (throw 'found (oref (monk-node-machine target) name)))))))
+    nil))
+
 (defun monk--requisite-verdict (node nodes)
   "Decide whether NODE can run given the results in NODES.
 Return (VERDICT . DETAIL).  VERDICT is `run', `skip', or `watch'.
@@ -1262,7 +1941,10 @@ action runs once after the run converged."
           (let ((targets (monk--nodes-for-ref ref node nodes)))
             (unless (monk--ref-satisfied-p ref targets)
               (throw 'done (setq verdict 'skip
-                                 detail (format "%s %s not satisfied" kind (monk-ref-name ref)))))
+                                 detail (let ((dark (monk--unreachable-ref node nodes)))
+                                          (if dark
+                                              (format "%s %s: %s is unreachable" kind (monk-ref-name ref) dark)
+                                            (format "%s %s not satisfied" kind (monk-ref-name ref)))))))
             (when (and (eq kind 'watch) (monk--ref-changed-p targets))
               (setq verdict 'watch
                     detail (format "watch %s changed" (monk-ref-name ref)))))))
@@ -1360,6 +2042,49 @@ cycle or a bad ref."
 
 ;;;; Running one node
 
+(defconst monk-unreachable-error-regexp
+  (rx (or "Connection refused" "No route to host" "Could not resolve hostname"
+          "Network is unreachable" "Connection timed out" "Operation timed out"
+          "Host is down" "Timeout" "not reachable" "ssh: connect to host"
+          "Tramp failed to connect" "Couldn't find a proper `ls' command"
+          "Login failed" "Host key verification failed" "Permission denied (publickey"
+          "nodename nor servname provided" "Name or service not known"))
+  "Error text that means the machine, not the resource, is the problem.")
+
+(defun monk-unreachable-error-p (err)
+  "Return non-nil when error condition ERR says the machine did not answer.
+TRAMP signals `file-error' with the ssh text; `monk-exec-error' from a
+remote command carries exit 255 from ssh."
+  (or (and (eq (car err) 'monk-exec-error) (eql 255 (nth 3 err)))
+      ;; `remote-file-error' and TRAMP's own conditions derive from
+      ;; `file-error'; test the hierarchy, not the exact symbol.
+      (and (or (memq 'file-error (get (car err) 'error-conditions))
+               (eq (car err) 'monk-exec-error))
+           (string-match-p monk-unreachable-error-regexp (error-message-string err)))))
+
+(defun monk--machine-unreachable-p (machine)
+  "Return the reason MACHINE was found unreachable in the current run, or nil."
+  (and monk--current-run (monk-run-unreachable-p monk--current-run (oref machine name))))
+
+(defun monk-unreachable-reason (text)
+  "Return the part of error TEXT that says why the machine did not answer.
+One line, without TRAMP's advice to clean up and without the command
+that happened to hit the wall: the whole message is in the log."
+  (let ((line (string-trim (car (split-string text "\n")))))
+    ;; `Monk command failed: "h", ("uname" "-s"), 255, "ssh: ..."' →
+    ;; the quoted ssh text at the end.
+    (if (string-match "255, \"\\(.*\\)\"\\'" line)
+        (match-string 1 line)
+      line)))
+
+(defun monk--mark-unreachable (machine reason)
+  "Record in the current run that MACHINE did not answer, with REASON."
+  (when monk--current-run
+    (unless (monk-run-unreachable-p monk--current-run (oref machine name))
+      (monk-log 'warn "%s: unreachable: %s" (oref machine name) reason)
+      (push (cons (oref machine name) (monk-unreachable-reason reason))
+            (monk-run-unreachable monk--current-run)))))
+
 (defun monk--run-node (node nodes dry-run)
   "Check and repair NODE.  Return a `monk-result'.
 NODES carries the results of earlier nodes for requisites.  When
@@ -1377,13 +2102,27 @@ execution model."
     (monk-progress 'node-start :node node)
     (pcase-let ((`(,verdict . ,detail)
                  (let* ((mock (and monk--current-run (monk-run-mock monk--current-run)))
-                        (reason (and (monk-node-selected node)
-                                     (or (monk-resource-skip-reason resource machine)
+                        (dark (monk--machine-unreachable-p machine))
+                        (reason (and (not dark) (monk-node-selected node)
+                                     (or (condition-case err
+                                             (monk-resource-skip-reason resource machine)
+                                           (error (if (monk-unreachable-error-p err)
+                                                      (progn (monk--mark-unreachable machine (error-message-string err))
+                                                             (setq dark (error-message-string err))
+                                                             nil)
+                                                    (signal (car err) (cdr err)))))
                                          ;; A mock run opens no connection,
                                          ;; so it cannot ask what is installed.
-                                         (and (not mock)
-                                              (monk-resource-available-p resource machine))))))
+                                         (and (not mock) (not dark)
+                                              (condition-case err
+                                                  (monk-resource-available-p resource machine)
+                                                (error (if (monk-unreachable-error-p err)
+                                                           (progn (monk--mark-unreachable machine (error-message-string err))
+                                                                  (setq dark (error-message-string err))
+                                                                  nil)
+                                                         (signal (car err) (cdr err))))))))))
                    (cond
+                    (dark (cons 'unreachable dark))
                     ((not (monk-node-selected node))
                      (cons 'skip monk-skip-not-selected))
                     (reason (cons 'skip reason))
@@ -1394,6 +2133,9 @@ execution model."
                        (if (eq (car v) 'skip) v (cons 'mock nil))))
                     (t (monk--requisite-verdict node nodes))))))
       (cond
+       ((eq verdict 'unreachable)
+        (setf (monk-result-status result) monk-status-unreachable
+              (monk-result-comment result) (monk-unreachable-reason detail)))
        ((eq verdict 'skip)
         (setf (monk-result-status result) monk-status-skipped
               (monk-result-comment result) detail))
@@ -1404,6 +2146,8 @@ execution model."
        (t
         (monk--class-init-once resource machine)
         (monk--run-node-with-retry resource machine result verdict detail dry-run))))
+    (when (oref resource no-log)
+      (monk-result-censor result))
     (setf (monk-result-duration result) (- (float-time) start)
           (monk-node-result node) result)
     (monk-progress 'node-end :node node :result result)
@@ -1467,8 +2211,10 @@ pass through."
                       (oref machine name) (oref resource name) attempt attempts waited))))
       (monk--run-node-once resource machine result verdict detail dry-run)
       (setq done (or dry-run
+                     (eq (monk-result-status result) monk-status-unreachable)
                      (pcase until
                        ('failure (monk-result-failed-p result))
+                       ((pred functionp) (funcall until result))
                        (_ (not (monk-result-failed-p result)))))))
     (when (and plan (> attempt 1))
       (setf (monk-result-comment result)
@@ -1503,10 +2249,18 @@ report only.  After a repair, `monk-resource-verify' can still fail it."
           (setf (monk-result-diff result)
                 (and monk-show-diffs (monk-diff resource machine changes))
                 (monk-result-degree result) degree)
-          (setf (monk-result-comment result) (monk-repair resource machine changes)
-                (monk-result-status result) monk-status-repaired
-                (monk-result-degree result) monk-degree-satisfied
-                (monk-result-changes result) changes)
+          (condition-case unchanged
+              (setf (monk-result-comment result) (monk-repair resource machine changes)
+                    (monk-result-status result) monk-status-repaired
+                    (monk-result-degree result) monk-degree-satisfied
+                    (monk-result-changes result) changes)
+            ;; A query command ran and its predicate said nothing
+            ;; changed: kept, with the output as the comment.
+            (monk-command-unchanged
+             (setf (monk-result-status result) monk-status-kept
+                   (monk-result-degree result) monk-degree-satisfied
+                   (monk-result-comment result) (cadr unchanged)
+                   (monk-result-changes result) nil)))
           (let ((reason (monk-resource-verify resource machine)))
             (when reason
               ;; The repair ran, but the verification says the system is
@@ -1515,13 +2269,21 @@ report only.  After a repair, `monk-resource-verify' can still fail it."
               (signal 'monk-resource-error
                       (list (format "repaired, but verify failed: %s" reason))))))))
     (error
-     (setf (monk-result-status result)
-           (if (> (monk-result-degree result) 0.0) monk-status-partial monk-status-failed)
-           (monk-result-comment result) (error-message-string err))
-     (monk-log 'warn "%s: %s %s %s: %s"
+     (if (monk-unreachable-error-p err)
+         (progn
+           (monk--mark-unreachable machine (error-message-string err))
+           (setf (monk-result-status result) monk-status-unreachable
+                 (monk-result-degree result) 0.0
+                 (monk-result-comment result) (monk-unreachable-reason (error-message-string err))))
+       (setf (monk-result-status result)
+             (if (> (monk-result-degree result) 0.0) monk-status-partial monk-status-failed)
+             (monk-result-comment result) (error-message-string err)))
+     ;; The result itself carries the failure; reports and the CLI
+     ;; print it.  Logged at info so a terminal does not see it twice.
+     (monk-log 'info "%s: %s %s %s: %s"
                (oref machine name) (monk-resource-type resource)
                (oref resource name) (monk-result-status result)
-               (error-message-string err))))
+               (if (oref resource no-log) monk-censored (error-message-string err)))))
   result)
 
 (defun monk--perform-watch (resource machine result detail dry-run)
@@ -1656,22 +2418,36 @@ With DRY-RUN, report only."
                      (format "%s (aggregated with %d other%s)"
                              (or (monk-result-comment aggregate-result) "")
                              (1- (length group)) (if (= 2 (length group)) "" "s")))))
+           (when (oref r no-log)
+             (monk-result-censor result))
            (setf (monk-node-result node) result)
            (monk-progress 'node-end :node node :result result)
            (monk--run-result-functions result)
            result))
        group skips))))
 
+(defvar monk--batch-machines nil
+  "Machines the current batch acts on, or nil for all.
+Bound by `monk--run-batches'.  Nodes on other machines keep the
+result of their own batch, so requisites across batches resolve.")
+
+(defun monk--in-batch-p (node)
+  "Return non-nil when NODE's machine acts in the current batch."
+  (or (null monk--batch-machines) (memq (monk-node-machine node) monk--batch-machines)))
+
 (defun monk--pass (nodes dry-run)
   "Run one pass over NODES in order.  Return a `monk-pass'.
 Results from earlier passes are cleared first so requisites read this
 pass only.  When DRY-RUN is non-nil, report only.  Every node runs:
 a failure never stops the pass, except after a :fatal failure, which
-ends the pass on that machine only."
+ends the pass on that machine only.  Nodes outside the current batch
+are left as they are."
   (dolist (node nodes)
-    (setf (monk-node-result node) nil))
+    (when (monk--in-batch-p node)
+      (setf (monk-node-result node) nil)))
   (let (results (repaired 0) (repaired-keys nil) (fatal-machines nil))
-    (dolist (item (monk--aggregate-groups nodes))
+    (dolist (item (seq-filter (lambda (item) (monk--in-batch-p (if (listp item) (car item) item)))
+                              (monk--aggregate-groups nodes)))
       (let* ((group (if (listp item) item (list item)))
              (m (monk-node-machine (car group)))
              (group-results
@@ -1716,7 +2492,7 @@ what would fire.  Return the number that fired."
       (let* ((resource (monk-node-resource node))
              (machine (monk-node-machine node))
              (refs (monk-resource-refs resource 'listen)))
-        (when (and refs (monk-node-selected node)
+        (when (and refs (monk-node-selected node) (monk--in-batch-p node)
                    (not (monk-resource-skip-reason resource machine))
                    (monk-node-result node)
                    (not (monk-result-failed-p (monk-node-result node))))
@@ -1784,6 +2560,76 @@ resolves to kept reads as kept."
            (t (setcar (memq earlier merged) result)))))
       merged)))
 
+;;;; Batches
+;;
+;; Ansible's `serial': a fleet change goes to a few machines first.  A
+;; batch is a list of machines; the graph is one, so requisites across
+;; batches still resolve, but a later batch waits for the earlier one
+;; to finish, and a batch that fails past the threshold stops the ones
+;; after it.  Failures count per batch, not cumulatively: the review
+;; found Ansible's cumulative count to be an accident of the code.
+
+(defun monk-serial-count (spec total)
+  "Return how many of TOTAL machines SPEC selects for one batch.
+SPEC is an integer or a string percentage such as `25%'.  A
+percentage rounds down but never below one.  Ansible's `pct_to_int'."
+  (cond
+   ((integerp spec) spec)
+   ((and (stringp spec) (string-match "\\`\\([0-9]+\\)%\\'" spec))
+    (max 1 (floor (* total (/ (string-to-number (match-string 1 spec)) 100.0)))))
+   (t (signal 'monk-policy-error (list "Bad :serial entry" spec)))))
+
+(defun monk-serial-batches (machines serial)
+  "Split MACHINES into batches by SERIAL.
+SERIAL is nil, one spec, or a list of specs; the last spec repeats
+until every machine has a batch.  A spec of zero or less puts all
+remaining machines in one batch.  Ansible's `_get_serialized_batches'."
+  (let ((specs (cond ((null serial) (list 0))
+                     ((listp serial) serial)
+                     (t (list serial))))
+        (rest (copy-sequence machines))
+        (total (length machines))
+        (batches nil))
+    (while rest
+      (let ((count (monk-serial-count (car specs) total)))
+        (if (<= count 0)
+            (progn (push rest batches) (setq rest nil))
+          (push (seq-take rest count) batches)
+          (setq rest (seq-drop rest count))))
+      (when (cdr specs) (setq specs (cdr specs))))
+    (nreverse batches)))
+
+(defun monk-batch-failed-machines (run machines)
+  "Return the machines in MACHINES with a failed result or unreachable in RUN."
+  (seq-filter (lambda (m)
+                (let ((name (oref m name)))
+                  (or (assoc name (monk-run-unreachable run))
+                      (seq-some (lambda (r)
+                                  (and (equal (monk-result-machine r) name)
+                                       (monk-result-failed-p r)
+                                       (not (member (monk-result-key r) (monk-run-rescued run)))))
+                                (monk-run-results run)))))
+              machines))
+
+(defun monk-batch-over-threshold-p (failed total percentage)
+  "Return non-nil when FAILED of TOTAL machines is more than PERCENTAGE.
+The comparison is strictly greater, as in Ansible."
+  (and percentage (> total 0)
+       (> (* 100.0 (/ failed (float total))) percentage)))
+
+(defconst monk-skip-batch "an earlier batch failed past :max-fail-percentage"
+  "Skip comment on every node of a batch that never started.")
+
+(defun monk--skip-batch (nodes machines)
+  "Give every node of NODES on MACHINES a skipped result with `monk-skip-batch'."
+  (dolist (node nodes)
+    (when (memq (monk-node-machine node) machines)
+      (let ((r (monk-node-resource node)) (m (monk-node-machine node)))
+        (setf (monk-node-result node)
+              (monk-result-create :machine (oref m name) :name (oref r name)
+                                  :type (monk-resource-type r) :origin (oref r origin)
+                                  :status monk-status-skipped :comment monk-skip-batch))))))
+
 ;;;; Runs
 
 (defun monk--run-nodes (machines nodes dry-run max-passes policy options)
@@ -1812,7 +2658,11 @@ POLICY and OPTIONS are recorded on the run so `monk-apply' can repeat it."
         (pass 0)
         (continue t))
     (setq monk--current-run run)
-    (monk-progress 'run-start :run run :nodes ordered)
+    (dolist (cell monk--unreachable-at-compile)
+      (monk-log 'warn "%s: unreachable: %s" (car cell) (cdr cell))
+      (push cell (monk-run-unreachable run)))
+    (setq monk--unreachable-at-compile nil)
+    (monk-progress 'run-start :run run :nodes (seq-filter #'monk--in-batch-p ordered))
     ;; A quit or an error in a hook must still send run-end, or a
     ;; display keeps its spinner and its live state.
     (unwind-protect
@@ -1846,7 +2696,7 @@ POLICY and OPTIONS are recorded on the run so `monk-apply' can repeat it."
       (setf (monk-run-end-time run) (current-time))
       (monk-progress 'run-end :run run))
     (when (monk-run-flapping-p run)
-      (monk-log 'warn "flapping: %s"
+      (monk-log 'info "flapping: %s"
                 (mapconcat (lambda (key) (format "%s:%s" (car key) (cdr key)))
                            (monk-run-flapping run) ", ")))
     (when (and (monk-run-oscillating-p run) (not (monk-run-flapping-p run)))
@@ -1855,11 +2705,30 @@ POLICY and OPTIONS are recorded on the run so `monk-apply' can repeat it."
     run))
 
 (defun monk--nodes-for (machines policy)
-  "Gather facts, compile POLICY, and return nodes for MACHINES."
+  "Gather facts, compile POLICY, and return nodes for MACHINES.
+A machine whose facts cannot be gathered because it does not answer
+is recorded in `monk--unreachable-at-compile'; its policy still
+compiles with the facts it has, so its nodes exist and report
+unreachable, and requisites elsewhere can name it."
   (let ((nodes nil) (index 0))
+    (setq monk--unreachable-at-compile nil)
     (dolist (m machines)
       (unless (oref m facts)
-        (monk-gather-facts m))
+        ;; Fresh cached facts spare a connection; a stale or empty
+        ;; cache means gathering, and an unreachable machine then falls
+        ;; back to whatever the cache had, stale as it is, so its
+        ;; policy still compiles with the right classes.
+        (unless (monk-facts-load m)
+          (condition-case err
+              (monk-gather-facts m)
+            (error
+             (if (monk-unreachable-error-p err)
+                 (progn
+                   (push (cons (oref m name) (error-message-string err)) monk--unreachable-at-compile)
+                   (let ((monk-fact-ttl most-positive-fixnum))
+                     (monk-facts-load m))
+                   (oset m classes (monk-hard-classes m)))
+               (signal (car err) (cdr err)))))))
       (monk-log 'info "%s: classes: %s" (oref m name)
                 (mapconcat #'symbol-name (oref m classes) " "))
       (dolist (resource (monk-compile m policy))
@@ -1891,15 +2760,75 @@ keys.  With :only, just those resources and their transitive
 dependents run; the rest compile, so requisites resolve, and are
 skipped.  Return a `monk-run'."
   (pcase-let ((`(,dry-run . ,max-passes) (monk--run-options options))
-              (only (plist-get options :only)))
-    (monk-log 'info "%s %d machine(s)%s%s"
+              (only (plist-get options :only))
+              (tags (plist-get options :tags))
+              (skip-tags (plist-get options :skip-tags))
+              (serial (plist-get options :serial))
+              (max-fail (plist-get options :max-fail-percentage)))
+    (monk-log 'info "%s %d machine(s)%s%s%s"
               (if dry-run "plan" "apply") (length machines)
               (if dry-run " (dry run)" "")
-              (if only (format ", only %d key(s) and dependents" (length only)) ""))
+              (if only (format ", only %d key(s) and dependents" (length only)) "")
+              (if (or tags skip-tags) (format ", tags %S skip %S" tags skip-tags) ""))
     (let ((nodes (monk--nodes-for machines policy)))
+      (when (or tags skip-tags)
+        ;; Tag selection narrows :only, so requisites still pull in
+        ;; what a selected resource needs.
+        (let ((tagged (monk-tags-select-keys nodes tags skip-tags)))
+          (setq only (if only (seq-filter (lambda (k) (member k tagged)) only) tagged))
+          (unless only (setq only (list (cons nil nil))))))
       (when only
         (monk-select-nodes nodes only))
-      (monk--run-nodes machines nodes dry-run max-passes policy options))))
+      (if (or (null serial) (null (cdr machines)))
+          (monk--run-nodes machines nodes dry-run max-passes policy options)
+        (monk--run-batches machines nodes serial max-fail dry-run max-passes policy options)))))
+
+(defun monk--run-batches (machines nodes serial max-fail dry-run max-passes policy options)
+  "Run NODES for MACHINES in the batches SERIAL gives.  Return one `monk-run'.
+Each batch is a run over its machines only; the runs merge into one
+with the same policy and options.  After a batch, when the share of
+its machines that failed or were unreachable is more than MAX-FAIL
+percent, the remaining batches are skipped with `monk-skip-batch'."
+  (let* ((batches (monk-serial-batches machines serial))
+         (merged nil)
+         (index 0)
+         (stopped nil))
+    (monk-log 'info "serial: %d batch(es) of %s"
+              (length batches) (mapconcat (lambda (b) (number-to-string (length b))) batches ", "))
+    (dolist (batch batches)
+      (cl-incf index)
+      (if stopped
+          (monk--skip-batch nodes batch)
+        (let* ((run (let ((monk--batch-machines batch))
+                      (monk--run-nodes batch nodes dry-run max-passes policy options)))
+               (failed (length (monk-batch-failed-machines run batch))))
+          (monk-log 'info "batch %d/%d: %d of %d machine(s) failed" index (length batches) failed (length batch))
+          (when (and (not dry-run) (monk-batch-over-threshold-p failed (length batch) max-fail))
+            (monk-log 'warn "batch %d: %d of %d failed, over %s%%; later batches are skipped"
+                      index failed (length batch) max-fail)
+            (setq stopped index))
+          (setq merged (if merged (monk--merge-runs merged run) run)))))
+    (when stopped
+      (setf (monk-run-results merged)
+            (append (monk-run-results merged)
+                    (delq nil (mapcar (lambda (n) (and (equal (monk-result-comment (monk-node-result n)) monk-skip-batch)
+                                                       (monk-node-result n)))
+                                      (seq-filter #'monk-node-result nodes))))))
+    (setf (monk-run-machines merged) machines
+          (monk-run-batches merged) (mapcar (lambda (b) (mapcar (lambda (m) (oref m name)) b)) batches)
+          (monk-run-stopped-at-batch merged) stopped)
+    merged))
+
+(defun monk--merge-runs (into run)
+  "Fold RUN's results and bookkeeping into INTO.  Return INTO."
+  (setf (monk-run-results into) (append (monk-run-results into) (monk-run-results run))
+        (monk-run-passes into) (max (monk-run-passes into) (monk-run-passes run))
+        (monk-run-rescued into) (append (monk-run-rescued into) (monk-run-rescued run))
+        (monk-run-unreachable into) (append (monk-run-unreachable into) (monk-run-unreachable run))
+        (monk-run-repaired-by-pass into) (append (monk-run-repaired-by-pass into) (monk-run-repaired-by-pass run))
+        (monk-run-last-pass-repaired into) (+ (monk-run-last-pass-repaired into) (monk-run-last-pass-repaired run))
+        (monk-run-end-time into) (monk-run-end-time run))
+  into)
 
 (defun monk-plan (machines policy &rest options)
   "Dry-run POLICY on MACHINES.  Return a `monk-run' with no changes made.
@@ -1976,6 +2905,7 @@ the report shows them elsewhere."
           (:live (push (format "live %s → %s" (car value) (cadr value)) parts))
           (:persist (push (format "persist %s" value) parts))
           (:run (push (format "run %s" (string-join (mapcar (lambda (a) (format "%s" a)) value) " ")) parts))
+          (:censored (push monk-censored parts))
           (_ (push (format "%s %s" (string-remove-prefix ":" (symbol-name key))
                            (monk--describe-value value))
                    parts)))))
@@ -1985,15 +2915,17 @@ the report shows them elsewhere."
 
 (defun monk-run-summary (run &optional machine)
   "Return a one-line summary of RUN, or of MACHINE within it."
-  (format "%d kept, %d repaired, %d would repair, %d partial, %d failed, %d skipped, %d pass%s"
-          (monk-run-count run monk-status-kept machine)
-          (monk-run-count run monk-status-repaired machine)
-          (monk-run-count run monk-status-would-repair machine)
-          (monk-run-count run monk-status-partial machine)
-          (monk-run-count run monk-status-failed machine)
-          (monk-run-count run monk-status-skipped machine)
-          (monk-run-passes run)
-          (if (= 1 (monk-run-passes run)) "" "es")))
+  (let ((unreachable (monk-run-count run monk-status-unreachable machine)))
+    (format "%d kept, %d repaired, %d would repair, %d partial, %d failed, %d skipped%s, %d pass%s"
+            (monk-run-count run monk-status-kept machine)
+            (monk-run-count run monk-status-repaired machine)
+            (monk-run-count run monk-status-would-repair machine)
+            (monk-run-count run monk-status-partial machine)
+            (monk-run-count run monk-status-failed machine)
+            (monk-run-count run monk-status-skipped machine)
+            (if (> unreachable 0) (format ", %d unreachable" unreachable) "")
+            (monk-run-passes run)
+            (if (= 1 (monk-run-passes run)) "" "es"))))
 
 (defun monk-run-report-string (run &optional verbose)
   "Return a text report for RUN.
@@ -2043,10 +2975,8 @@ Without VERBOSE, omit kept and skipped results."
             (insert "\n")
             (when (and (monk-result-changes result) (not (monk-result-diff result)))
               (insert (format "              %s\n" (monk-describe-changes (monk-result-changes result)))))
-            (when (monk-result-diff result)
-              (insert (monk-result-diff result))
-              (unless (string-suffix-p "\n" (monk-result-diff result))
-                (insert "\n")))))))
+            (let ((text (monk-result-diff-text result)))
+              (when text (insert text)))))))
     (buffer-string)))
 
 (defvar monk-report-function #'monk-run-report-text
@@ -2104,10 +3034,85 @@ Signal `user-error' when ORIGIN has no file."
 OTHER-WINDOW as in `find-file-other-window'."
   (monk-find-origin (or (oref m origin) (cons nil (oref m name))) other-window))
 
+;;;; Compile only
+
+(defun monk-check-policy (machines policy &rest options)
+  "Compile POLICY for MACHINES without a connection.  Return a plist.
+Every machine is compiled with the facts it has: the cache, or none.
+The plist holds :nodes, the compiled nodes; :tags, every tag in use;
+:machines, the names; :errors, an alist of (MACHINE-NAME . MESSAGE)
+for machines whose policy did not compile; and :unresolved, requisite
+errors from ordering the graph.  OPTIONS take :tags and :skip-tags to
+also report :selected, the keys tag selection would run.  Ansible's
+`--syntax-check', `--list-tasks', and `--list-tags' in one call."
+  (let ((machines (if (listp machines) machines (list machines)))
+        (monk-fact-ttl most-positive-fixnum)
+        (nodes nil) (errors nil) (unresolved nil) (index 0))
+    (dolist (m machines)
+      (unless (oref m facts)
+        (monk-facts-load m)
+        (oset m classes (monk-hard-classes m)))
+      (condition-case err
+          (dolist (resource (monk-compile m policy))
+            (push (monk-node-create :machine m :resource resource :index index) nodes)
+            (cl-incf index))
+        (error (push (cons (oref m name) (error-message-string err)) errors))))
+    (setq nodes (nreverse nodes))
+    (condition-case err
+        (monk-schedule nodes)
+      (error (push (error-message-string err) unresolved)))
+    (list :nodes nodes
+          :machines (mapcar (lambda (m) (oref m name)) machines)
+          :tags (monk-nodes-tags nodes)
+          :errors (nreverse errors)
+          :unresolved (nreverse unresolved)
+          :selected (and (or (plist-get options :tags) (plist-get options :skip-tags))
+                         (monk-tags-select-keys nodes (plist-get options :tags)
+                                                (plist-get options :skip-tags))))))
+
+(defun monk-check-policy-ok-p (report)
+  "Return non-nil when REPORT from `monk-check-policy' found no problem."
+  (and (null (plist-get report :errors)) (null (plist-get report :unresolved))))
+
+(defun monk-check-policy-string (report)
+  "Return REPORT from `monk-check-policy' as text, one resource per line."
+  (with-temp-buffer
+    (let ((by-machine (seq-group-by (lambda (n) (oref (monk-node-machine n) name))
+                                    (plist-get report :nodes))))
+      (dolist (name (plist-get report :machines))
+        (insert (format "== %s: %d resource(s)\n" name (length (alist-get name by-machine nil nil #'equal))))
+        (dolist (node (alist-get name by-machine nil nil #'equal))
+          (let ((r (monk-node-resource node)))
+            (insert (format "  %-12s %s%s\n" (monk-resource-type r) (oref r name)
+                            (if (oref r tags) (format "  [%s]" (mapconcat #'symbol-name (oref r tags) " ")) "")))))))
+    (when (plist-get report :tags)
+      (insert (format "tags: %s\n" (mapconcat #'symbol-name (plist-get report :tags) " "))))
+    (dolist (cell (plist-get report :errors))
+      (insert (format "error: %s: %s\n" (car cell) (cdr cell))))
+    (dolist (text (plist-get report :unresolved))
+      (insert (format "unresolved: %s\n" text)))
+    (buffer-string)))
+
 ;;;; Batch entry point
 
 (defvar monk-batch-policy nil
   "The policy function a batch entry point runs.  Set by the policy file.")
+
+(defun monk-batch-check (policy-file &rest machine-args)
+  "Load POLICY-FILE and compile it for the local machine, with no run.
+MACHINE-ARGS are passed to `monk-local-machine'.  Print the report and
+exit 1 when the policy does not compile or a requisite does not
+resolve.  For CI."
+  (load policy-file nil t)
+  (let* ((policy (or monk-batch-policy
+                     (signal 'monk-policy-error
+                             (list "monk-batch-policy is not set by" policy-file))))
+         (report (monk-check-policy (apply #'monk-local-machine machine-args) policy)))
+    (dolist (line (split-string (monk-check-policy-string report) "\n" t))
+      (funcall monk-batch-print-function line))
+    (unless (monk-check-policy-ok-p report)
+      (kill-emacs 1))
+    report))
 
 (defun monk-batch-converge (policy-file &rest machine-args)
   "Load POLICY-FILE and converge the local machine.
@@ -2120,8 +3125,9 @@ any resource failed."
                              (list "monk-batch-policy is not set by" policy-file))))
          (run (monk-converge (apply #'monk-local-machine machine-args) policy)))
     (monk-run-report run)
-    (unless (monk-run-ok-p run)
-      (kill-emacs 1))
+    (let ((code (monk-run-exit-code run)))
+      (unless (zerop code)
+        (kill-emacs code)))
     run))
 
 (provide 'monk)

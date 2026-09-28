@@ -19,6 +19,14 @@ strings and never look at a window; the header line was invisible for
 days for that reason. When you hand over a feature, name the drive
 step or tour stop that covers it.
 
+A parser of another program's output is only as good as the samples
+it was tested on. Before trusting one, capture the real output on
+every platform Monk targets (macOS rsync prints 12 itemize columns,
+Linux rsync 3.2 prints 11; brew's JSON differs from what docs show)
+and keep the captured lines in the tests. A parser that matches
+nothing must not be read as "nothing to do": when a check finds no
+changes but the tool printed lines the regexp did not match, log it.
+
 Execution model is Salt's, not Ansible's: a failure is a result, the
 pass goes on, only `:require` and `:watch` dependents skip. Do not
 add a stop-on-failure path.

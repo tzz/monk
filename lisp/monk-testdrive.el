@@ -63,6 +63,7 @@
 (require 'monk-package)
 (require 'monk-bridge)
 (require 'monk-sync)
+(require 'monk-cli)
 
 ;; The drive checks history when monk-history is loaded; it needs an
 ;; Emacs with SQLite, so it is not required here.
@@ -886,12 +887,268 @@ so `~' in the policy lands there."
            (cons (equal "nowhere.invalid is not reachable"
                         (monk-result-comment (monk-run-result dead '("drive" . "away"))))
                  (format "reason %S" (monk-result-comment (monk-run-result dead '("drive" . "away")))))))))
+    (monk-testdrive--step "salt" "terminal progress prints aligned change lines off a tty"
+      (let ((lines nil) (monk-log-level nil))
+        (cl-letf (((symbol-function 'message) (lambda (fmt &rest args) (push (apply #'format fmt args) lines))))
+          (unwind-protect
+              (progn (monk-cli-enable)
+                     (monk-converge m (lambda (_m)
+                                        (monk-directory "~/cli-a")
+                                        (monk-directory "~/cli-longer-name-here"))
+                                    :passes 1))
+            (monk-cli-disable)))
+        (let ((rows (seq-filter (lambda (l) (string-match-p "cli-" l)) lines)))
+          (monk-testdrive--checks
+           (cons (= 2 (length rows)) (format "%d rows" (length rows)))
+           (cons (and (= 2 (length rows))
+                      (= (string-search "directory" (car rows)) (string-search "directory" (cadr rows))))
+                 "type column not aligned")
+           (cons (not monk-cli--tty) "drive stderr is a tty?")
+           (cons (not (seq-some (lambda (l) (string-search "\e[2K" l)) lines)) "escape bytes off a tty")))))
     (monk-testdrive--step "salt" "compound matcher translates to CELL and selects machines"
       (let ((form (monk-salt-matcher-to-cell "G@kernel:Linux and not L@nobody")))
         (monk-testdrive--checks
          (cons (equal '(and (class linux) (not (in (name) (list "nobody")))) form) (format "%S" form))
          (cons (equal '("drive") (mapcar (lambda (x) (oref x name)) (monk-cell-select form (list m))))
                "drive did not match"))))))
+
+(defun monk-testdrive--section-ansible ()
+  "From Ansible: declared parameters, unreachable, predicates, no-log."
+  (monk-testdrive--out "\n## Ansible-style features")
+  (let ((m (monk-testdrive--machine)))
+    (monk-testdrive--step "ansible" "a misspelled keyword is refused when the policy compiles"
+      (condition-case err
+          (progn (monk-compile m (lambda (_m) (monk-directory "~/x" :mdoe #o700)))
+                 (cons 'FAIL "compiled"))
+        (monk-argument-error
+         (monk-testdrive--checks
+          (cons (string-match-p "Unsupported parameter for monk-directory: :mdoe" (cadr err)) (cadr err))
+          (cons (string-match-p "Supported parameters include: :group, :mode, :owner" (cadr err)) "no list")))))
+    (monk-testdrive--step "ansible" "changed-when makes a query; failed-when replaces the exit code"
+      (let ((run (monk-converge
+                  m (lambda (_m)
+                      (monk-command "query" "sh" :args '("-c" "echo same") :changed-when '(= (stdout) "changed"))
+                      (monk-command "tolerant" "sh" :args '("-c" "echo warn; exit 1") :creates "~/never"
+                                    :failed-when '(contains (stdout) "ERROR")))
+                  :passes 1)))
+        (monk-testdrive--checks
+         (cons (eq monk-status-kept (monk-result-status (monk-run-result run '("drive" . "query")))) "query not kept")
+         (cons (equal "same" (monk-result-comment (monk-run-result run '("drive" . "query")))) "query comment")
+         (cons (eq monk-status-repaired (monk-result-status (monk-run-result run '("drive" . "tolerant"))))
+               "exit 1 failed despite failed-when"))))
+    (monk-testdrive--step "ansible" "no-log keeps a secret out of results and events"
+      (let* ((secret "drive-secret-9f2a")
+             (run (monk-converge m (lambda (_m) (monk-file "~/creds" :content (concat secret "\n") :no-log t)) :passes 1))
+             (events (mapconcat #'monk-event-line (monk-run-events run) "")))
+        (monk-testdrive--checks
+         (cons (eq monk-status-repaired (monk-result-status (monk-run-result run '("drive" . "~/creds")))) "not repaired")
+         (cons (equal (concat secret "\n") (monk-testdrive--text "creds")) "file not written")
+         (cons (not (string-search secret events)) "secret in events")
+         (cons (not (string-search secret (monk-run-report-string run t))) "secret in report"))))
+    (monk-testdrive--step "ansible" "an unreachable machine: its nodes marked, others finish, exit code 4"
+      (let* ((dead (monk-machine :name "dead" :address "dead.invalid"))
+             (run (cl-letf* ((real (symbol-function 'monk-exec))
+                             ((symbol-function 'monk-exec)
+                              (lambda (mm program &rest args)
+                                (if (equal (oref mm name) "dead")
+                                    (monk-exec-create :command (cons program args) :exit-code 255
+                                                      :output "ssh: connect to host dead.invalid port 22: No route to host")
+                                  (apply real mm program args)))))
+                    (monk-orchestrate (list dead m)
+                                      (lambda (mm)
+                                        (monk-command "probe" "true" :creates "~/never")
+                                        (when (equal (oref mm name) "drive")
+                                          (monk-directory "~/needs-dead" :require '((dead . "probe")))
+                                          (monk-directory "~/free-of-dead")))
+                                      :passes 1))))
+        (monk-testdrive--checks
+         (cons (eq monk-status-unreachable (monk-result-status (monk-run-result run '("dead" . "probe")))) "dead not unreachable")
+         (cons (eq monk-status-repaired (monk-result-status (monk-run-result run '("drive" . "~/free-of-dead")))) "free did not run")
+         (cons (eq monk-status-skipped (monk-result-status (monk-run-result run '("drive" . "~/needs-dead")))) "dependent ran")
+         (cons (string-match-p "dead is unreachable" (monk-result-comment (monk-run-result run '("drive" . "~/needs-dead"))))
+               "reason does not name the host")
+         (cons (= 4 (monk-run-exit-code run)) (format "exit code %d" (monk-run-exit-code run)))
+         (cons (string-match-p "1 unreachable" (monk-run-summary run)) "summary"))))))
+
+(defun monk-testdrive--section-fleet ()
+  "Tags, serial batches, compile-only check, direct Ansible modules, agent pull."
+  (monk-testdrive--out "\n## Fleet controls")
+  (let ((m (monk-testdrive--machine)))
+    (monk-testdrive--step "fleet" "tags narrow a run; requisites and always still pull in what they need"
+      (let ((run (monk-orchestrate
+                  (list m)
+                  (lambda (_m)
+                    (monk-directory "~/tag-base" :tags '(base))
+                    (monk-file "~/tag-conf" :content "x\n" :require '("~/tag-base") :tags '(ssh))
+                    (monk-directory "~/tag-dns" :tags '(dns))
+                    (monk-directory "~/tag-always" :tags '(always))
+                    (monk-directory "~/tag-slow" :tags '(ssh slow)))
+                  :tags '(ssh) :skip-tags '(slow) :passes 1)))
+        (monk-testdrive--checks
+         (cons (eq monk-status-repaired (monk-result-status (monk-run-result run '("drive" . "~/tag-conf")))) "ssh not run")
+         (cons (eq monk-status-skipped (monk-result-status (monk-run-result run '("drive" . "~/tag-base")))) "base ran")
+         (cons (eq monk-status-skipped (monk-result-status (monk-run-result run '("drive" . "~/tag-dns")))) "dns ran")
+         (cons (eq monk-status-repaired (monk-result-status (monk-run-result run '("drive" . "~/tag-always")))) "always skipped")
+         (cons (eq monk-status-skipped (monk-result-status (monk-run-result run '("drive" . "~/tag-slow")))) "skip-tags ignored")
+         (cons (file-exists-p (monk-testdrive--path "tag-conf")) "conf not written"))))
+    (monk-testdrive--step "fleet" "serial batches stop after one fails past max-fail-percentage"
+      (let* ((machines (mapcar (lambda (n)
+                                 (let ((x (monk-local-machine :name n)))
+                                   (oset x facts (oref m facts))
+                                   (oset x classes (monk-hard-classes x))
+                                   x))
+                               '("s1" "s2" "s3")))
+             (run (monk-orchestrate machines
+                                    (lambda (mm)
+                                      (when (equal (oref mm name) "s1")
+                                        (monk-line-in-file "~/serial-missing" "x"))
+                                      (monk-directory (concat "~/serial-" (oref mm name))))
+                                    :serial 1 :max-fail-percentage 50 :passes 1)))
+        (monk-testdrive--checks
+         (cons (equal '(("s1") ("s2") ("s3")) (monk-run-batches run)) (format "batches %S" (monk-run-batches run)))
+         (cons (eql 1 (monk-run-stopped-at-batch run)) (format "stopped at %S" (monk-run-stopped-at-batch run)))
+         (cons (file-directory-p (monk-testdrive--path "serial-s1")) "batch 1 did not run")
+         (cons (not (file-directory-p (monk-testdrive--path "serial-s2"))) "batch 2 ran")
+         (cons (equal monk-skip-batch (monk-result-comment (monk-run-result run '("s3" . "~/serial-s3")))) "no batch skip comment")
+         (cons (not (monk-run-ok-p run)) "run counted as ok")
+         (cons (= 2 (monk-run-exit-code run)) (format "exit code %d" (monk-run-exit-code run))))))
+    (monk-testdrive--step "fleet" "check-policy compiles with no connection and lists tags and errors"
+      (let ((gathers 0))
+        (cl-letf (((symbol-function 'monk-gather-facts) (lambda (_m) (cl-incf gathers))))
+          (let* ((fresh (monk-local-machine :name "drive-check"))
+                 (_ (progn (oset fresh facts (oref m facts)) (oset fresh classes (monk-hard-classes fresh))))
+                 (good (monk-check-policy fresh (lambda (_m)
+                                                  (monk-directory "~/c1" :tags '(base))
+                                                  (monk-file "~/c2" :content "x" :tags '(ssh)))
+                                          :tags '(ssh)))
+                 (bad (monk-check-policy fresh (lambda (_m) (monk-directory "~/c1" :require '("nope")))))
+                 (text (monk-check-policy-string good)))
+            (monk-testdrive--checks
+             (cons (= 0 gathers) (format "%d gathers" gathers))
+             (cons (monk-check-policy-ok-p good) "good not ok")
+             (cons (equal '(base ssh) (plist-get good :tags)) (format "tags %S" (plist-get good :tags)))
+             (cons (equal '(("drive-check" . "~/c2")) (plist-get good :selected)) "selection")
+             (cons (string-match-p "\\[ssh\\]" text) text)
+             (cons (not (monk-check-policy-ok-p bad)) "bad ok")
+             (cons (string-match-p "nope" (car (plist-get bad :unresolved))) "unresolved text"))))))
+    (monk-testdrive--step "fleet" "an Ansible module runs directly from a payload zip"
+      (let ((library (seq-find (lambda (d) (file-exists-p (expand-file-name "ansible/module_utils/basic.py" d)))
+                               (list (getenv "MONK_ANSIBLE_LIBRARY")
+                                     (expand-file-name "../ansible/lib" (or (and load-file-name (file-name-directory load-file-name)) default-directory))
+                                     (expand-file-name "~/ai_workspace/source/ansible/lib")
+                                     (expand-file-name "~/src/ansible/lib")))))
+        (if (not (and library (executable-find "zip") (executable-find "python3")))
+            (cons 'SKIP "no ansible checkout, zip, or python3 (set MONK_ANSIBLE_LIBRARY)")
+          (require 'monk-bridge)
+          (let* ((monk-ansible-library library)
+                 (monk-ansible--payload nil)
+                 (path (monk-testdrive--path "direct.txt"))
+                 (policy (lambda (_m)
+                           (monk-ansible "direct" "lineinfile" `((path . ,path) (line . "b=2") (create . t)))
+                           (monk-ansible "bad" "file" '((path . "/nonexistent/monk-drive") (state . "file")))))
+                 (plan (monk-plan m policy))
+                 (planned (monk-run-result plan '("drive" . "direct")))
+                 (run (monk-apply plan))
+                 (again (monk-converge m policy :passes 1)))
+            (monk-testdrive--checks
+             (cons (eq monk-status-would-repair (monk-result-status planned)) (format "plan %s" (monk-result-status planned)))
+             (cons (string-match-p "^\\+b=2$" (or (monk-result-diff-text planned) "")) (format "plan diff %S" (monk-result-diff-text planned)))
+             (cons (eq monk-status-repaired (monk-result-status (monk-run-result run '("drive" . "direct")))) "apply")
+             (cons (equal "b=2\n" (monk-testdrive--text "direct.txt")) "file")
+             (cons (eq monk-status-kept (monk-result-status (monk-run-result again '("drive" . "direct")))) "not idempotent")
+             (cons (eq monk-status-failed (monk-result-status (monk-run-result run '("drive" . "bad")))) "bad not failed")
+             (cons (string-match-p "is absent" (monk-result-comment (monk-run-result run '("drive" . "bad")))) "bad message")
+             (cons (file-exists-p (car monk-ansible--payload)) "payload zip missing"))))))
+    (monk-testdrive--step "fleet" "the agent skips a timed converge while the policy repo stands still"
+      (require 'monk-agent)
+      (let ((converges 0)
+            (monk-agent-only-if-changed t)
+            (monk-agent-policy-repo (monk-testdrive--path "no-such-repo"))
+            (monk-agent-splay 0)
+            (updates '(same same changed same)))
+        (cl-letf (((symbol-function 'monk-converge) (lambda (&rest _) (cl-incf converges) (monk-run-create)))
+                  ((symbol-function 'monk-run-report) #'identity)
+                  ((symbol-function 'monk-cli-print-line) #'ignore)
+                  ((symbol-function 'monk-agent-update-policy-repo)
+                   (lambda () (setq monk-agent--policy-revision "0123456789abcdef") (pop updates))))
+          (monk-agent--full-converge #'ignore)
+          (monk-agent--full-converge #'ignore t)
+          (monk-agent--full-converge #'ignore t)
+          (monk-agent--full-converge #'ignore t)
+          (monk-testdrive--checks
+           (cons (= 2 converges) (format "%d converges, wanted 2 (start + changed)" converges))))))))
+
+(defun monk-testdrive--section-facts ()
+  "Fact cache, facts.d, structured diffs, generic package and service."
+  (monk-testdrive--out "\n## Facts and diffs")
+  (let ((m (monk-testdrive--machine)))
+    (monk-testdrive--step "facts" "a content and mode change give two diff entries"
+      (with-temp-file (monk-testdrive--path "two.conf") (insert "old\n"))
+      (set-file-modes (monk-testdrive--path "two.conf") #o644)
+      (let* ((plan (monk-plan m (lambda (_m) (monk-file "~/two.conf" :content "new\n" :mode #o600))))
+             (r (monk-run-result plan '("drive" . "~/two.conf")))
+             (text (monk-result-diff-text r)))
+        (monk-testdrive--checks
+         (cons (= 2 (length (monk-diff-entries (monk-result-diff r)))) "entry count")
+         (cons (string-match-p "^\\+new$" text) "content hunk missing")
+         (cons (string-match-p "mode: 0644 → 0600" text) (format "attributes line missing in %S" text)))))
+    (monk-testdrive--step "facts" "facts.d files become (fact local) and CELL reads inside"
+      (let ((d (monk-testdrive--path ".config/monk/facts.d/")))
+        (make-directory d t)
+        (with-temp-file (concat d "monk.fact") (insert "{\"role\": \"drive-box\"}"))
+        (let ((fresh (monk-local-machine :name "drive")))
+          (oset fresh facts (oref m facts))
+          (oset fresh facts (append (list (cons 'local (cdar (monk--probe-local fresh)))) (oref fresh facts)))
+          (oset fresh classes (monk-hard-classes fresh))
+          (monk-testdrive--checks
+           (cons (equal "drive-box" (monk-cell-eval fresh (monk-cell-guard "facts.local.monk.role"))) "CEL nested read")
+           (cons (monk-cell-eval fresh '(= (get (fact local) monk role) "drive-box")) "CELL get")))))
+    (monk-testdrive--step "facts" "cached facts: fresh spares a gather, stale shows a badge"
+      (if (not (featurep 'monk-history))
+          (cons 'SKIP "monk-history not loaded")
+        (let ((gathers 0) (monk-log-level nil))
+          (cl-letf (((symbol-function 'monk--probe-uname)
+                     (lambda (_m) (cl-incf gathers) '((kernel . "Linux") (arch . "x") (hostname . "c") (nodename . "c"))))
+                    ((symbol-function 'monk--probe-os) (lambda (_m) '((os-family . "Debian"))))
+                    ((symbol-function 'monk--probe-env) (lambda (_m) nil))
+                    ((symbol-function 'monk--probe-managers) (lambda (_m) nil))
+                    ((symbol-function 'monk--probe-local) (lambda (_m) nil)))
+            (let ((a (monk-local-machine :name "drive-cache")) (b (monk-local-machine :name "drive-cache")))
+              (monk--nodes-for (list a) (lambda (_m) (monk-directory "~/x")))
+              (monk--nodes-for (list b) (lambda (_m) (monk-directory "~/x")))
+              (let ((stale (monk-local-machine :name "drive-cache")))
+                (let ((monk-fact-ttl most-positive-fixnum)) (monk-facts-load stale))
+                (oset stale gathered (time-subtract (current-time) (* 3 86400)))
+                (monk-testdrive--checks
+                 (cons (= 1 gathers) (format "%d gathers for two compiles" gathers))
+                 (cons (eq 'cache (oref b facts-source)) "second compile not from cache")
+                 (cons (string-prefix-p "·" (monk-ui-facts-badge b)) (format "fresh badge %S" (monk-ui-facts-badge b)))
+                 (cons (string-prefix-p "!3d" (monk-ui-facts-badge stale)) (format "stale badge %S" (monk-ui-facts-badge stale)))
+                 (cons (memq 'debian (oref b classes)) "classes not rebuilt from cache"))))))))
+    (monk-testdrive--step "facts" "monk-package and monk-service dispatch on the manager facts"
+      (let* ((facts (oref m facts))
+             (deb (monk-local-machine :name "deb")) (mac (monk-local-machine :name "mac")))
+        (oset deb facts (append '((pkg-mgr . "apt") (service-mgr . "systemd")) facts))
+        (oset mac facts (append '((pkg-mgr . "homebrew") (service-mgr . "launchd")) facts))
+        (dolist (x (list deb mac)) (oset x classes (monk-hard-classes x)))
+        (let ((policy (lambda (_m) (monk-package "p" '("jq")) (monk-service "sshd"))))
+          (monk-testdrive--checks
+           (cons (equal '(monk-apt-resource monk-systemd-unit-resource)
+                        (mapcar #'eieio-object-class-name (monk-compile deb policy)))
+                 "debian dispatch")
+           (cons (equal '(monk-brew-resource monk-launchd-resource)
+                        (mapcar #'eieio-object-class-name (monk-compile mac policy)))
+                 "mac dispatch")))))
+    (monk-testdrive--step "facts" "derived groups follow the facts"
+      (let ((monk-inventory nil) (monk-inventory-derived nil))
+        (monk-inventory-define '(w :hosts ((a) (b))))
+        (oset (monk-inventory-find 'a) facts '((kernel . "Linux") (disk . 10)))
+        (oset (monk-inventory-find 'b) facts '((kernel . "Linux") (disk . 900)))
+        (monk-group 'roomy "facts.disk > 100")
+        (monk-keyed-groups '(fact kernel) "os")
+        (monk-testdrive--checks
+         (cons (equal '("b") (mapcar (lambda (x) (oref x name)) (monk-inventory-select 'roomy))) "roomy")
+         (cons (memq 'os_linux (oref (monk-inventory-find 'a) groups)) "keyed group"))))))
 
 (defconst monk-testdrive--sections
   '(("Converge" monk-testdrive--section-converge)
@@ -900,6 +1157,9 @@ so `~' in the policy lands there."
     ("Guards and failures" monk-testdrive--section-guards)
     ("Inspect and navigate" monk-testdrive--section-inspect)
     ("Salt-style features" monk-testdrive--section-salt)
+    ("Ansible-style features" monk-testdrive--section-ansible)
+    ("Facts and diffs" monk-testdrive--section-facts)
+    ("Fleet controls" monk-testdrive--section-fleet)
     ("Watch" monk-testdrive--section-watch)
     ("Agent and events" monk-testdrive--section-agent))
   "The drive's sections: (TITLE FUNCTION).")
@@ -998,6 +1258,54 @@ so `~' in the policy lands there."
       (redisplay)
       (monk-testdrive--ask "The cursor is now in the *monk* window (not in the report), so 'a' would apply at once?"))))
 
+(defun monk-testdrive--tour-facts ()
+  "The fact age badge, fresh and stale, and the structured diff."
+  (monk-testdrive--step "tour" "stale facts show an amber badge next to the machine"
+    (let ((m (monk-testdrive--machine)))
+      (oset m facts-source 'cache)
+      (oset m gathered (time-subtract (current-time) (* 3 86400)))
+      (unwind-protect
+          (progn
+            (monk-ui-show (monk-converge m #'monk-testdrive--policy))
+            (monk-testdrive--focus-monk)
+            (monk-testdrive--ask "In the machine row, after 'drive', an amber '!3d' badge?  Hover it: does the tooltip say the facts are from the cache and stale?  Press i: does the inspector line 'facts from' read 'the cache, 3d old, stale' in amber?"))
+        (oset m facts-source 'live)
+        (oset m gathered (current-time)))))
+  (monk-testdrive--step "tour" "a mode change renders as an attributes block under the diff"
+    (let ((m (monk-testdrive--machine)))
+      (with-temp-file (monk-testdrive--path ".config/app/app.conf") (insert "level=9\n"))
+      (set-file-modes (monk-testdrive--path ".config/app/app.conf") #o644)
+      (monk-ui-show (monk-plan m #'monk-testdrive--policy))
+      (monk-testdrive--focus-detail "drive")
+      (monk-testdrive--ask "Under app.conf: a colored unified diff (red level=9, green level=3) followed by '--- a/... (attributes)' and a 'mode: 0644 → 0600' line in the changed color?"))))
+
+(defun monk-testdrive--tour-fleet ()
+  "Batch badges, the stopped-at-batch header, the check-policy buffer."
+  (monk-testdrive--step "tour" "a serial run shows batch numbers and a stopped-at-batch warning"
+    (let* ((m (monk-testdrive--machine))
+           (machines (mapcar (lambda (n)
+                               (let ((x (monk-local-machine :name n)))
+                                 (oset x facts (oref m facts))
+                                 (oset x classes (monk-hard-classes x))
+                                 x))
+                             '("t1" "t2" "t3"))))
+      (monk-ui-show (monk-orchestrate machines
+                                      (lambda (mm)
+                                        (when (equal (oref mm name) "t1")
+                                          (monk-line-in-file "~/tour-serial-missing" "x"))
+                                        (monk-directory (concat "~/tour-serial-" (oref mm name))))
+                                      :serial 1 :max-fail-percentage 50 :passes 1))
+      (monk-testdrive--focus-monk)
+      (monk-testdrive--ask "Rows t1 t2 t3 carry badges b1, b2×, b3×, the × ones dimmed?  Hover b2×: does the tooltip say the batch never started?  Does the header show a red 'stopped at batch 1/3'?")))
+  (monk-testdrive--step "tour" "the check buffer lists resources with tags and marks a selection"
+    (let ((m (monk-testdrive--machine)))
+      (monk-ui-check-policy m (lambda (_m)
+                                (monk-directory "~/tour-c1" :tags '(base))
+                                (monk-file "~/tour-c2" :content "x" :tags '(ssh))
+                                (monk-directory "~/tour-c3" :require '("nope")))
+                            :tags '(ssh))
+      (monk-testdrive--ask "A *monk-check* buffer: a red 'CHECK FAILED' badge, an 'unresolved' line naming nope, a tags row with base and ssh as pills, and three resource lines where only ~/tour-c2 has the kept glyph and the others are dimmed?  Press . on a line: does it jump to this drive's source?  q closes?"))))
+
 (defun monk-testdrive--tour-history ()
   "The history buffer."
   (monk-testdrive--step "tour" "h opens the history list; RET, c, r"
@@ -1014,6 +1322,8 @@ so `~' in the policy lands there."
     ("Flapping" monk-testdrive--tour-flapping)
     ("Inspect and query" monk-testdrive--tour-inspect)
     ("History" monk-testdrive--tour-history)
+    ("Facts and diffs" monk-testdrive--tour-facts)
+    ("Fleet controls" monk-testdrive--tour-fleet)
     ("Watch" monk-testdrive--tour-watch)
     ("Text fallback" monk-testdrive--tour-text))
   "The tour's stops: (TITLE FUNCTION).")

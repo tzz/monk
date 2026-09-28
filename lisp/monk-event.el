@@ -148,12 +148,56 @@ goes in the tag.  Nil SEQ looks the result up in the run."
     (degree . ,(monk-result-degree result))
     (changes . ,(and (monk-result-changes result)
                      (monk-event--plist-to-alist (monk-result-changes result))))
-    (diff . ,(monk-result-diff result))
+    (diff . ,(monk-event-diff (monk-result-diff result)))
     (comment . ,(monk-result-comment result))
     (duration_ms . ,(* 1000.0 (monk-result-duration result)))
       (dry_run . ,(if (monk-run-dry-run run) t :false))
+      (censored . ,(if (monk-result-censored result) t :false))
       (native . ((tool . "monk")
                  (source . ,(car (monk-result-origin result))))))))
+
+(defun monk-event-diff (diff)
+  "Return DIFF as JSON data: a list of objects with before/after and headers.
+Ansible's shape, one object per entry.  A rendered string entry keeps
+its text under `rendered'."
+  (and diff
+       (vconcat
+        (mapcar (lambda (e)
+                  (pcase (monk-diff-entry-kind e)
+                    ('rendered `((rendered . ,(monk-diff-entry-after e))))
+                    ('attributes
+                     `((before . ,(monk-event--jsonable (monk-diff-entry-before e)))
+                       (after . ,(monk-event--jsonable (monk-diff-entry-after e)))
+                       (before_header . ,(monk-diff-entry-before-header e))
+                       (after_header . ,(monk-diff-entry-after-header e))
+                       (kind . "attributes")))
+                    (_ `((before . ,(monk-diff-entry-before e))
+                         (after . ,(monk-diff-entry-after e))
+                         (before_header . ,(monk-diff-entry-before-header e))
+                         (after_header . ,(monk-diff-entry-after-header e))
+                         (kind . "content")))))
+                (monk-diff-entries diff)))))
+
+(defun monk-event-diff-to-entries (data)
+  "Return `monk-diff-entry' objects from DATA as `monk-event-diff' wrote it.
+A plain string, from an older event, becomes one rendered entry."
+  (cond
+   ((null data) nil)
+   ((stringp data) (list (monk-diff-entry-create :after data :kind 'rendered)))
+   (t (mapcar (lambda (o)
+                (cond
+                 ((alist-get 'rendered o)
+                  (monk-diff-entry-create :after (alist-get 'rendered o) :kind 'rendered))
+                 ((equal (alist-get 'kind o) "attributes")
+                  (monk-diff-entry-create :before (alist-get 'before o) :after (alist-get 'after o)
+                                          :before-header (alist-get 'before_header o)
+                                          :after-header (alist-get 'after_header o)
+                                          :kind 'attributes))
+                 (t (monk-diff-entry-create :before (alist-get 'before o) :after (alist-get 'after o)
+                                            :before-header (alist-get 'before_header o)
+                                            :after-header (alist-get 'after_header o)
+                                            :kind 'content))))
+              (append data nil)))))
 
 (defun monk-run-result-seq (run result)
   "Return the position of RESULT among the results of RUN, or nil."
@@ -182,6 +226,8 @@ goes in the tag.  Nil SEQ looks the result up in the run."
     ,@(when (eq kind 'run-end)
         `((passes . ,(monk-run-passes run))
           (ok . ,(if (monk-run-ok-p run) t :false))
+          (exit_code . ,(monk-run-exit-code run))
+          (unreachable . ,(vconcat (mapcar #'car (monk-run-unreachable run))))
           (converged . ,(if (monk-run-converged-p run) t :false))
           (flapping . ,(vconcat (mapcar (lambda (k) (format "%s:%s" (car k) (cdr k)))
                                         (monk-run-flapping run))))
@@ -268,10 +314,11 @@ Arrays become vectors, so a parsed event can be serialized again:
    :degree (or (alist-get 'degree event) 0.0)
    :changes (monk-event-alist-to-plist (alist-get 'changes event))
    :comment (alist-get 'comment event)
-   :diff (alist-get 'diff event)
+   :diff (monk-event-diff-to-entries (alist-get 'diff event))
    :duration (/ (or (alist-get 'duration_ms event) 0) 1000.0)
    :origin (let ((source (alist-get 'source (alist-get 'native event))))
-             (and source (cons source (alist-get 'name event))))))
+             (and source (cons source (alist-get 'name event))))
+   :censored (eq t (alist-get 'censored event))))
 
 (defun monk-events-to-run (events)
   "Rebuild a `monk-run' from EVENTS, a list of alists from one run.

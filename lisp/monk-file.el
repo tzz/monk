@@ -189,15 +189,12 @@ temporary files."
 (cl-defmethod monk-resource-owns-subtree-p ((_r monk-directory-resource))
   t)
 
-(defun monk-directory (path &rest args)
-  "Ensure directory PATH exists.  ARGS: :mode :owner :group and common keys."
-  (monk-add-resource
-   (apply #'monk-directory-resource
-          :name path
-          (monk--resource-plist args
-                                :mode (plist-get args :mode)
-                                :owner (plist-get args :owner)
-                                :group (plist-get args :group)))))
+(monk-define-resource monk-directory monk-directory-resource
+  "Ensure directory PATH exists, with the given mode and ownership."
+  ((path :type path :doc "The directory."))
+  ((mode :type mode :doc "Octal mode, for example #o700.  Nil leaves it alone.")
+   (owner :type string :doc "User name.")
+   (group :type string :doc "Group name.")))
 
 ;;;; ownership helpers
 
@@ -279,16 +276,11 @@ the text verbatim and a literal `~' in a link is dangling."
 The watcher wants both, so that a replaced target re-checks the link."
   (list (oref r name) (oref r target)))
 
-(defun monk-symlink (path target &rest args)
-  "Ensure PATH is a symbolic link to TARGET.  ARGS: :force and common keys."
-  (monk-add-resource
-   (apply #'monk-symlink-resource
-          :name path
-          (monk--resource-plist args
-                                :target target
-                                :force (if (plist-member args :force)
-                                           (plist-get args :force)
-                                         t)))))
+(monk-define-resource monk-symlink monk-symlink-resource
+  "Ensure PATH is a symbolic link to TARGET."
+  ((path :type path :doc "The link.")
+   (target :type path :doc "What it points to.  A leading ~ expands on the machine."))
+  ((force :type boolean :default t :doc "Replace a file or directory in the way.")))
 
 ;;;; file
 
@@ -337,11 +329,27 @@ The watcher wants both, so that a replaced target re-checks the link."
                                                      (oref r sudo)))))
     changes))
 
+(defun monk--attribute-diff (path changes)
+  "Return an attributes entry for PATH from the :mode :owner :group of CHANGES."
+  (let (before after)
+    (dolist (key '(:mode :owner :group))
+      (let ((pair (plist-get changes key)))
+        (when (and (consp pair) (= 2 (length pair)))
+          (push (cons (intern (substring (symbol-name key) 1)) (car pair)) before)
+          (push (cons (intern (substring (symbol-name key) 1)) (cadr pair)) after))))
+    (and after (monk-diff-attributes path (nreverse before) (nreverse after)))))
+
 (cl-defmethod monk-diff ((r monk-file-resource) (m monk-machine) changes)
-  (when (or (plist-get changes :create) (plist-get changes :content))
-    (monk--unified-diff (monk-file-read m (oref r name) (oref r sudo))
-                        (monk--file-desired-content r)
-                        (oref r name))))
+  (delq nil
+        (list (and (or (plist-get changes :create) (plist-get changes :content))
+                   (monk-diff-content (monk-file-read m (oref r name) (oref r sudo))
+                                      (monk--file-desired-content r)
+                                      (oref r name)))
+              (monk--attribute-diff (oref r name) changes))))
+
+(cl-defmethod monk-diff ((r monk-directory-resource) (_m monk-machine) changes)
+  (let ((entry (monk--attribute-diff (oref r name) changes)))
+    (and entry (list entry))))
 
 (cl-defmethod monk-repair ((r monk-file-resource) (m monk-machine) changes)
   (let ((notes nil))
@@ -364,19 +372,16 @@ The watcher wants both, so that a replaced target re-checks the link."
 (cl-defmethod monk-resource-paths ((r monk-file-resource))
   (list (oref r name)))
 
-(defun monk-file (path &rest args)
-  "Ensure PATH has the given content.
-ARGS: :content STRING or :source LOCAL-PATH, plus :mode :owner :group
-and common keys."
-  (monk-add-resource
-   (apply #'monk-file-resource
-          :name path
-          (monk--resource-plist args
-                                :content (plist-get args :content)
-                                :source (plist-get args :source)
-                                :mode (plist-get args :mode)
-                                :owner (plist-get args :owner)
-                                :group (plist-get args :group)))))
+(monk-define-resource monk-file monk-file-resource
+  "Ensure PATH has the given content, mode, and ownership."
+  ((path :type path :doc "The file."))
+  ((content :type string :doc "Exact content.")
+   (source :type path :doc "Local file whose content is copied.")
+   (mode :type mode :doc "Octal mode.  Nil leaves it alone.")
+   (owner :type string :doc "User name.")
+   (group :type string :doc "Group name."))
+  :one-of (content source)
+  :exclusive ((content source)))
 
 ;;;; line-in-file
 
@@ -478,7 +483,7 @@ without a match, append at the end."
 
 (cl-defmethod monk-diff ((r monk-line-in-file-resource) (m monk-machine) _changes)
   (let ((current (monk-file-read m (oref r path) (oref r sudo))))
-    (monk--unified-diff current (monk--line-in-file-compute r current) (oref r path))))
+    (list (monk-diff-content current (monk--line-in-file-compute r current) (oref r path)))))
 
 (cl-defmethod monk-repair ((r monk-line-in-file-resource) (m monk-machine) changes)
   (let ((current (monk-file-read m (oref r path) (oref r sudo))))
@@ -490,22 +495,23 @@ without a match, append at the end."
 (cl-defmethod monk-resource-paths ((r monk-line-in-file-resource))
   (list (oref r path)))
 
-(defun monk-line-in-file (path line &rest args)
-  "Ensure LINE is present in PATH, or absent when :state is `absent'.
-ARGS: :regexp :state :insert-after :insert-before :create and common
-keys.  The resource name is PATH followed by the regexp or line, so
+(monk-define-resource monk-line-in-file monk-line-in-file-resource
+  "Ensure LINE is present in PATH, or absent with :state absent.
+The resource name is PATH followed by # and the regexp or line, so
 one file can hold several line resources."
-  (monk-add-resource
-   (apply #'monk-line-in-file-resource
-          :name (format "%s#%s" path (or (plist-get args :regexp) line))
-          (monk--resource-plist args
-                                :path path
-                                :line line
-                                :regexp (plist-get args :regexp)
-                                :state (or (plist-get args :state) 'present)
-                                :insert-after (plist-get args :insert-after)
-                                :insert-before (plist-get args :insert-before)
-                                :create (plist-get args :create)))))
+  ((path :type path :doc "The file.")
+   (line :type string :doc "The line, without newline."))
+  ((regexp :type string :doc "Match this line instead of LINE itself; replace it with LINE.")
+   (state :type symbol :default present :choices (present absent))
+   (insert-after :type string :doc "Regexp of the line to insert after; EOF is the default.")
+   (insert-before :type string :doc "Regexp of the line to insert before.")
+   (create :type boolean :doc "Create the file when it is missing."))
+  ;; With :no-log the line must not be in the name either: the name
+  ;; goes into every event and history row.  A hash keeps it unique.
+  :name-form (format "%s#%s" path
+                     (cond ((plist-get rest :no-log)
+                            (concat "no-log-" (substring (sha1 (or (plist-get args :regexp) line)) 0 8)))
+                           (t (or (plist-get args :regexp) line)))))
 
 ;;;; absent
 
@@ -530,10 +536,10 @@ one file can hold several line resources."
 (cl-defmethod monk-resource-paths ((r monk-absent-resource))
   (list (oref r name)))
 
-(defun monk-absent (path &rest args)
-  "Ensure PATH does not exist.  ARGS: common keys."
-  (monk-add-resource
-   (apply #'monk-absent-resource :name path (monk--resource-plist args))))
+(monk-define-resource monk-absent monk-absent-resource
+  "Ensure PATH does not exist."
+  ((path :type path :doc "File, link, or directory to remove."))
+  ())
 
 (provide 'monk-file)
 ;;; monk-file.el ends here
