@@ -1041,11 +1041,15 @@ A :degree threshold on a require lets a follower run anyway."
   (let* ((m (monk-test-machine))
          (monk-log-level nil)
          (run (cl-letf (((symbol-function 'monk-exec)
-                         (lambda (_m program &rest _)
-                           (if (equal program "dpkg-query")
-                               (monk-exec-create :exit-code 0
-                                                 :output "a installed\nb installed\nc missing\nd missing\n")
-                             (monk-exec-create :exit-code 1 :output "apt broke")))))
+                         (lambda (_m program &rest args)
+                           (cond
+                            ((equal program "dpkg-query")
+                             (monk-exec-create :exit-code 0
+                                               :output "a installed\nb installed\nc missing\nd missing\n"))
+                            ;; the availability probe and apt-get update succeed
+                            ((or (equal program "sh") (member "update" args))
+                             (monk-exec-create :exit-code 0 :output ""))
+                            (t (monk-exec-create :exit-code 1 :output "apt broke"))))))
                 (monk-converge
                  m
                  (lambda (_m)
@@ -1219,6 +1223,292 @@ A :degree threshold on a require lets a follower run anyway."
                (lambda (&rest _)
                  (monk-exec-create :exit-code 0 :output "{\"local\": {}}"))))
       (should-error (monk-check r m) :type 'monk-resource-error))))
+
+;;;; rsync and launchd
+
+(ert-deftest monk-test-rsync-parse-itemize ()
+  (require 'monk-sync)
+  (pcase-let ((`(,changed . ,total)
+               (monk-rsync-parse-itemize
+                (concat ">f+++++++++ a\n.d..t...... d/\n>f.st...... d/b\n*deleting   gone\n"
+                        "sending incremental file list\n\nNumber of files: 1,204 (reg: 3, dir: 2)\n"))))
+    (should (= 1204 total))
+    (should (equal '(">f+++++++++ a" ">f.st...... d/b" "*deleting   gone") changed)))
+  (should (null (cdr (monk-rsync-parse-itemize ">f+++++++++ a\n")))))
+
+(ert-deftest monk-test-rsync-local-roundtrip ()
+  "rsync to a local destination: would-repair, repaired with a degree, then kept."
+  (skip-unless (executable-find "rsync"))
+  (require 'monk-sync)
+  (monk-test-with-tmpdir dir
+    (let* ((src (concat dir "src/"))
+           (dst (concat dir "dst/"))
+           (policy (lambda (_m)
+                     (monk-rsync "mirror" (list src) dst :archive t :delete t)))
+           (m (monk-test-machine))
+           (monk-log-level nil))
+      (make-directory (concat src "d") t)
+      (with-temp-file (concat src "a") (insert "a\n"))
+      (with-temp-file (concat src "d/b") (insert "b\n"))
+      (make-directory dst)
+      (with-temp-file (concat dst "stale") (insert "x\n"))
+      (let ((plan (monk-plan m policy)))
+        (should (eq 'would-repair (monk-test-status plan "mirror")))
+        ;; a, d/ (created), d/b, and the deletion of stale
+        (should (= 4 (length (plist-get (monk-result-changes (monk-test-result plan "mirror")) :sync))))
+        (should (file-exists-p (concat dst "stale"))))
+      (let ((run (monk-converge m policy)))
+        (should (eq 'repaired (monk-test-status run "mirror")))
+        (should (string-match-p "synced 4 items" (monk-result-comment (monk-test-result run "mirror"))))
+        (should (equal "b\n" (with-temp-buffer (insert-file-contents (concat dst "d/b")) (buffer-string))))
+        (should-not (file-exists-p (concat dst "stale")))
+        (should (= 2 (monk-run-passes run))))
+      (should (eq 'kept (monk-test-status (monk-test-converge policy) "mirror"))))))
+
+(ert-deftest monk-test-rsync-follow-links-file-list ()
+  "Several file sources with -L land as files in the destination directory."
+  (skip-unless (executable-find "rsync"))
+  (require 'monk-sync)
+  (monk-test-with-tmpdir dir
+    (let ((real (concat dir "real"))
+          (link (concat dir "link"))
+          (dst (concat dir "out/")))
+      (with-temp-file real (insert "r\n"))
+      (make-symbolic-link real link)
+      (make-directory dst)
+      (let ((run (monk-test-converge (lambda (_m) (monk-rsync "files" (list link) dst :follow-links t)))))
+        (should (eq 'repaired (monk-test-status run "files")))
+        (should-not (file-symlink-p (concat dst "link")))
+        (should (equal "r\n" (with-temp-buffer (insert-file-contents (concat dst "link")) (buffer-string))))))))
+
+(ert-deftest monk-test-rsync-unreachable-is-skipped-with-probe ()
+  ":reachable turns a dead host into a skip; without it, rsync's 255 is a failure."
+  (require 'monk-sync)
+  (let ((m (monk-test-machine)) (monk-log-level nil))
+    (cl-letf (((symbol-function 'monk-host-reachable-p) (lambda (&rest _) nil)))
+      (let ((run (monk-converge m (lambda (_m) (monk-rsync "s" '("/x") "dead:x" :reachable "dead")) :passes 1)))
+        (should (eq 'skipped (monk-test-status run "s")))
+        (should (equal "dead is not reachable" (monk-result-comment (monk-test-result run "s"))))))
+    (cl-letf (((symbol-function 'monk-exec)
+               (lambda (_m program &rest args)
+                 (if (equal program "rsync")
+                     (monk-exec-create :exit-code 255 :output "ssh: connect to host dead port 22: No route")
+                   (ignore args)
+                   (monk-exec-create :exit-code 0 :output "")))))
+      (let ((run (monk-converge m (lambda (_m) (monk-rsync "s" '("/x") "dead:x")) :passes 1)))
+        (should (eq 'failed (monk-test-status run "s")))
+        (should (string-match-p "could not reach dead:x" (monk-result-comment (monk-test-result run "s"))))))))
+
+(ert-deftest monk-test-host-reachable-p ()
+  "A listening local port is reachable; a closed one is not; answers are cached per run."
+  (require 'monk-sync)
+  (let* ((server (make-network-process :name "monk-test-listen" :server t :host "127.0.0.1"
+                                       :service t :noquery t))
+         (port (process-contact server :service))
+         (monk--current-run (monk-run-create)))
+    (unwind-protect
+        (progn
+          (should (monk-host-reachable-p "127.0.0.1" port 1.0))
+          (delete-process server)
+          ;; cached: still yes inside this run
+          (should (monk-host-reachable-p "127.0.0.1" port 1.0))
+          (let ((monk--current-run (monk-run-create)))
+            (should-not (monk-host-reachable-p "127.0.0.1" port 0.5))))
+      (ignore-errors (delete-process server)))))
+
+(ert-deftest monk-test-launchd-plist-and-check ()
+  "The plist renders; check compares content and load state through faked launchctl."
+  (let* ((m (monk-test-machine))
+         (job '((ProgramArguments . ("/usr/bin/emacs" "--batch" "-f" "monk-agent-main"))
+                (RunAtLoad . t) (KeepAlive . t) (ThrottleInterval . 30)
+                (EnvironmentVariables . ((PATH . "/usr/bin:/bin")))))
+         (xml (monk-launchd-plist "org.example.job" job)))
+    (should (string-match-p "<key>Label</key><string>org.example.job</string>" xml))
+    (should (string-match-p "<key>ProgramArguments</key><array><string>/usr/bin/emacs</string>" xml))
+    (should (string-match-p "<key>KeepAlive</key><true/>" xml))
+    (should (string-match-p "<key>ThrottleInterval</key><integer>30</integer>" xml))
+    (should (string-match-p "<key>EnvironmentVariables</key><dict><key>PATH</key>" xml))
+    (should (string-match-p "&lt;x&gt;" (monk-launchd-plist "l" '((Comment . "<x>")))))
+    (monk-test-with-tmpdir dir
+      (let ((monk-launchd-agent-directory (concat dir "agents/"))
+            (r (monk-launchd-resource :name "org.example.job" :plist job))
+            (loaded nil) (calls nil))
+        (make-directory (concat dir "agents"))
+        (cl-letf (((symbol-function 'monk-exec)
+                   (lambda (_m program &rest args)
+                     (push (cons program (seq-take-while #'stringp args)) calls)
+                     (pcase program
+                       ("launchctl"
+                        (pcase (car args)
+                          ("print" (monk-exec-create :exit-code (if loaded 0 113) :output ""))
+                          ("bootstrap" (setq loaded t) (monk-exec-create :exit-code 0 :output ""))
+                          ("bootout" (setq loaded nil) (monk-exec-create :exit-code 0 :output ""))))
+                       ("id" (monk-exec-create :exit-code 0 :output "501\n"))
+                       (_ (monk-exec-create :exit-code 0 :output ""))))))
+          (let ((monk--current-run (monk-run-create)))
+            (should (equal '(:content t :loaded (nil t)) (monk-check r m)))
+            (should (equal "wrote plist, loaded" (monk-repair r m (monk-check r m))))
+            (should (equal xml (with-temp-buffer
+                                 (insert-file-contents (concat dir "agents/org.example.job.plist"))
+                                 (buffer-string))))
+            (should (member '("launchctl" "bootstrap" "gui/501") 
+                            (mapcar (lambda (c) (seq-take c 3)) calls)))
+            (should-not (monk-check r m))
+            ;; content change while loaded: bootout then bootstrap
+            (setq calls nil)
+            (oset r plist (cons '(Nice . 5) job))
+            (should (equal "wrote plist, loaded" (monk-repair r m (monk-check r m))))
+            (should (equal '("bootout" "bootstrap")
+                           (delq nil (mapcar (lambda (c) (and (equal (car c) "launchctl")
+                                                              (member (cadr c) '("bootout" "bootstrap"))
+                                                              (cadr c)))
+                                             (reverse calls)))))))))))
+
+(ert-deftest monk-test-agent-launchd-job ()
+  (require 'monk-agent)
+  (let* ((monk-agent-emacs "/opt/homebrew/bin/emacs")
+         (monk-agent-load-path "/Users/x/source/monk/lisp")
+         (job (monk-agent-launchd-job "/Users/x/policy.el")))
+    (should (equal '("/opt/homebrew/bin/emacs" "--batch" "-L" "/Users/x/source/monk/lisp"
+                     "-l" "/Users/x/policy.el" "-f" "monk-agent-main")
+                   (alist-get 'ProgramArguments job)))
+    (should (eq t (alist-get 'KeepAlive job)))
+    (should (string-suffix-p "agent.log" (alist-get 'StandardOutPath job)))))
+
+;;;; Salt bridge: high aggregation, import, completion, matchers
+
+(defconst monk-test-salt-low-sls-json
+  "{\"local\": [
+  {\"state\": \"file\", \"name\": \"/tmp/w/a.txt\", \"__sls__\": \"demo\", \"__env__\": \"base\",
+   \"__id__\": \"/tmp/w/a.txt\", \"contents\": \"hello\\n\", \"order\": 10000, \"fun\": \"managed\"},
+  {\"state\": \"cmd\", \"name\": \"touch /tmp/w/b\", \"__sls__\": \"demo\", \"__env__\": \"base\",
+   \"__id__\": \"touch-b\", \"creates\": \"/tmp/w/b\", \"order\": 10001, \"fun\": \"run\",
+   \"require\": [{\"file\": \"/tmp/w/a.txt\"}]},
+  {\"state\": \"cmd\", \"name\": \"echo last\", \"__sls__\": \"demo\", \"__env__\": \"base\",
+   \"__id__\": \"last-one\", \"order\": 1010100, \"fun\": \"run\"}]}"
+  "What state.show_low_sls demo printed on the sandbox (from the Salt review).")
+
+(ert-deftest monk-test-salt-split-key-and-id ()
+  (require 'monk-bridge)
+  (should (equal '("file" . "managed") (monk-salt-split-key "file_|-/x_|-/x_|-managed")))
+  (should (equal '("cmd" . "run") (monk-salt-split-key "cmd_|-touch-b_|-touch /tmp/w/b_|-run")))
+  (should (equal "weird" (monk-salt-result-id "cmd_|-a_|-b_|-run" '((__id__ . "weird")))))
+  (should (equal "a" (monk-salt-result-id "cmd_|-a_|-b_|-run" nil)))
+  (should (null (monk-salt-result-id "bare" nil))))
+
+(ert-deftest monk-test-salt-import-sls ()
+  "Low chunks become monk-salt forms with requisites, in Salt's order."
+  (require 'monk-bridge)
+  (let ((m (monk-test-machine)))
+    (cl-letf (((symbol-function 'monk-exec)
+               (lambda (_m _p &rest args)
+                 (should (member "state.show_low_sls" args))
+                 (should (member "--file-root=/tmp/states" args))
+                 (monk-exec-create :exit-code 0 :output monk-test-salt-low-sls-json))))
+      (let ((forms (monk-salt-import-sls m "demo" "/tmp/states")))
+        (should (= 3 (length forms)))
+        (should (equal '(monk-salt "/tmp/w/a.txt" "file.managed" '((contents . "hello\n")))
+                       (nth 0 forms)))
+        (should (equal '(monk-salt "touch /tmp/w/b" "cmd.run" '((creates . "/tmp/w/b"))
+                                   :id "touch-b" :require '("/tmp/w/a.txt"))
+                       (nth 1 forms)))
+        (should (equal "echo last" (nth 1 (nth 2 forms))))))))
+
+(ert-deftest monk-test-salt-high-data-and-aggregate ()
+  "Independent salt resources merge into one state.high with Salt requisites."
+  (require 'monk-bridge)
+  (let* ((a (monk-salt-resource :name "/x" :function "file.symlink" :args '((target . "/y"))))
+         (b (monk-salt-resource :name "svc" :function "service.running" :args nil :watch '("/x")))
+         (high (monk-salt-high-data (list a b))))
+    (should (equal '(/x . ((file . (((name . "/x")) ((target . "/y")) ((order . 10000)) "symlink"))))
+                   (car high)))
+    (should (equal '(svc . ((service . (((name . "svc")) ((order . 10001))
+                                        ((watch . (((file . "/x"))))) "running"))))
+                   (cadr high)))
+    (should (string-match-p "\"/x\":{\"file\":\\[{\"name\":\"/x\"}"
+                            (monk-bridge--json-string high)))
+    (let ((agg (monk-resource-aggregate a (list b) (monk-test-machine))))
+      (should agg)
+      (should (equal (list a b) (oref agg members)))
+      (should (null (monk-resource-aggregate a (list (monk-salt-resource :name "s" :function "f.g" :sudo t))
+                                             (monk-test-machine)))))))
+
+(ert-deftest monk-test-salt-high-check-and-disaggregate ()
+  "One state.high test call answers for every member; failures stay per member."
+  (require 'monk-bridge)
+  (let* ((m (monk-test-machine))
+         (a (monk-salt-resource :name "/x" :function "file.symlink" :args '((target . "/y"))))
+         (b (monk-salt-resource :name "/z" :function "file.directory" :args nil))
+         (c (monk-salt-resource :name "bad" :function "test.fail_without_changes" :args nil))
+         (agg (monk-resource-aggregate a (list b c) m))
+         (calls nil)
+         (monk-log-level nil))
+    (cl-letf (((symbol-function 'monk-exec)
+               (lambda (_m _p &rest args)
+                 (push args calls)
+                 (monk-exec-create
+                  :exit-code 0
+                  :output (concat "[WARNING ] noise on stderr\n"
+                                  "{\"local\": {"
+                                  "\"file_|-/x_|-/x_|-symlink\": {\"result\": null, \"changes\": {}, \"comment\": \"Symlink /x to /y is set for creation\", \"__id__\": \"/x\", \"__run_num__\": 0},"
+                                  "\"file_|-/z_|-/z_|-directory\": {\"result\": true, \"changes\": {}, \"comment\": \"in place\", \"__id__\": \"/z\", \"__run_num__\": 1},"
+                                  "\"test_|-bad_|-bad_|-fail_without_changes\": {\"result\": false, \"changes\": {}, \"comment\": \"Failure!\", \"__id__\": \"bad\", \"__run_num__\": 2}}}")))))
+      (let ((changes (monk-check agg m)))
+        (should (= 1 (length calls)))
+        (should (member "state.high" (car calls)))
+        (should (member "test=True" (car calls)))
+        (should (equal '("/x" "bad") (mapcar #'car (plist-get changes :salt-high))))
+        (should (equal "Symlink /x to /y is set for creation"
+                       (plist-get (monk-resource-disaggregate agg a changes) :salt)))
+        (should (null (monk-resource-disaggregate agg b changes)))
+        (should (string-match-p "Failure" (plist-get (monk-resource-disaggregate agg c changes) :salt)))))))
+
+(ert-deftest monk-test-salt-state-functions-cached ()
+  (require 'monk-bridge)
+  (let ((m (monk-test-machine)) (calls 0))
+    (cl-letf (((symbol-function 'monk-exec)
+               (lambda (&rest _)
+                 (cl-incf calls)
+                 (monk-exec-create :exit-code 0 :output "{\"local\": [\"file.managed\", \"file.symlink\"]}"))))
+      (let ((monk--current-run (monk-run-create)))
+        (should (equal '("file.managed" "file.symlink") (monk-salt-state-functions m)))
+        (should (equal '("file.managed" "file.symlink") (monk-salt-state-functions m)))
+        (should (= 1 calls))))))
+
+(ert-deftest monk-test-salt-matcher-to-cell ()
+  (require 'monk-bridge)
+  (dolist (case '(("G@os_family:Debian" . (= (fact os-family) "Debian"))
+                  ("G@os_family:MacOS" . (= (fact os-family) "Darwin"))
+                  ("G@kernel:Darwin" . (class darwin))
+                  ("G@os:Deb*" . (match (fact distribution) "\\`Deb.*\\'"))
+                  ("P@os:(Ubuntu|Debian)" . (match (fact distribution) "\\`(Ubuntu|Debian)"))
+                  ("I@role:web" . (= (var role) "web"))
+                  ("J@role:w.b" . (match (var role) "\\`w.b"))
+                  ("L@a,b" . (in (name) (list "a" "b")))
+                  ("E@web.*" . (match (name) "\\`web.*"))
+                  ("N@webs" . (group webs))
+                  ("web*" . (match (name) "\\`web.*\\'"))
+                  ("kamen" . (= (name) "kamen"))
+                  ("G@os_family:Debian and not L@a,b"
+                   . (and (= (fact os-family) "Debian") (not (in (name) (list "a" "b")))))
+                  ("( G@os:Ubuntu or G@os:Debian ) and I@role:web"
+                   . (and (or (= (fact distribution) "Ubuntu") (= (fact distribution) "Debian"))
+                          (= (var role) "web")))
+                  ("G@os_family:Debian not N@skip"
+                   . (and (= (fact os-family) "Debian") (not (group skip))))))
+    (should (equal (cdr case) (monk-salt-matcher-to-cell (car case)))))
+  (should-error (monk-salt-matcher-to-cell "S@10.0.0.0/8") :type 'monk-guard-error)
+  (should-error (monk-salt-matcher-to-cell "G@nokey") :type 'monk-guard-error)
+  (should-error (monk-salt-matcher-to-cell "( G@a:b") :type 'monk-guard-error)
+  ;; the translation evaluates
+  (let ((machines (monk-test-cell-machines)))
+    (should (equal "kamen" (monk-test-cell-names (monk-salt-matcher-to-cell "G@os_family:Debian") machines)))
+    (should (equal "foxy,moi" (monk-test-cell-names (monk-salt-matcher-to-cell "G@kernel:Darwin and not L@kamen") machines)))))
+
+(ert-deftest monk-test-bridge-parse-json-skips-noise ()
+  (require 'monk-bridge)
+  (should (equal '((local . 1)) (monk-bridge--parse-json "[ERROR   ] tls import failed\n{\"local\": 1}")))
+  (should (null (monk-bridge--parse-json "garbage"))))
 
 ;;;; Plan and apply
 
@@ -1641,7 +1931,7 @@ this suite reports inotify and delivers nothing."
         (should-not (monk-run-dry-run back))
         (should (string-match-p "\"status\":\"repaired\"" (nth 1 lines)))
         (should (string-match-p "\"changed\":true" (nth 1 lines)))
-        (should (string-match-p "\"rgi\":1" (car lines)))))))
+        (should (string-match-p (format "\"rgi\":%d" monk-event-version) (car lines)))))))
 
 (ert-deftest monk-test-event-jsonable ()
   (should (equal "sym" (monk-event--jsonable 'sym)))
@@ -2314,6 +2604,8 @@ refuses to run from a side window."
     (should (monk-cell-eval pi '(ends-with (fact distribution) "bian")))
     (should (monk-cell-eval pi '(contains (fact distribution) "asp")))
     (should (monk-cell-eval pi '(match (fact kernel) "^Lin")))
+    (let ((case-fold-search t))
+      (should-not (monk-cell-eval pi '(match (fact kernel) "^lin"))))
     (should (equal 4 (monk-cell-eval mac '(size "abcd"))))
     (should (equal 2 (monk-cell-eval mac '(size (groups)))))
     (should (equal 7 (monk-cell-eval mac '(+ 3 4))))
@@ -2537,6 +2829,422 @@ refuses to run from a side window."
         (should (search-forward "repaired" nil t)))
       (kill-buffer detail)
       (kill-buffer (monk-ui--buffer)))))
+
+;;;; Salt items: tags, result hook, watch suppression, folds
+
+(ert-deftest monk-test-event-tags ()
+  "Every event carries a /-joined tag; names never go into tags."
+  (should (equal "monk/run/r1/prog/host/3" (monk-event-tag "run" "r1" "prog" "host" 3)))
+  (should (equal "monk/drift/h" (monk-event-tag "drift" "h" nil)))
+  (should (equal "monk/x/a_b" (monk-event-tag "x" "a/b")))
+  (should (monk-event-tag-matches-p "monk/run" "monk/run/r1/end"))
+  (should-not (monk-event-tag-matches-p "monk/run" "monk/runs/r1"))
+  (monk-test-with-tmpdir dir
+    (let* ((run (monk-test-converge (lambda (_m) (monk-directory (concat dir "d")))))
+           (events (monk-run-events run))
+           (id (monk-run-id run)))
+      (should (equal (list (format "monk/run/%s/new" id)
+                           (format "monk/run/%s/prog/testbox/0" id)
+                           (format "monk/run/%s/end" id))
+                     (mapcar (lambda (e) (alist-get 'tag e)) events)))
+      (should (eql 0 (alist-get 'seq (nth 1 events))))
+      (should (equal (format "monk/drift/testbox")
+                     (alist-get 'tag (monk-event-drift '("testbox" . "~/x") "/x" 'changed))))
+      (should (equal "changed" (alist-get 'change (monk-event-drift '("testbox" . "~/x") "/x" 'changed))))
+      (should (equal (format "monk/run/%s/pass/2" id) (alist-get 'tag (monk-event-pass run 2 1)))))))
+
+(ert-deftest monk-test-result-functions-hook ()
+  "Each finished result reaches `monk-result-functions' with the run."
+  (monk-test-with-tmpdir dir
+    (let* ((seen nil)
+           (monk-result-functions
+            (list (lambda (result run) (push (cons (monk-result-name result) (and run t)) seen))
+                  (lambda (&rest _) (error "boom"))))
+           (monk-log-level nil))
+      (monk-test-converge (lambda (_m)
+                            (monk-directory (concat dir "a"))
+                            (monk-directory (concat dir "b")))
+                          :passes 1)
+      (should (equal (list (cons (concat dir "a") t) (cons (concat dir "b") t))
+                     (reverse seen))))))
+
+(ert-deftest monk-test-watch-suppressed-during-any-run ()
+  "Events during a run that the watch did not start are ignored."
+  (require 'monk-watch)
+  (let ((w (monk-watch-create :machines nil :policy #'ignore)))
+    (setf (monk-watch-last-run-end w) 0.0)
+    (let ((monk-watch-settle 0.0))
+      (should-not (monk-watch--suppressed-p w))
+      (let ((monk--current-run (monk-run-create)))
+        (should (monk-watch--suppressed-p w))))))
+
+(ert-deftest monk-test-ui-detail-folds-kept ()
+  "kept and skipped groups start folded; repaired starts open."
+  (require 'monk-ui)
+  (monk-test-with-tmpdir dir
+    (let ((run (monk-test-converge
+                (lambda (_m)
+                  (monk-directory (concat dir "d"))
+                  (monk-directory (concat dir "e") :classes '(mars))))))
+      ;; second run: d kept
+      (setq run (monk-test-converge
+                 (lambda (_m)
+                   (monk-directory (concat dir "d"))
+                   (monk-directory (concat dir "new"))
+                   (monk-directory (concat dir "e") :classes '(mars)))))
+      (with-temp-buffer
+        (monk-ui-mode)
+        (setq monk-ui--run run)
+        (save-window-excursion (monk-ui-show-machine "testbox"))
+        (with-current-buffer (format monk-ui-detail-buffer-format "testbox")
+          (goto-char (point-min))
+          (search-forward "repaired (1)")
+          (forward-line 1)
+          (should-not (get-text-property (point) 'invisible))
+          (goto-char (point-min))
+          (search-forward "kept (1)")
+          (should (looking-at ".*TAB to expand"))
+          (forward-line 1)
+          (should (get-text-property (point) 'invisible))
+          (goto-char (point-min))
+          (search-forward "skipped (1)")
+          (forward-line 1)
+          (should (get-text-property (point) 'invisible)))
+        (kill-buffer (format monk-ui-detail-buffer-format "testbox"))))))
+
+(ert-deftest monk-test-history-events-and-seq ()
+  "Results carry seq and pass; the run-end event is recorded and queryable by prefix."
+  (monk-test-with-history
+    (monk-test-with-tmpdir dir
+      (let* ((run (monk-test-converge (lambda (_m)
+                                        (monk-directory (concat dir "a"))
+                                        (monk-directory (concat dir "b")))))
+             (rows (monk-history-results :run (monk-run-id run))))
+        (should (equal '(0 1) (mapcar (lambda (r) (alist-get 'seq r)) rows)))
+        (should (equal (list (monk-run-passes run) (monk-run-passes run))
+                       (mapcar (lambda (r) (alist-get 'pass r)) rows)))
+        (let ((events (monk-history-events "monk/run")))
+          (should (= 1 (length events)))
+          (should (equal (format "monk/run/%s/end" (monk-run-id run)) (alist-get 'tag (car events))))
+          (should (equal "run-end" (alist-get 'event (alist-get 'data (car events))))))
+        (should (null (monk-history-events "monk/drift")))
+        (monk-history-record-event (monk-event-drift '("testbox" . "~/x") "/x" 'changed))
+        (should (= 1 (length (monk-history-events "monk/drift/testbox"))))))))
+
+;;;; Salt items: prereq, listen, retry, verify, order, available, mock, fatal, handled, aggregate
+
+(ert-deftest monk-test-prereq-runs-only-when-target-would-change ()
+  "A :prereq resource runs before its target and only when the target would change."
+  (monk-test-with-tmpdir dir
+    (let* ((log (concat dir "log"))
+           (policy (lambda (_m)
+                     (monk-command "before" "sh"
+                                   :args (list "-c" (format "echo before >> %s" log))
+                                   :creates (concat dir "never")
+                                   :prereq (list (concat dir "conf")))
+                     (monk-file (concat dir "conf") :content "v1\n")))
+           (first (monk-test-converge policy :passes 1))
+           (second (monk-test-converge policy :passes 1)))
+      ;; order: before ran ahead of conf
+      (should (equal (list "before" (concat dir "conf"))
+                     (list (monk-result-name (car (monk-run-results first)))
+                           (monk-result-name (cadr (monk-run-results first))))))
+      (should (eq 'repaired (monk-test-status first "before")))
+      (should (eq 'repaired (monk-test-status first (concat dir "conf"))))
+      (should (equal "before\n" (with-temp-buffer (insert-file-contents log) (buffer-string))))
+      ;; second run: conf is kept, so before is skipped with the prereq reason
+      (should (eq 'skipped (monk-test-status second "before")))
+      (should (equal monk-skip-prereq (monk-result-comment (monk-test-result second "before"))))
+      (should (equal "before\n" (with-temp-buffer (insert-file-contents log) (buffer-string)))))))
+
+(ert-deftest monk-test-prereq-ignores-a-target-that-is-itself-skipped ()
+  "Salt #68438: a target skipped by its own guard does not fire the prereq."
+  (monk-test-with-tmpdir dir
+    (let ((run (monk-test-converge
+                (lambda (_m)
+                  (monk-directory (concat dir "before") :prereq (list (concat dir "conf")))
+                  (monk-file (concat dir "conf") :content "x\n" :classes '(mars)))
+                :passes 1)))
+      (should (eq 'skipped (monk-test-status run (concat dir "before"))))
+      (should (eq 'skipped (monk-test-status run (concat dir "conf")))))))
+
+(ert-deftest monk-test-prereq-dry-run ()
+  "In a plan, a prereq resource is would-repair only when its target would change."
+  (monk-test-with-tmpdir dir
+    (let* ((m (monk-test-machine)) (monk-log-level nil)
+           (policy (lambda (_m)
+                     (monk-directory (concat dir "before") :prereq (list (concat dir "conf")))
+                     (monk-file (concat dir "conf") :content "x\n")))
+           (plan (monk-plan m policy)))
+      (should (eq 'would-repair (monk-test-status plan (concat dir "before"))))
+      (should-not (file-directory-p (concat dir "before"))))))
+
+(ert-deftest monk-test-listen-fires-once-after-convergence ()
+  "Two watched files change across two passes; the listener acts once."
+  (monk-test-with-tmpdir dir
+    (let* ((count (concat dir "restarts"))
+           (policy (lambda (_m)
+                     (monk-file (concat dir "a.conf") :content "a\n")
+                     ;; b depends on a so it repairs in the same pass but later;
+                     ;; either way, the listener must fire exactly once.
+                     (monk-file (concat dir "b.conf") :content "b\n" :require (list (concat dir "a.conf")))
+                     (monk-command "svc" "sh"
+                                   :args (list "-c" (format "echo r >> %s" count))
+                                   :listen (list (concat dir "a.conf") (concat dir "b.conf")))))
+           (run (monk-test-converge policy)))
+      (should (eq 'repaired (monk-test-status run "svc")))
+      (should (string-match-p "listen: .*a.conf.*b.conf" (monk-result-comment (monk-test-result run "svc"))))
+      (should (= 1 (with-temp-buffer (insert-file-contents count) (count-lines 1 (point-max)))))
+      ;; nothing changed: the listener stays kept
+      (let ((again (monk-test-converge policy)))
+        (should (eq 'kept (monk-test-status again "svc")))
+        (should (= 1 (with-temp-buffer (insert-file-contents count) (count-lines 1 (point-max)))))))))
+
+(ert-deftest monk-test-listen-gates-like-require ()
+  "A listener whose ref failed is skipped, and does not fire."
+  (monk-test-with-tmpdir dir
+    (let ((run (monk-test-converge
+                (lambda (_m)
+                  (monk-line-in-file (concat dir "missing") "x")
+                  (monk-command "svc" "true" :listen (list (concat dir "missing#x")))))))
+      (should (eq 'skipped (monk-test-status run "svc"))))))
+
+(ert-deftest monk-test-retry-until-success-with-backoff ()
+  "A resource that fails twice then succeeds is repaired on the third try."
+  (monk-test-with-tmpdir dir
+    (let* ((tries 0) (waits nil)
+           (monk-log-level nil))
+      (cl-letf (((symbol-function 'sit-for) (lambda (secs &rest _) (push secs waits) t)))
+        (let ((run (monk-test-converge
+                    (lambda (_m)
+                      (monk-command "flaky" "sh"
+                                    :args (list "-c" (format "test -e %s/ok" dir))
+                                    :creates (concat dir "never")
+                                    :retry '(:attempts 3 :interval 1 :backoff 2))))))
+          (ignore tries)
+          (should (eq 'failed (monk-test-status run "flaky")))
+          (should (string-match-p "attempt 3 of 3" (monk-result-comment (monk-test-result run "flaky"))))
+          (should (equal '(1.0 2.0) (reverse waits)))))
+      (with-temp-file (concat dir "ok") (insert ""))
+      (let ((run (monk-test-converge
+                  (lambda (_m)
+                    (monk-command "flaky" "sh"
+                                  :args (list "-c" (format "test -e %s/ok" dir))
+                                  :creates (concat dir "never")
+                                  :retry '(:attempts 3 :interval 0))))))
+        (should (eq 'repaired (monk-test-status run "flaky")))
+        (should-not (string-match-p "attempt" (or (monk-result-comment (monk-test-result run "flaky")) "")))))))
+
+(ert-deftest monk-test-retry-defaults-and-cap ()
+  (let ((r (monk-command-resource :name "x" :program "true" :retry t)))
+    (should (equal 2 (plist-get (monk--retry-plan r) :attempts)))
+    (should (equal 30 (plist-get (monk--retry-plan r) :interval)))
+    (should (eq 'success (plist-get (monk--retry-plan r) :until))))
+  (let ((r (monk-command-resource :name "x" :program "true" :retry '(:attempts 5 :interval 1000))))
+    (should (equal 5 (plist-get (monk--retry-plan r) :attempts)))
+    (cl-letf (((symbol-function 'sit-for) (lambda (secs &rest _) secs)))
+      (should (= monk-retry-max-interval (monk--retry-wait (monk--retry-plan r) 2)))))
+  (should (null (monk--retry-plan (monk-command-resource :name "x" :program "true")))))
+
+(ert-deftest monk-test-retry-dry-run-only-reports ()
+  (monk-test-with-tmpdir dir
+    (let* ((m (monk-test-machine)) (monk-log-level nil) (waits nil))
+      (cl-letf (((symbol-function 'sit-for) (lambda (secs &rest _) (push secs waits) t)))
+        (let ((plan (monk-plan m (lambda (_m) (monk-directory (concat dir "d") :retry '(:attempts 4))))))
+          (should (eq 'would-repair (monk-test-status plan (concat dir "d"))))
+          (should (string-match-p "retry up to 4" (monk-result-comment (monk-test-result plan (concat dir "d")))))
+          (should (null waits)))))))
+
+(ert-deftest monk-test-verify-fails-a-command-after-it-ran ()
+  "A :verify that exits non-zero turns a successful command into a failure."
+  (monk-test-with-tmpdir dir
+    (let ((run (monk-test-converge
+                (lambda (_m)
+                  (monk-command "bad" "true" :creates (concat dir "never")
+                                :verify '("sh" "-c" "echo nope; exit 3"))
+                  (monk-command "good" "true" :creates (concat dir "never")
+                                :verify (lambda (_m) nil))
+                  (monk-command "fn" "true" :creates (concat dir "never")
+                                :verify (lambda (_m) "state is wrong")))
+                :passes 1)))
+      (should (eq 'failed (monk-test-status run "bad")))
+      (should (string-match-p "verify failed: sh exited 3: nope" (monk-result-comment (monk-test-result run "bad"))))
+      (should (eq 'repaired (monk-test-status run "good")))
+      (should (eq 'failed (monk-test-status run "fn")))
+      (should (string-match-p "state is wrong" (monk-result-comment (monk-test-result run "fn")))))))
+
+(ert-deftest monk-test-order-first-and-last ()
+  "`:order' breaks ties; requisites still win."
+  (monk-test-with-tmpdir dir
+    (let* ((run (monk-test-converge
+                 (lambda (_m)
+                   (monk-directory (concat dir "b"))
+                   (monk-directory (concat dir "z") :order 'last)
+                   (monk-directory (concat dir "a") :order 'first)
+                   (monk-directory (concat dir "after-z") :require (list (concat dir "z"))))
+                 :passes 1))
+           (names (mapcar (lambda (r) (file-name-nondirectory (monk-result-name r)))
+                          (monk-run-results run))))
+      (should (equal '("a" "b" "z" "after-z") names))))
+  (should-error (monk-test-converge (lambda (_m) (monk-directory "~/x" :order 'middle)))
+                :type 'monk-policy-error))
+
+(ert-deftest monk-test-available-p-skips-with-reason ()
+  "A resource type that is not available here is skipped, not failed."
+  (let* ((m (monk-test-machine))
+         (monk-log-level nil)
+         (run (cl-letf (((symbol-function 'monk-exec)
+                         (lambda (_m program &rest args)
+                           (if (and (equal program "sh") (seq-some (lambda (a) (string-match-p "command -v" a)) args))
+                               (monk-exec-create :exit-code 1 :output "")
+                             (monk-exec-create :exit-code 0 :output "")))))
+                (monk-converge m (lambda (_m)
+                                   (monk-brew "b" '("jq") :classes nil)
+                                   (monk-apt "a" '("jq") :classes nil))
+                               :passes 1))))
+    (should (eq 'skipped (monk-test-status run "b")))
+    (should (equal "brew is not on this machine" (monk-result-comment (monk-test-result run "b"))))
+    (should (eq 'skipped (monk-test-status run "a")))
+    (should (monk-run-ok-p run))))
+
+(ert-deftest monk-test-mock-run-calls-nothing ()
+  "A mock run orders the graph and evaluates requisites without touching the host."
+  (monk-test-with-tmpdir dir
+    (let* ((m (monk-test-machine)) (monk-log-level nil)
+           (checked nil)
+           (run (cl-letf (((symbol-function 'monk-check)
+                           (lambda (&rest _) (setq checked t) nil)))
+                  (monk-orchestrate (list m)
+                                    (lambda (_m)
+                                      (monk-directory (concat dir "a"))
+                                      (monk-directory (concat dir "b") :require (list (concat dir "a")))
+                                      (monk-directory (concat dir "c") :onchanges (list (concat dir "a"))))
+                                    :mock t))))
+      (should-not checked)
+      (should (monk-run-mock run))
+      (should (= 1 (monk-run-passes run)))
+      (should (equal (list monk-comment-mocked monk-comment-mocked "onchanges: nothing changed")
+                     (mapcar #'monk-result-comment (monk-run-results run))))
+      (should-not (file-directory-p (concat dir "a"))))))
+
+(ert-deftest monk-test-fatal-stops-only-its-machine ()
+  "A :fatal failure skips the rest of that machine; other machines finish."
+  (monk-test-with-tmpdir dir
+    (let* ((machines (monk-test-machines "a" "b"))
+           (monk-log-level nil)
+           (run (monk-orchestrate
+                 machines
+                 (lambda (m)
+                   (when (equal (oref m name) "a")
+                     (monk-line-in-file (concat dir "missing") "x" :fatal t))
+                   (monk-directory (concat dir (oref m name) "-after")))
+                 :passes 1)))
+      (should (eq monk-status-failed (monk-result-status (monk-run-result run (cons "a" (concat dir "missing#x"))))))
+      (should (eq monk-status-skipped (monk-result-status (monk-run-result run (cons "a" (concat dir "a-after"))))))
+      (should (equal monk-skip-fatal (monk-result-comment (monk-run-result run (cons "a" (concat dir "a-after"))))))
+      (should (eq monk-status-repaired (monk-result-status (monk-run-result run (cons "b" (concat dir "b-after"))))))
+      (should-not (file-directory-p (concat dir "a-after"))))))
+
+(ert-deftest monk-test-handled-onfail-rescues ()
+  "A successful :onfail handler with :handled t makes the run ok."
+  (monk-test-with-tmpdir dir
+    (let ((run (monk-test-converge
+                (lambda (_m)
+                  (monk-line-in-file (concat dir "missing") "x")
+                  (monk-directory (concat dir "rescue") :onfail (list (concat dir "missing#x")) :handled t))
+                :passes 1)))
+      (should (eq 'failed (monk-test-status run (concat dir "missing#x"))))
+      (should (eq 'repaired (monk-test-status run (concat dir "rescue"))))
+      (should (equal (list (cons "testbox" (concat dir "missing#x"))) (monk-run-rescued run)))
+      (should (monk-run-ok-p run)))
+    ;; without :handled the failure still counts
+    (let ((run (monk-test-converge
+                (lambda (_m)
+                  (monk-line-in-file (concat dir "missing2") "x")
+                  (monk-directory (concat dir "rescue2") :onfail (list (concat dir "missing2#x"))))
+                :passes 1)))
+      (should-not (monk-run-ok-p run)))))
+
+(ert-deftest monk-test-run-context-cache ()
+  "The run context caches per run and is gone after it."
+  (should (null (monk-run-context-get 'x)))
+  (let ((calls 0))
+    (monk-test-with-tmpdir dir
+      (monk-test-converge
+       (lambda (_m)
+         (monk-command "c1" "true" :creates (concat dir "n")
+                       :verify (lambda (_m) (monk-with-run-cache '(k) (cl-incf calls) nil)))
+         (monk-command "c2" "true" :creates (concat dir "n")
+                       :verify (lambda (_m) (monk-with-run-cache '(k) (cl-incf calls) nil))))
+       :passes 1))
+    ;; nil results are not cached (the macro uses `or'), so both compute;
+    ;; with a non-nil value the second call hits the cache
+    (should (= 2 calls)))
+  (let ((calls 0))
+    (monk-test-with-tmpdir dir
+      (monk-test-converge
+       (lambda (_m)
+         (monk-command "c1" "true" :creates (concat dir "n")
+                       :verify (lambda (_m) (monk-with-run-cache '(k) (cl-incf calls) 'seen) nil))
+         (monk-command "c2" "true" :creates (concat dir "n")
+                       :verify (lambda (_m) (monk-with-run-cache '(k) (cl-incf calls) 'seen) nil)))
+       :passes 1))
+    (should (= 1 calls)))
+  (should (null monk--current-run)))
+
+(ert-deftest monk-test-class-init-runs-once-per-machine ()
+  "apt-get update runs once per run per machine, before the first apt resource."
+  (let* ((machines (monk-test-machines "a" "b"))
+         (monk-log-level nil)
+         (updates nil)
+         (run (cl-letf (((symbol-function 'monk-exec)
+                         (lambda (m program &rest args)
+                           (cond
+                            ((member "update" args)
+                             (push (oref m name) updates)
+                             (monk-exec-create :exit-code 0 :output ""))
+                            ((equal program "dpkg-query")
+                             (monk-exec-create :exit-code 0 :output "jq installed\ncurl installed\n"))
+                            (t (monk-exec-create :exit-code 0 :output ""))))))
+                (monk-orchestrate machines
+                                  (lambda (_m)
+                                    (monk-apt "one" '("jq") :classes nil)
+                                    (monk-apt "two" '("curl") :classes nil))
+                                  :passes 1))))
+    (ignore run)
+    (should (equal '("a" "b") (sort updates #'string<)))
+    (should (= 2 (length updates)))))
+
+(ert-deftest monk-test-aggregate-merges-independent-apt-resources ()
+  "Two apt resources with no requisite between them install in one call."
+  (let* ((m (monk-test-machine))
+         (monk-log-level nil)
+         (installs nil)
+         (monk-apt-update nil)
+         (run (cl-letf (((symbol-function 'monk-exec)
+                         (lambda (_m program &rest args)
+                           (cond
+                            ((equal program "dpkg-query")
+                             (monk-exec-create :exit-code 0 :output "a installed\n"))
+                            ((member "install" args)
+                             (push (seq-take-while #'stringp (cdr (member "-q" args))) installs)
+                             (monk-exec-create :exit-code 0 :output ""))
+                            (t (monk-exec-create :exit-code 0 :output ""))))))
+                (monk-converge m (lambda (_m)
+                                   (monk-apt "set1" '("a" "b") :classes nil)
+                                   (monk-apt "set2" '("c") :classes nil)
+                                   (monk-directory "/tmp" :require '("set1"))
+                                   (monk-apt "set3" '("d") :classes nil :require '("/tmp")))
+                               :passes 1))))
+    ;; set1 and set2 merged; set3 depends transitively on set1 so it ran alone
+    (should (= 2 (length installs)))
+    (should (equal '("b" "c") (sort (copy-sequence (car (last installs))) #'string<)))
+    (should (equal '("d") (car installs)))
+    (should (eq 'repaired (monk-test-status run "set1")))
+    (should (equal '(:install ("b") :degree 0.5) (monk-result-changes (monk-test-result run "set1"))))
+    (should (eq 'repaired (monk-test-status run "set2")))
+    (should (string-match-p "aggregated with 1 other" (monk-result-comment (monk-test-result run "set2"))))
+    (should (eq 'repaired (monk-test-status run "set3")))))
 
 ;;;; History
 

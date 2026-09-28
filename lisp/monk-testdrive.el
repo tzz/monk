@@ -60,6 +60,9 @@
 (require 'monk-agent)
 (require 'filenotify)
 (require 'vc-git)
+(require 'monk-package)
+(require 'monk-bridge)
+(require 'monk-sync)
 
 ;; The drive checks history when monk-history is loaded; it needs an
 ;; Emacs with SQLite, so it is not required here.
@@ -751,12 +754,152 @@ so `~' in the policy lands there."
       (when (get-buffer (format monk-ui-detail-buffer-format "drive"))
         (kill-buffer (format monk-ui-detail-buffer-format "drive"))))))
 
+(defun monk-testdrive--section-salt ()
+  "The requisites and run features borrowed from Salt."
+  (monk-testdrive--out "\n## Salt-style features")
+  (let ((m (monk-testdrive--machine)))
+    (monk-testdrive--step "salt" "prereq runs before its target, only when the target would change"
+      (let* ((log (monk-testdrive--path "prereq.log"))
+             (policy (lambda (_m)
+                       (monk-command "stop-first" "sh"
+                                     :args (list "-c" (format "echo stop >> %s" log))
+                                     :creates "~/never"
+                                     :prereq '("~/app.bin"))
+                       (monk-file "~/app.bin" :content "v2\n")))
+             (first (monk-converge m policy :passes 1))
+             (second (monk-converge m policy :passes 1)))
+        (monk-testdrive--checks
+         (cons (equal '("stop-first" "~/app.bin") (mapcar #'monk-result-name (monk-run-results first)))
+               (format "order %S" (mapcar #'monk-result-name (monk-run-results first))))
+         (cons (eq monk-status-repaired (monk-result-status (monk-run-result first '("drive" . "stop-first"))))
+               "prereq did not run before a change")
+         (cons (eq monk-status-skipped (monk-result-status (monk-run-result second '("drive" . "stop-first"))))
+               "prereq ran when nothing would change")
+         (cons (equal "stop\n" (monk-testdrive--text "prereq.log")) "log has more than one line"))))
+    (monk-testdrive--step "salt" "listen restarts once after two changes across passes"
+      (let* ((count (monk-testdrive--path "restarts"))
+             (policy (lambda (_m)
+                       (monk-file "~/svc/a.conf" :content "a\n")
+                       (monk-file "~/svc/b.conf" :content "b\n" :require '("~/svc/a.conf"))
+                       (monk-command "svc" "sh" :args (list "-c" (format "echo r >> %s" count))
+                                     :listen '("~/svc/a.conf" "~/svc/b.conf"))))
+             (run (monk-converge m policy)))
+        (monk-testdrive--checks
+         (cons (eq monk-status-repaired (monk-result-status (monk-run-result run '("drive" . "svc")))) "listener kept")
+         (cons (equal "r\n" (monk-testdrive--text "restarts"))
+               (format "restarts: %S" (monk-testdrive--text "restarts"))))))
+    (monk-testdrive--step "salt" "retry with backoff, then verify after repair"
+      (let ((waits nil))
+        (cl-letf (((symbol-function 'sit-for) (lambda (secs &rest _) (push secs waits) t)))
+          (let ((run (monk-converge
+                      m (lambda (_m)
+                          (monk-command "flaky" "sh" :args '("-c" "false") :creates "~/never"
+                                        :retry '(:attempts 3 :interval 1 :backoff 3))
+                          (monk-command "checked" "true" :creates "~/never"
+                                        :verify '("sh" "-c" "exit 7")))
+                      :passes 1)))
+            (monk-testdrive--checks
+             (cons (equal '(1.0 3.0) (reverse waits)) (format "waits %S" (reverse waits)))
+             (cons (string-match-p "attempt 3 of 3" (monk-result-comment (monk-run-result run '("drive" . "flaky"))))
+                   "no attempt count in the comment")
+             (cons (eq monk-status-failed (monk-result-status (monk-run-result run '("drive" . "checked"))))
+                   "verify did not fail the command")
+             (cons (string-match-p "verify failed: sh exited 7"
+                                   (monk-result-comment (monk-run-result run '("drive" . "checked"))))
+                   "verify reason missing"))))))
+    (monk-testdrive--step "salt" "mock run touches nothing and keeps the order"
+      (let ((run (monk-orchestrate (list m)
+                                   (lambda (_m)
+                                     (monk-directory "~/mocked-dir")
+                                     (monk-file "~/mocked-dir/f" :content "x\n" :require '("~/mocked-dir"))
+                                     (monk-command "h" "true" :onchanges '("~/mocked-dir/f")))
+                                   :mock t)))
+        (monk-testdrive--checks
+         (cons (equal (list monk-comment-mocked monk-comment-mocked "onchanges: nothing changed")
+                      (mapcar #'monk-result-comment (monk-run-results run)))
+               (format "comments %S" (mapcar #'monk-result-comment (monk-run-results run))))
+         (cons (not (file-exists-p (monk-testdrive--path "mocked-dir"))) "mock created a directory")
+         (cons (= 1 (monk-run-passes run)) "mock ran more than one pass"))))
+    (monk-testdrive--step "salt" ":fatal ends its machine, :handled rescues a failure"
+      (let* ((machines (list m (let ((o (monk-local-machine :name "other")))
+                                 (oset o facts (oref m facts))
+                                 (oset o classes (monk-hard-classes o))
+                                 o)))
+             (run (monk-orchestrate
+                   machines
+                   (lambda (mm)
+                     (when (equal (oref mm name) "drive")
+                       (monk-line-in-file "~/absent" "x" :fatal t)
+                       (monk-directory "~/after-fatal"))
+                     (monk-line-in-file "~/absent2" "y")
+                     (monk-directory "~/rescue" :onfail '("~/absent2#y") :handled t))
+                   :passes 1)))
+        (monk-testdrive--checks
+         (cons (equal monk-skip-fatal (monk-result-comment (monk-run-result run '("drive" . "~/after-fatal"))))
+               "after-fatal was not skipped")
+         (cons (eq monk-status-repaired (monk-result-status (monk-run-result run '("other" . "~/rescue"))))
+               "rescue on other did not run")
+         (cons (member '("other" . "~/absent2#y") (monk-run-rescued run)) "absent2 on other not rescued")
+         (cons (not (monk-run-ok-p run)) "run ok despite the unhandled fatal failure on drive"))))
+    (monk-testdrive--step "salt" "availability: a brew resource on a host without brew is skipped"
+      (if (executable-find "brew")
+          (cons 'SKIP "brew is installed here")
+        (let ((run (monk-converge m (lambda (_m) (monk-brew "tools" '("jq") :classes nil)) :passes 1)))
+          (monk-testdrive--checks
+           (cons (eq monk-status-skipped (monk-result-status (monk-run-result run '("drive" . "tools")))) "not skipped")
+           (cons (equal "brew is not on this machine" (monk-result-comment (monk-run-result run '("drive" . "tools"))))
+                 (format "comment %S" (monk-result-comment (monk-run-result run '("drive" . "tools")))))))))
+    (monk-testdrive--step "salt" "events carry tags; results carry seq"
+      (let* ((run (monk-converge m #'monk-testdrive--policy :passes 1))
+             (events (monk-run-events run))
+             (id (monk-run-id run)))
+        (monk-testdrive--checks
+         (cons (equal (format "monk/run/%s/new" id) (alist-get 'tag (car events))) "no new tag")
+         (cons (equal (format "monk/run/%s/prog/drive/0" id) (alist-get 'tag (nth 1 events))) "no prog tag")
+         (cons (equal (format "monk/run/%s/end" id) (alist-get 'tag (car (last events)))) "no end tag"))))
+    (monk-testdrive--step "salt" "rsync mirrors a tree, deletes strays, then is kept"
+      (if (not (executable-find monk-rsync-program))
+          (cons 'SKIP "no rsync on this host")
+        (let* ((policy (lambda (_m)
+                         (monk-directory "~/mirror-src/sub")
+                         (monk-file "~/mirror-src/a" :content "a\n" :require '("~/mirror-src/sub"))
+                         (monk-file "~/mirror-src/sub/b" :content "b\n" :require '("~/mirror-src/sub"))
+                         (monk-rsync "mirror" '("~/mirror-src/") "~/mirror-dst/" :archive t :delete t
+                                     :require '("~/mirror-src/a" "~/mirror-src/sub/b"))))
+               (_ (progn (make-directory (monk-testdrive--path "mirror-dst") t)
+                         (with-temp-file (monk-testdrive--path "mirror-dst/stray") (insert "x\n"))))
+               (first (monk-converge m policy))
+               (second (monk-converge m policy :passes 1))
+               (dead (monk-converge m (lambda (_m)
+                                        (monk-rsync "away" '("~/mirror-src/") "nowhere.invalid:x/"
+                                                    :reachable "nowhere.invalid"))
+                                    :passes 1)))
+          (monk-testdrive--checks
+           (cons (eq monk-status-repaired (monk-result-status (monk-run-result first '("drive" . "mirror"))))
+                 "mirror not repaired")
+           (cons (equal "b\n" (monk-testdrive--text "mirror-dst/sub/b")) "b did not arrive")
+           (cons (not (file-exists-p (monk-testdrive--path "mirror-dst/stray"))) "stray not deleted")
+           (cons (eq monk-status-kept (monk-result-status (monk-run-result second '("drive" . "mirror"))))
+                 "second run not kept")
+           (cons (eq monk-status-skipped (monk-result-status (monk-run-result dead '("drive" . "away"))))
+                 "unreachable destination did not skip")
+           (cons (equal "nowhere.invalid is not reachable"
+                        (monk-result-comment (monk-run-result dead '("drive" . "away"))))
+                 (format "reason %S" (monk-result-comment (monk-run-result dead '("drive" . "away")))))))))
+    (monk-testdrive--step "salt" "compound matcher translates to CELL and selects machines"
+      (let ((form (monk-salt-matcher-to-cell "G@kernel:Linux and not L@nobody")))
+        (monk-testdrive--checks
+         (cons (equal '(and (class linux) (not (in (name) (list "nobody")))) form) (format "%S" form))
+         (cons (equal '("drive") (mapcar (lambda (x) (oref x name)) (monk-cell-select form (list m))))
+               "drive did not match"))))))
+
 (defconst monk-testdrive--sections
   '(("Converge" monk-testdrive--section-converge)
     ("Plan and apply" monk-testdrive--section-plan)
     ("Requisites and convergence" monk-testdrive--section-graph)
     ("Guards and failures" monk-testdrive--section-guards)
     ("Inspect and navigate" monk-testdrive--section-inspect)
+    ("Salt-style features" monk-testdrive--section-salt)
     ("Watch" monk-testdrive--section-watch)
     ("Agent and events" monk-testdrive--section-agent))
   "The drive's sections: (TITLE FUNCTION).")
@@ -840,7 +983,7 @@ so `~' in the policy lands there."
     (monk-ui-show (monk-converge m #'monk-testdrive--policy))
     (monk-testdrive--step "tour" "detail buffer opens with a folded machine line; TAB unfolds"
       (monk-testdrive--focus-detail "drive")
-      (monk-testdrive--ask "Second line reads '▸ drive: N classes, N facts, N vars (TAB to expand)'.  Press TAB on it: does it turn into ▾ with class chips and a facts table under it?  Press q: does the detail close and *monk* stay?"))
+      (monk-testdrive--ask "Second line reads '▸ drive: N classes, N facts, N vars (TAB to expand)'.  Press TAB on it: does it turn into ▾ with class chips and a facts table under it?  Below, is the 'kept (N)' group folded with '(TAB to expand)' while 'repaired' is open?  Press q: does the detail close and *monk* stay?"))
     (monk-testdrive--step "tour" "/ query: matches, explanations, folded facts"
       (monk-testdrive--focus-monk)
       (save-window-excursion (monk-ui-query "'drive' in classes && facts.arch == 'nope'" (list m)))

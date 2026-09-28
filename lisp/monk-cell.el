@@ -214,8 +214,11 @@ Signal `monk-guard-error' for a form that is not CELL."
                                      (monk-cell--string 'contains (monk-cell-eval m (nth 1 form))))
                       t))
       ('match (monk-cell--arity form 2 2)
-              (and (string-match-p (monk-cell--string 'match (monk-cell-eval m (nth 2 form)))
-                                   (monk-cell--string 'match (monk-cell-eval m (nth 1 form))))
+              ;; Case-sensitive on purpose: `case-fold-search' defaults
+              ;; to t and would make a guard depend on the caller's buffer.
+              (and (let ((case-fold-search nil))
+                     (string-match-p (monk-cell--string 'match (monk-cell-eval m (nth 2 form)))
+                                     (monk-cell--string 'match (monk-cell-eval m (nth 1 form)))))
                    t))
       ('size (monk-cell--arity form 1 1)
              (let ((value (monk-cell-eval m (cadr form))))

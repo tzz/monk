@@ -16,18 +16,20 @@ Richer conditions are CELL guards. See [Guards: CELL and CEL](#guards-cell-and-c
 
 Monk runs passes until a pass repairs nothing, with a cap of `monk-max-passes`. A second pass after repairs confirms that the repairs held. A resource that repairs in more than one pass is flapping: a repair that held would be kept afterwards, so a second repair means another resource undid it, or its check and repair disagree. The passes need not be adjacent. With A undoing B, B undoing C, and C undoing A, each repairs every third pass. The classic two-resource case is one that installs a package and one that removes it. The run stops at the second repair of any resource, the report names the flapping resources, and `monk-run-flapping` returns their keys. `monk-max-passes`, default 6, bounds the cycle length Monk can name. When the cap is reached with repairs still happening and no single resource flaps, the report says `did not converge` and `monk-run-oscillating-p` returns non-nil. `monk-run-converged-p` is true only when neither happened.
 
-A failure never stops a run. This is the Salt execution model, not the Ansible one. A failed resource is a result with status `failed`, the pass goes on to the next resource, and only resources that `:require` or `:watch` the failed one skip because of it, with a comment that names the unsatisfied ref. Everything unrelated converges. `monk-run-ok-p` is nil when any result failed.
+A failure never stops a run. This is the Salt execution model, not the Ansible one. A failed resource is a result with status `failed`, the pass goes on to the next resource, and only resources that `:require` or `:watch` the failed one skip because of it, with a comment that names the unsatisfied ref. Everything unrelated converges. `monk-run-ok-p` is nil when any result failed. Two opt-in exceptions: `:fatal t` on a resource ends the pass on its machine when it fails, and other machines go on (Salt's `failhard`, per resource); `:handled t` on an `:onfail` handler makes the failures it handles count as rescued when the handler succeeds, so `monk-run-ok-p` stays true (`monk-run-rescued` lists them).
 
 ## Requisites
 
-Requisites order resources and gate them on results, as in Salt. Every constructor accepts four of them.
+Requisites order resources and gate them on results, as in Salt. Every constructor accepts six of them.
 
 | Keyword | Effect |
 |---|---|
 | `:require REFS` | Run after REFS, and only when they succeeded. |
 | `:watch REFS` | Like `:require`. When a ref changed, run the watch action after the check. A systemd unit restarts. A command runs. Set `:watch-action` to override. |
+| `:listen REFS` | Like `:watch`, but the action runs once, after the run converged, however many refs changed in however many passes. Five config files change, the service restarts once. |
 | `:onchanges REFS` | Run only when a ref changed in this run. |
 | `:onfail REFS` | Run only when a ref failed in this run. |
+| `:prereq REFS` | Run before REFS, and only when one of them would change. Monk checks the refs without repairing them to decide. Stop a service before its binary changes. A ref that is itself skipped does not count. |
 
 A ref names a resource on the same machine, on another machine, or on a group:
 
@@ -81,6 +83,28 @@ A command without `:creates` or `:unless` is always kept. With `:watch` it becom
 ;; monk-watch-mode to autopilot.
 (monk-watch-start (monk-inventory-select 'home) #'my-policy)
 ```
+
+## Run controls
+
+These come from Salt and apply to any resource.
+
+`:retry PLIST` tries a failed check or repair again inside the same pass: `(:attempts 3 :interval 5 :backoff 2 :splay 1 :until success)`. `:attempts` is the total number of tries, `:interval` the wait before try two, each later wait is the previous one times `:backoff`, `:splay` adds up to that many random seconds, `:until` is `success` or `failure`. `:retry t` takes `monk-retry-defaults` (2 tries, 30 seconds, no backoff). `monk-retry-max-interval` caps one wait. The wait uses `sit-for`, so the display updates and `C-g` works; the run is still synchronous. A plan reports the retry policy and does not wait. The result comment says `attempt N of M` when more than one try ran.
+
+`:verify` on `monk-command` runs after the command: a `(PROGRAM . ARGS)` list that must exit zero, or a function of the machine that returns nil or a reason. A failed verification fails the resource with the output as comment. Salt's `check_cmd`. Other resources need none, because the next pass re-checks them.
+
+`:order 'first` or `:order 'last` breaks ties among resources the graph does not order. Requisites always win.
+
+Each resource type can say when it cannot work on a machine (`monk-resource-available-p`): brew, apt, salt, and systemd-unit check for their program once per run and the resource is `skipped` with the reason, for example `brew is not on this machine`, instead of failing on its first command. Salt's `__virtual__`.
+
+Each resource type can run something once per run per machine before its first resource (`monk-resource-class-init`): apt runs `apt-get update` (off with `monk-apt-update` nil), brew runs `brew update` and installs with `HOMEBREW_NO_AUTO_UPDATE=1`. Salt's `mod_init`.
+
+Resources of one type on one machine with no requisite between them can run as one call (`monk-resource-aggregate`): several `monk-apt` or `monk-brew` sets install in one command, several `monk-salt` states run as one `state.high`. Each member still gets its own result, with its share of the changes and a comment that says it was aggregated. Salt's `mod_aggregate`.
+
+`monk-run-context-get`, `monk-run-context-put`, and `monk-with-run-cache` hold values for the length of one run, keyed by anything. brew caches its installed list there and clears it after an install. Salt's `__context__`.
+
+`(monk-orchestrate MACHINES POLICY :mock t)` compiles and orders the graph, evaluates requisites, and calls no resource: every result is `kept` with the comment `not called, mocked`. Use it in tests and to see the order before connecting anywhere. Salt's `mock=True`.
+
+`monk-result-functions` is a hook called with every finished result and its run, for your own returner.
 
 ## Guards: CELL and CEL
 
@@ -157,8 +181,10 @@ Bridge resources in `monk-bridge.el` call another tool installed on the target. 
 
 | Constructor | Purpose |
 |---|---|
+| `(monk-rsync NAME SOURCES DEST &key archive recursive follow-links delete excludes options reachable)` | DEST mirrors SOURCES through rsync. Check is `rsync --dry-run --itemize-changes --stats`; the changed items are the changes and the degree is the share of files already in step. `:reachable HOST` probes the ssh port first and skips with `HOST is not reachable` instead of failing. Needs rsync. |
+| `(monk-launchd LABEL &key plist loaded daemon)` | A launchd job on macOS: its plist under `~/Library/LaunchAgents` (or `/Library/LaunchDaemons` with `:daemon`) rendered from an alist by `monk-launchd-plist`, and its loaded state through `launchctl bootstrap`/`bootout`. The systemd-unit of macOS. |
 | `(monk-ansible NAME MODULE ARGS &key become)` | One Ansible module through `ansible localhost -c local -m MODULE -a ... -o`. Check uses `--check --diff`. ARGS is an alist. A module without check mode counts as changed. |
-| `(monk-salt NAME FUNCTION ARGS)` | One Salt state through `salt-call --local --out=json state.single FUNCTION name=NAME ...`. Check uses `test=True`. |
+| `(monk-salt NAME FUNCTION ARGS &key id)` | One Salt state through `salt-call --local --out=json`. Alone it uses `state.single`; independent salt resources on one machine aggregate into one `state.high` call with Salt's own requisites among them. Check uses `test=True`. `monk-salt-read-function` completes over `sys.list_state_functions`, cached per run. |
 
 Both parse JSON and map `changed`, `failed`, `result`, `changes`, and `comment` onto Monk results. Neither is verified against a live install in this tree. The parsers are tested against captured output shapes.
 
@@ -211,6 +237,12 @@ Remote machines have no notification channel over TRAMP. Monk polls them: every 
 
 A compiled-in notification library does not guarantee delivery. Sandboxes and some network filesystems report `inotify` and deliver nothing. `monk-watch-notifications-work-p` writes a probe file and waits for its event; `monk-watch-start` logs a warning when the probe fails, and local drift then goes unseen until the next manual run.
 
+## Salt import and matchers
+
+`(monk-salt-import-sls MACHINE "demo" FILE-ROOT PILLAR-ROOT)` runs `state.show_low_sls` and returns one `(monk-salt ...)` form per low chunk, in Salt's order, with `require`, `watch`, `onchanges`, `onfail`, `prereq`, and `listen` carried over as Monk requisites on the id. `M-x monk-salt-insert-sls` inserts them at point. Paste them into a policy and edit.
+
+`(monk-salt-matcher-to-cell "G@os_family:Debian and not L@a,b")` returns a CELL form: `G@`/`P@` grains map through `monk-salt-grain-facts` to Monk facts (`os_family` values through `monk-salt-os-family-values`, so `MacOS` becomes `Darwin`; `G@kernel:X` becomes `(class x)`), `I@`/`J@` to inventory vars, `L@` to a name list, `E@` to a name regexp, `N@` to a group, a bare glob to the name. Salt compares case-insensitively and CELL `=` does not, so check values against `monk-machine-describe`. `S@` has no CELL form.
+
 ## History
 
 `monk-history.el` writes every finished run to a SQLite database: one row per run and one per result, with the same fields as the event record. Plans, applies, and watch runs all count. Loading the file turns `monk-history-mode` on; it needs an Emacs built with SQLite (`sqlite-available-p`).
@@ -218,6 +250,8 @@ A compiled-in notification library does not guarantee delivery. Sandboxes and so
 The database is `history.sqlite` under the Monk state directory: `$MONK_HOME` when set, `/etc/monk` when Emacs runs as root, else `$XDG_DATA_HOME/monk` or `~/.local/share/monk`. `monk-history-file` overrides the path.
 
 `monk-history-runs` and `monk-history-results` return alists and take the same filters: `:host`, `:name`, `:type`, `:status`, `:run`, `:since` and `:until` (a timestamp or a duration such as `"7d"`), `:dry-run`, `:changed t` for repaired, would-repair, and partial only, `:limit`, `:offset`. `monk-history-repairs HOST NAME` is the timeline of one resource. `monk-history-run ID` rebuilds a `monk-run` for the report view. `monk-history-delete-before WHEN` prunes.
+
+The detail buffer folds the `kept` and `skipped` groups by default and opens the rest, Salt's `state_output: changes`; `monk-ui-fold-statuses` changes the set and `TAB` on a group heading unfolds it.
 
 In `*monk*`, `h` opens `*monk-history*`: newest run first with kind, hosts, counts, passes, and a note for flapping, watch-triggered, or from-plan runs. `RET` opens a run in the report view, `c` lists what changed in it, `r` asks for a host and resource and shows every change to it, `f` filters by host, `g` rereads.
 
@@ -235,6 +269,10 @@ Monk runs in three modes that share one engine and differ in who decides.
 
 Supervised and autopilot are `monk-watch-mode`. Standalone is `monk-agent.el`. The agent converges the local policy on start, watches owned paths in autopilot, and converges in full every `monk-agent-full-interval` seconds (3600). It appends every event to `monk-agent-ledger-file` as JSON Lines and mirrors them to journald through `systemd-cat` when present. `(monk-agent-observe MACHINE)` on the central Monk runs `tail -F` on that ledger through TRAMP and dispatches each parsed event to `monk-agent-observe-functions`; there is no port and no daemon beyond SSH. The agent and a controller applying the same policy do not fight: both apply the same policy, and the settle window drops the events the other side produced.
 
+### launchd
+
+On macOS, `(monk-agent-launchd-units :policy-file FILE)` in a policy installs and loads `org.monk.agent`, a user agent that runs `emacs --batch -l FILE -f monk-agent-main` with `KeepAlive`, so the loop restarts if it dies and `ThrottleInterval` keeps a crash from spinning. Output goes to `agent.log` under the Monk state directory. There is no socket endpoint on launchd; read the ledger or the history instead. `monk-host-reachable-p` is the probe `:reachable` uses: one TCP connect with `make-network-process`, cached per run.
+
 ### systemd units
 
 `(monk-agent-units)` inside a policy installs and enables two units on a Linux host. `monk-agent.service` is the long-lived loop; a drift watcher must stay resident, so it is not socket activated. `monk-agent.socket` plus `monk-agent@.service` is an on-demand query endpoint on `/run/monk/agent.sock` with `Accept=yes`: systemd accepts each connection and starts one `emacs --batch -f monk-agent-serve` with the connection on stdin and stdout, inetd style, because Emacs cannot adopt an inherited listening socket but reads and writes stdio well. Idle cost is zero. `:user t` installs user units under `~/.config/systemd/user/` with the socket in `$XDG_RUNTIME_DIR/monk/`. Set `monk-agent-emacs`, `monk-agent-load-path`, and `monk-agent-policy-file` before compiling the policy so the `ExecStart` lines point at the right places on the target.
@@ -250,13 +288,16 @@ The endpoint takes one JSON object per line and answers in JSON Lines. `{"op":"s
 `monk-event.el` serializes results as one JSON object per line. This is the ledger format, and it is the shape every other configuration tool normalizes to.
 
 ```json
-{"rgi":1,"event":"result","ts":"2026-09-26T10:00:01.234Z","host":"kamen","run":"r20260926T100001.000",
- "pass":1,"type":"file","name":"/etc/motd","status":"repaired","changed":true,"degree":1.0,
+{"rgi":2,"event":"result","tag":"monk/run/r20260926T100001.000/prog/kamen/0",
+ "ts":"2026-09-26T10:00:01.234Z","host":"kamen","run":"r20260926T100001.000",
+ "pass":1,"seq":0,"type":"file","name":"/etc/motd","status":"repaired","changed":true,"degree":1.0,
  "changes":{"content":true},"diff":"--- a/etc/motd\n+++ b/etc/motd\n...","comment":"content",
  "duration_ms":4.5,"dry_run":false,"native":{"tool":"monk"}}
 ```
 
-`event` is `run-start`, `result`, `run-end`, or `drift`. `status` is Monk's vocabulary plus `unknown`; `native` carries a foreign tool's own status verbatim. Fields are added, never renamed; `rgi` is the format version. `monk-run-events` produces the list for a run, `monk-events-to-run` rebuilds a run from parsed lines. `docs/mgmt-review-and-interop.md` explains why a shared event protocol is realistic, a shared resource graph is realistic for import only, and a shared language is not.
+Every event carries a `tag`, a `/`-joined path like Salt's: `monk/run/<run>/new`, `monk/run/<run>/pass/<n>`, `monk/run/<run>/prog/<host>/<seq>`, `monk/run/<run>/end`, `monk/drift/<host>`, `monk/agent/<host>/start`. Resource names never go in a tag; they are in the data, and `seq` is the position in the run. Filter with `monk-event-tag-matches-p`. Results carry `seq` and `pass`, and so do the history rows; the history also has an `events` table that `monk-history-events PREFIX` reads.
+
+`event` is `run-start`, `result`, `pass`, `run-end`, `drift`, or `agent-start`. `status` is Monk's vocabulary plus `unknown`; `native` carries a foreign tool's own status verbatim. Fields are added, never renamed; `rgi` is the format version. `monk-run-events` produces the list for a run, `monk-events-to-run` rebuilds a run from parsed lines. `docs/mgmt-review-and-interop.md` explains why a shared event protocol is realistic, a shared resource graph is realistic for import only, and a shared language is not.
 
 ## Report
 

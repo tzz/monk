@@ -103,6 +103,8 @@ packages, cron, services, and paths whose parent did not exist yet."
   "Unix socket for a user instance.  %t is XDG_RUNTIME_DIR under systemd.")
 
 (defconst monk-agent-service-name "monk-agent.service")
+(defconst monk-agent-launchd-label "org.monk.agent"
+  "Label of the launchd job that runs the agent loop on macOS.")
 (defconst monk-agent-socket-name "monk-agent.socket")
 (defconst monk-agent-template-name "monk-agent@.service")
 
@@ -296,6 +298,39 @@ Uses `monk-batch-policy', set by the policy file loaded before this."
           "StandardOutput=socket\n"
           "StandardError=journal\n"
           "TimeoutStartSec=600\n"))
+
+(defun monk-agent-launchd-job (&optional policy-file)
+  "Return the launchd job alist that runs `monk-agent-main' from POLICY-FILE.
+KeepAlive restarts the loop when it exits; ThrottleInterval keeps a
+crash loop from spinning.  Output goes under the Monk state directory."
+  (let* ((policy (or policy-file monk-agent-policy-file load-file-name ""))
+         (log (expand-file-name "agent.log" (if (fboundp 'monk-home-directory)
+                                                (funcall 'monk-home-directory)
+                                              "~/.local/share/monk/"))))
+    (list (cons 'ProgramArguments
+                (list monk-agent-emacs "--batch"
+                      "-L" (directory-file-name
+                            (or monk-agent-load-path
+                                (file-name-directory (or load-file-name buffer-file-name default-directory))))
+                      "-l" policy
+                      "-f" "monk-agent-main"))
+          (cons 'RunAtLoad t)
+          (cons 'KeepAlive t)
+          (cons 'ThrottleInterval 30)
+          (cons 'StandardOutPath log)
+          (cons 'StandardErrorPath log)
+          (cons 'EnvironmentVariables
+                (list (cons 'PATH "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"))))))
+
+(defun monk-agent-launchd-units (&rest args)
+  "Policy fragment: install and load the agent as a launchd user agent.
+The macOS counterpart of `monk-agent-units'.  ARGS: :policy-file, and
+common keys.  Call inside a policy.  There is no socket endpoint on
+launchd; query the agent through its ledger or history."
+  (apply #'monk-launchd monk-agent-launchd-label
+         :plist (monk-agent-launchd-job (plist-get args :policy-file))
+         :loaded t
+         (monk--common-initargs args)))
 
 (defun monk-agent-units (&rest args)
   "Policy fragment: install and enable the agent units on this machine.

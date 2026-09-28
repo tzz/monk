@@ -280,8 +280,13 @@ Only machines without an address are indexed; remote ones poll."
 ;;;; Events
 
 (defun monk-watch--suppressed-p (watch)
-  "Return non-nil when WATCH must ignore events right now."
+  "Return non-nil when WATCH must ignore events right now.
+Any run in progress counts, not only one the watch started: a manual
+apply repairs the same paths, and its writes are not drift.  Salt's
+`disable_during_state_run'.  The settle window after a run covers
+writes the kernel reports late."
   (or monk-watch--running
+      monk--current-run
       (< (- (float-time) (monk-watch-last-run-end watch)) monk-watch-settle)))
 
 (defun monk-watch--on-event (event)

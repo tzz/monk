@@ -36,11 +36,46 @@
 (require 'monk)
 (require 'json)
 
-(defconst monk-event-version 1
+(defconst monk-event-version 2
   "Value of the rgi field.  Bump when a field changes meaning.")
 
-(defconst monk-event-kinds '(result run-start run-end drift)
+(defconst monk-event-kinds '(result run-start run-end drift pass)
   "Values of the event field.")
+
+;;;; Tags
+;;
+;; Every event carries a tag: a `/'-joined path, like Salt's
+;; `salt/job/<jid>/ret/<id>' and `salt/beacon/<id>/<beacon>/...'.
+;; Consumers filter by prefix: an etcd watch on `monk/run/', a socket
+;; client that wants `monk/drift/<host>'.  Resource names never go in
+;; a tag, because paths contain `/'; the name is in the data, and the
+;; per-result tag uses a sequence number, like Salt's `__run_num__'.
+;;
+;;   monk/run/<run>/new                 run-start: hosts, policy, dry_run
+;;   monk/run/<run>/pass/<n>            pass end: repaired count
+;;   monk/run/<run>/prog/<host>/<seq>   one result
+;;   monk/run/<run>/end                 run-end: summary, ok, flapping
+;;   monk/drift/<host>                  a watch saw drift
+;;   monk/agent/<host>/start            an agent came up
+;;
+;; Run ids sort by time, like Salt's jid.
+
+(defconst monk-event-tag-base "monk"
+  "First element of every Monk event tag.")
+
+(defun monk-event-tag (&rest parts)
+  "Return the tag for PARTS, joined with `/' under `monk-event-tag-base'.
+Numbers are printed; nil parts are dropped; a `/' inside a part is
+replaced by `_' so the tag stays a path."
+  (mapconcat (lambda (part)
+               (replace-regexp-in-string "/" "_" (format "%s" part) t t))
+             (cons monk-event-tag-base (delq nil parts))
+             "/"))
+
+(defun monk-event-tag-matches-p (prefix tag)
+  "Return non-nil when TAG is PREFIX or is under PREFIX as a path."
+  (or (equal tag prefix)
+      (string-prefix-p (concat prefix "/") tag)))
 
 (defconst monk-event-time-format "%FT%T.%3NZ"
   "ISO 8601 UTC with milliseconds.")
@@ -93,14 +128,19 @@ is not an alist returns unchanged."
    ;; A dotted pair or another object JSON cannot carry.
    (t (format "%S" value))))
 
-(defun monk-event-result (result run &optional pass)
-  "Return the event alist for RESULT inside RUN at PASS."
-  `((rgi . ,monk-event-version)
-    (event . "result")
-    (ts . ,(monk-event--time))
-    (host . ,(monk-result-machine result))
-    (run . ,(monk-run-id run))
-    (pass . ,pass)
+(defun monk-event-result (result run &optional pass seq)
+  "Return the event alist for RESULT inside RUN at PASS as item SEQ.
+SEQ is the position of the result in the run's schedule, from 0; it
+goes in the tag.  Nil SEQ looks the result up in the run."
+  (let ((seq (or seq (monk-run-result-seq run result))))
+    `((rgi . ,monk-event-version)
+      (event . "result")
+      (tag . ,(monk-event-tag "run" (monk-run-id run) "prog" (monk-result-machine result) seq))
+      (ts . ,(monk-event--time))
+      (host . ,(monk-result-machine result))
+      (run . ,(monk-run-id run))
+      (pass . ,pass)
+      (seq . ,seq)
     (type . ,(monk-result-type result))
     (name . ,(monk-result-name result))
     (status . ,(symbol-name (monk-result-status result)))
@@ -111,14 +151,30 @@ is not an alist returns unchanged."
     (diff . ,(monk-result-diff result))
     (comment . ,(monk-result-comment result))
     (duration_ms . ,(* 1000.0 (monk-result-duration result)))
-    (dry_run . ,(if (monk-run-dry-run run) t :false))
-    (native . ((tool . "monk")
-               (source . ,(car (monk-result-origin result)))))))
+      (dry_run . ,(if (monk-run-dry-run run) t :false))
+      (native . ((tool . "monk")
+                 (source . ,(car (monk-result-origin result))))))))
+
+(defun monk-run-result-seq (run result)
+  "Return the position of RESULT among the results of RUN, or nil."
+  (cl-position result (monk-run-results run)
+               :test (lambda (a b) (equal (monk-result-key a) (monk-result-key b)))))
+
+(defun monk-event-pass (run pass repaired)
+  "Return the event alist for the end of PASS of RUN with REPAIRED changes."
+  `((rgi . ,monk-event-version)
+    (event . "pass")
+    (tag . ,(monk-event-tag "run" (monk-run-id run) "pass" pass))
+    (ts . ,(monk-event--time))
+    (run . ,(monk-run-id run))
+    (pass . ,pass)
+    (repaired . ,repaired)))
 
 (defun monk-event-run (kind run)
   "Return the event alist for the start or end of RUN.  KIND is a symbol."
   `((rgi . ,monk-event-version)
     (event . ,(symbol-name kind))
+    (tag . ,(monk-event-tag "run" (monk-run-id run) (if (eq kind 'run-start) "new" "end")))
     (ts . ,(monk-event--time))
     (run . ,(monk-run-id run))
     (hosts . ,(vconcat (mapcar (lambda (m) (oref m name)) (monk-run-machines run))))
@@ -135,11 +191,22 @@ is not an alist returns unchanged."
   "Return the event alist for drift on KEY at PATH after ACTION."
   `((rgi . ,monk-event-version)
     (event . "drift")
+    (tag . ,(monk-event-tag "drift" (car key)))
     (ts . ,(monk-event--time))
     (host . ,(car key))
     (name . ,(cdr key))
     (path . ,path)
+    ;; Salt's beacon shape: id, path, change.
+    (change . ,(format "%s" action))
     (action . ,(format "%s" action))))
+
+(defun monk-event-agent-start (host)
+  "Return the event alist for an agent that came up on HOST."
+  `((rgi . ,monk-event-version)
+    (event . "agent-start")
+    (tag . ,(monk-event-tag "agent" host "start"))
+    (ts . ,(monk-event--time))
+    (host . ,host)))
 
 (defun monk-event-line (event)
   "Return EVENT, an alist, as one JSON line with a trailing newline."
@@ -167,8 +234,9 @@ is not an alist returns unchanged."
 (defun monk-run-events (run)
   "Return all events of RUN as a list of alists: start, results, end."
   (append (list (monk-event-run 'run-start run))
-          (mapcar (lambda (r) (monk-event-result r run (monk-run-passes run)))
-                  (monk-run-results run))
+          (let ((seq -1))
+            (mapcar (lambda (r) (monk-event-result r run (monk-run-passes run) (cl-incf seq)))
+                    (monk-run-results run)))
           (list (monk-event-run 'run-end run))))
 
 (defun monk-run-write-events (run file)

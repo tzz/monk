@@ -91,7 +91,7 @@ Nil means history.sqlite under `monk-home-directory'."
 
 ;;;; Schema
 
-(defconst monk-history-schema-version 1
+(defconst monk-history-schema-version 2
   "Schema version stored in the `meta' table.")
 
 (defconst monk-history-schema
@@ -121,7 +121,16 @@ Nil means history.sqlite under `monk-home-directory'."
        comment TEXT,
        diff TEXT,
        duration_ms REAL,
-       source TEXT)"
+       source TEXT,
+       seq INTEGER,
+       pass INTEGER)"
+    "CREATE TABLE IF NOT EXISTS events (
+       ts TEXT NOT NULL,
+       tag TEXT NOT NULL,
+       run_id TEXT,
+       data TEXT)"
+    "CREATE INDEX IF NOT EXISTS events_tag ON events(tag)"
+    "CREATE INDEX IF NOT EXISTS events_ts ON events(ts)"
     "CREATE INDEX IF NOT EXISTS results_run ON results(run_id)"
     "CREATE INDEX IF NOT EXISTS results_key ON results(host, name)"
     "CREATE INDEX IF NOT EXISTS runs_started ON runs(started)")
@@ -133,7 +142,7 @@ Nil means history.sqlite under `monk-home-directory'."
   "Columns of the runs table, in table order.")
 
 (defconst monk-history-result-columns
-  '(run_id host name type status degree changes comment diff duration_ms source)
+  '(run_id host name type status degree changes comment diff duration_ms source seq pass)
   "Columns of the results table, in table order.")
 
 ;;;; Connection
@@ -157,10 +166,19 @@ Nil means history.sqlite under `monk-home-directory'."
       (sqlite-execute monk-history--db "PRAGMA foreign_keys = ON")
       (dolist (statement monk-history-schema)
         (sqlite-execute monk-history--db statement))
+      (monk-history--migrate monk-history--db)
       (sqlite-execute monk-history--db
                       "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?)"
                       (list (number-to-string monk-history-schema-version))))
     monk-history--db))
+
+(defun monk-history--migrate (db)
+  "Bring an older DB up to `monk-history-schema-version'.
+Columns are added, never removed, so an old Monk still reads the file."
+  (let ((columns (mapcar #'cadr (sqlite-select db "PRAGMA table_info(results)"))))
+    (dolist (column '("seq" "pass"))
+      (unless (member column columns)
+        (sqlite-execute db (format "ALTER TABLE results ADD COLUMN %s INTEGER" column))))))
 
 (defun monk-history-close ()
   "Close the database connection, if open."
@@ -183,7 +201,8 @@ Nil means history.sqlite under `monk-home-directory'."
   "Write RUN and its results to the database.  Return the run id.
 A run id that exists already is replaced, so recording is idempotent."
   (let ((db (monk-history-db))
-        (id (monk-run-id run)))
+        (id (monk-run-id run))
+        (seq -1))
     (sqlite-transaction db)
     (condition-case err
         (progn
@@ -217,6 +236,7 @@ A run id that exists already is replaced, so recording is idempotent."
                                                (cons 'reason (cdr cell))))
                           (monk-run-reasons run)))))
           (dolist (result (monk-run-results run))
+            (cl-incf seq)
             (sqlite-execute
              db
              (format "INSERT INTO results (%s) VALUES (%s)"
@@ -233,12 +253,39 @@ A run id that exists already is replaced, so recording is idempotent."
                    (monk-result-comment result)
                    (monk-result-diff result)
                    (* 1000.0 (monk-result-duration result))
-                   (car (monk-result-origin result)))))
+                   (car (monk-result-origin result))
+                   seq
+                   (monk-run-passes run))))
+          (monk-history--record-event db (monk-event-run 'run-end run) id)
           (sqlite-commit db))
       (error
        (sqlite-rollback db)
        (signal (car err) (cdr err))))
     id))
+
+(defun monk-history--record-event (db event &optional run-id)
+  "Insert EVENT, an alist with tag and ts, into the events table of DB."
+  (sqlite-execute db "INSERT INTO events (ts, tag, run_id, data) VALUES (?, ?, ?, ?)"
+                  (list (alist-get 'ts event) (alist-get 'tag event) run-id
+                        (monk-event--json event))))
+
+(defun monk-history-record-event (event)
+  "Record EVENT, an alist from monk-event.el, in the events table."
+  (monk-history--record-event (monk-history-db) event (alist-get 'run event)))
+
+(defun monk-history-events (&optional prefix limit)
+  "Return recorded events whose tag is under PREFIX, newest first, at most LIMIT.
+Each is an alist (ts tag run_id data), with data parsed."
+  (let* ((where (if prefix " WHERE tag = ? OR tag LIKE ?" ""))
+         (params (and prefix (list prefix (concat prefix "/%"))))
+         (rows (sqlite-select (monk-history-db)
+                              (format "SELECT ts, tag, run_id, data FROM events%s ORDER BY ts DESC%s"
+                                      where (if limit (format " LIMIT %d" limit) ""))
+                              params)))
+    (mapcar (lambda (row)
+              (list (cons 'ts (nth 0 row)) (cons 'tag (nth 1 row)) (cons 'run_id (nth 2 row))
+                    (cons 'data (and (nth 3 row) (monk-event-parse (nth 3 row))))))
+            rows)))
 
 (defun monk-history--on-progress (event data)
   "Record the run when EVENT is `run-end'.  DATA carries :run."

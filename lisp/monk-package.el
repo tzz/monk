@@ -53,6 +53,31 @@
          :documentation "Treat the names as casks."))
   "A set of Homebrew formulae or casks that must be installed.")
 
+(cl-defmethod monk-resource-available-p ((_r monk-brew-resource) (m monk-machine))
+  (monk-program-available-p m monk-brew-program))
+
+(cl-defmethod monk-resource-class-init ((_r monk-brew-resource) (m monk-machine))
+  "Update Homebrew on M once per run, so no install call does it noisily."
+  (if (monk-exec-ok-p (monk-exec m monk-brew-program "update" "--quiet"))
+      "brew update"
+    (monk-log 'warn "%s: brew update failed; installs go on with stale taps" (oref m name))
+    nil))
+
+(cl-defmethod monk-resource-aggregate ((r monk-brew-resource) others (_m monk-machine))
+  "Merge R and OTHERS, brew resources of one kind (formula or cask), into one."
+  (when (cl-every (lambda (o) (eq (null (oref o cask)) (null (oref r cask)))) others)
+    (monk-brew-resource
+     :name (format "%s (+%d)" (oref r name) (length others))
+     :packages (delete-dups (apply #'append (oref r packages)
+                                   (mapcar (lambda (o) (oref o packages)) others)))
+     :cask (oref r cask))))
+
+(cl-defmethod monk-resource-disaggregate ((_a monk-brew-resource) (member monk-brew-resource) changes)
+  (let ((mine (seq-filter (lambda (name) (member name (oref member packages)))
+                          (plist-get changes :install))))
+    (and mine (list :install mine
+                    :degree (monk-set-degree (length (oref member packages)) (length mine))))))
+
 (defun monk--brew-json-names (entry cask)
   "Return every name that brew ENTRY, a parsed JSON object, answers to.
 For a formula: name, full_name, aliases, oldnames.  For a CASK:
@@ -69,10 +94,16 @@ token, full_token, old_tokens.  Each also under its short name."
 
 (defun monk--brew-installed-names (m)
   "Return every name an installed formula or cask on M answers to.
-One `brew info --json=v2 --installed' call.  Aliases count: rg is
-installed when ripgrep is.  Casks count for a formula resource too,
-because `brew install NAME' installs a cask of that name.  When the
-call fails, fall back to `brew list', which knows no aliases."
+One `brew info --json=v2 --installed' call per run, cached in the run
+context and cleared by a repair.  Aliases count: rg is installed when
+ripgrep is.  Casks count for a formula resource too, because `brew
+install NAME' installs a cask of that name.  When the call fails,
+fall back to `brew list', which knows no aliases."
+  (monk-with-run-cache (list 'brew-installed (oref m name))
+    (monk--brew-installed-names-uncached m)))
+
+(defun monk--brew-installed-names-uncached (m)
+  "Ask brew on M for installed names.  See `monk--brew-installed-names'."
   (let ((exec (monk-exec m monk-brew-program "info" "--json=v2" "--installed")))
     (if (monk-exec-ok-p exec)
         (let ((parsed (json-parse-string (monk-exec-output exec))))
@@ -115,7 +146,8 @@ this returns nil, and the caller proceeds as before."
       nil)))
 
 (cl-defmethod monk-repair ((r monk-brew-resource) (m monk-machine) changes)
-  (let ((arguments (append (list "install")
+  (let ((process-environment (cons "HOMEBREW_NO_AUTO_UPDATE=1" process-environment))
+        (arguments (append (list "install")
                            (and (oref r cask) '("--cask"))
                            (plist-get changes :install)))
         (trusted nil))
@@ -130,6 +162,7 @@ this returns nil, and the caller proceeds as before."
            (signal (car err) (cdr err)))
          (setq trusted (match-string 1 output))
          (apply #'monk-exec-string m monk-brew-program arguments))))
+    (monk-run-context-clear (list 'brew-installed (oref m name)))
     (format "installed %s%s" (string-join (plist-get changes :install) " ")
             (if trusted (format " (after brew trust %s)" trusted) ""))))
 
@@ -200,6 +233,37 @@ ARGS: :cask and common keys."
     (apply #'monk-exec-string m monk-apt-program "install" "-y" "-q"
            (append (plist-get changes :install) (list :sudo t))))
   (format "installed %s" (string-join (plist-get changes :install) " ")))
+
+(cl-defmethod monk-resource-available-p ((_r monk-apt-resource) (m monk-machine))
+  (monk-program-available-p m monk-apt-program))
+
+(defcustom monk-apt-update t
+  "When non-nil, run `apt-get update' once per run before the first apt resource."
+  :type 'boolean
+  :group 'monk)
+
+(cl-defmethod monk-resource-class-init ((_r monk-apt-resource) (m monk-machine))
+  "Refresh the package index on M once per run, per `monk-apt-update'."
+  (when monk-apt-update
+    (let ((process-environment (cons "DEBIAN_FRONTEND=noninteractive" process-environment)))
+      (if (monk-exec-ok-p (monk-exec m monk-apt-program "update" "-q" :sudo t))
+          "apt-get update"
+        (monk-log 'warn "%s: apt-get update failed; installs go on with a stale index" (oref m name))
+        nil))))
+
+(cl-defmethod monk-resource-aggregate ((r monk-apt-resource) others (_m monk-machine))
+  "Merge R and OTHERS, apt resources, into one install."
+  (monk-apt-resource
+   :name (format "%s (+%d)" (oref r name) (length others))
+   :packages (delete-dups (apply #'append (oref r packages)
+                                 (mapcar (lambda (o) (oref o packages)) others)))
+   :sudo t))
+
+(cl-defmethod monk-resource-disaggregate ((_a monk-apt-resource) (member monk-apt-resource) changes)
+  (let ((mine (seq-filter (lambda (name) (member name (oref member packages)))
+                          (plist-get changes :install))))
+    (and mine (list :install mine
+                    :degree (monk-set-degree (length (oref member packages)) (length mine))))))
 
 (defun monk-apt (name packages &rest args)
   "Ensure Debian PACKAGES are installed.  NAME identifies the set.

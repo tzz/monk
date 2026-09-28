@@ -112,6 +112,22 @@ limits the cycle length Monk can name: with 6 passes a cycle of up to
 5 resources is caught."
   :type 'natnum)
 
+(defcustom monk-retry-defaults '(:attempts 2 :interval 30 :backoff 1.0 :splay 0 :until success)
+  "Defaults for a resource :retry plist.
+:attempts is the total number of tries.  :interval is the wait in
+seconds before try two.  Each later wait is the previous one times
+:backoff.  :splay adds a random 0..SPLAY seconds to each wait.
+:until is `success' (stop on kept or repaired) or `failure' (stop on
+the first failure, for a resource expected to fail).  Salt's defaults,
+plus :backoff."
+  :type 'plist)
+
+(defcustom monk-retry-max-interval 300
+  "Longest wait between two tries of one resource, in seconds.
+The run is synchronous, so the wait blocks Emacs.  `sit-for' keeps
+redisplay and `C-g' working."
+  :type 'number)
+
 (defconst monk-tramp-method "ssh"
   "TRAMP method for remote machines.")
 
@@ -128,7 +144,7 @@ local machine.  Seen as \"Opening connection for BOSMEJ... using ssh\".")
 (defconst monk-log-buffer-name "*monk-log*"
   "Buffer that receives log lines.")
 
-(defconst monk-requisite-kinds '(require watch onchanges onfail)
+(defconst monk-requisite-kinds '(require watch onchanges onfail prereq listen)
   "Requisite slots, in evaluation order.")
 
 (defconst monk-degree-satisfied 1.0
@@ -148,6 +164,12 @@ One of `debug', `info', `warn', or nil to record nothing."
 (defcustom monk-show-diffs t
   "When non-nil, file content results carry a unified diff."
   :type 'boolean)
+
+(defcustom monk-result-functions nil
+  "Functions called with each finished `monk-result' and its run.
+Salt's returner hook, per result.  Called after `node-end' progress,
+inside the run.  An error in a function is logged and ignored."
+  :type 'hook)
 
 (defcustom monk-progress-functions nil
   "Functions called with progress events.
@@ -239,6 +261,9 @@ Each is called with two arguments: EVENT, one of `run-start',
   options
   plan
   reasons               ; alist of (KEY . TEXT): why a watch selected KEY
+  (context (make-hash-table :test #'equal))  ; per-run cache, see `monk-run-context-get'
+  (mock nil)            ; compile and order only; nothing is checked
+  (rescued nil)         ; keys whose failure an :onfail handler with :handled t covered
   (last-pass-repaired 0)
   (repaired-by-pass nil)
   (start-time (current-time))
@@ -347,8 +372,45 @@ With MACHINE, a name string, count only that machine."
              (monk-run-results run)))
 
 (defun monk-run-ok-p (run)
-  "Return non-nil when no result in RUN failed."
-  (not (seq-some #'monk-result-failed-p (monk-run-results run))))
+  "Return non-nil when no result in RUN failed.
+A failure that an :onfail handler with :handled t covered is rescued
+and does not count.  See `monk-run-rescued'."
+  (not (seq-some (lambda (r)
+                   (and (monk-result-failed-p r)
+                        (not (member (monk-result-key r) (monk-run-rescued run)))))
+                 (monk-run-results run))))
+
+;;;; Run context
+
+(defvar monk--current-run nil
+  "The run in progress, for `monk-run-context-get' inside resources.")
+
+(defun monk-run-context-get (key &optional run)
+  "Return the value cached under KEY in RUN, or nil.
+RUN defaults to the run in progress.  KEY is any `equal'-comparable
+value; resources use (MACHINE-NAME . TAG).  Salt's `__context__'."
+  (let ((run (or run monk--current-run)))
+    (and run (gethash key (monk-run-context run)))))
+
+(defun monk-run-context-put (key value &optional run)
+  "Cache VALUE under KEY in RUN, default the run in progress.  Return VALUE."
+  (let ((run (or run monk--current-run)))
+    (when run (puthash key value (monk-run-context run)))
+    value))
+
+(defun monk-run-context-clear (key &optional run)
+  "Forget KEY in RUN, default the run in progress."
+  (let ((run (or run monk--current-run)))
+    (when run (remhash key (monk-run-context run)))))
+
+(defmacro monk-with-run-cache (key &rest body)
+  "Return the value cached under KEY in the current run, or compute it with BODY.
+Outside a run, BODY runs every time."
+  (declare (indent 1))
+  (let ((k (make-symbol "key")) (v (make-symbol "value")))
+    `(let* ((,k ,key)
+            (,v (monk-run-context-get ,k)))
+       (or ,v (monk-run-context-put ,k (progn ,@body))))))
 
 (defun monk-run-oscillating-p (run)
   "Return non-nil when RUN hit the pass cap with repairs still happening.
@@ -526,14 +588,21 @@ Signal `monk-exec-error' on non-zero exit.")
                 (mapconcat #'shell-quote-argument args " "))
       (with-temp-buffer
         (let ((code
-               (if input
-                   (let ((stdin (make-temp-file "monk-stdin")))
-                     (unwind-protect
-                         (progn
-                           (with-temp-file stdin (insert input))
-                           (apply #'process-file program stdin t nil args))
-                       (delete-file stdin)))
-                 (apply #'process-file program nil t nil args))))
+               (condition-case err
+                   (if input
+                       (let ((stdin (make-temp-file "monk-stdin")))
+                         (unwind-protect
+                             (progn
+                               (with-temp-file stdin (insert input))
+                               (apply #'process-file program stdin t nil args))
+                           (delete-file stdin)))
+                     (apply #'process-file program nil t nil args))
+                 ;; A missing program is an exit like any other, code
+                 ;; 127 as the shell would say, so callers that test
+                 ;; `monk-exec-ok-p' need no separate error path.
+                 (file-missing
+                  (insert (error-message-string err))
+                  127))))
           (monk-exec-create :command (cons program args)
                             :exit-code code
                             :output (buffer-string)))))))
@@ -744,6 +813,32 @@ Nil means the value of `monk-default-watch-action'.")
    (onfail :initarg :onfail
            :initform nil
            :documentation "Refs.  Run only when one of them failed in this run.")
+   (prereq :initarg :prereq
+           :initform nil
+           :documentation "Refs.  Run before them, and only when one of them would change.
+The refs are checked, not repaired, to decide.  Salt's prereq.")
+   (listen :initarg :listen
+           :initform nil
+           :documentation "Refs like `watch', but the action runs once, after the run
+converged, however many of the refs changed in however many passes.
+Salt's listen.")
+   (retry :initarg :retry
+          :initform nil
+          :documentation "Plist (:attempts N :interval S :backoff F :splay S :until STATUS).
+A failed check or repair is tried again up to N times in the same pass.
+See `monk-retry-defaults'.")
+   (order :initarg :order
+          :initform nil
+          :documentation "`first' or `last': a tie-breaker among nodes the graph
+does not order.  Requisites always win.")
+   (fatal :initarg :fatal
+          :initform nil
+          :documentation "When non-nil, a failure of this resource ends the pass on its
+machine.  Other machines go on.  Salt's failhard, per resource, off by default.")
+   (handled :initarg :handled
+            :initform nil
+            :documentation "On an :onfail handler: when the handler succeeds, the failures
+it handles count as rescued, not against the run.")
    (sudo :initarg :sudo
          :initform nil
          :documentation "Perform the resource as root."))
@@ -796,6 +891,59 @@ or ownership expectations.  Nil for a file.")
 Nil means the resource only re-checks.")
 
 (cl-defmethod monk-default-watch-action ((_r monk-resource))
+  nil)
+
+(cl-defgeneric monk-resource-available-p (resource machine)
+  "Return nil when RESOURCE can run on MACHINE, else a reason string.
+Salt's `__virtual__': a resource type says why it cannot work here,
+for example \"brew not found\", and the run skips it with that reason
+instead of failing on the first command.")
+
+(cl-defmethod monk-resource-available-p ((_r monk-resource) (_m monk-machine))
+  nil)
+
+(defun monk-program-available-p (m program)
+  "Return nil when PROGRAM is on the PATH of M, else a reason string.
+Cached per run and machine."
+  (let* ((key (list 'program (oref m name) program))
+         (state (or (monk-run-context-get key)
+                    (monk-run-context-put
+                     key (if (monk-exec-ok-p (monk-exec m "sh" "-c" (concat "command -v " program)))
+                             'yes 'no)))))
+    (and (eq state 'no) (format "%s is not on this machine" program))))
+
+
+(cl-defgeneric monk-resource-class-init (resource machine)
+  "Run once per run on MACHINE before the first RESOURCE of its class.
+Salt's `mod_init': `apt-get update' once, not once per resource.
+Return a comment string or nil.  Runs only when a resource of the
+class is selected and applicable.")
+
+(cl-defmethod monk-resource-class-init ((_r monk-resource) (_m monk-machine))
+  nil)
+
+(cl-defgeneric monk-resource-aggregate (resource others machine)
+  "Return a resource that stands for RESOURCE and OTHERS together, or nil.
+Salt's `mod_aggregate': same class, same MACHINE, no dependency path
+between them.  The aggregate is checked and repaired once; its
+changes are split back per member by `monk-resource-disaggregate'.
+Nil means this class does not aggregate.")
+
+(cl-defmethod monk-resource-aggregate ((_r monk-resource) _others (_m monk-machine))
+  nil)
+
+(cl-defgeneric monk-resource-disaggregate (aggregate member changes)
+  "Return the part of CHANGES of AGGREGATE that belongs to MEMBER, or nil.")
+
+(cl-defmethod monk-resource-disaggregate ((_a monk-resource) (_member monk-resource) changes)
+  changes)
+
+(cl-defgeneric monk-resource-verify (resource machine)
+  "After a repair of RESOURCE on MACHINE, return nil when it holds, else a reason.
+Salt's `check_cmd'.  A resource whose `monk-check' is a real check
+needs none; the next pass re-checks it.  The default returns nil.")
+
+(cl-defmethod monk-resource-verify ((_r monk-resource) (_m monk-machine))
   nil)
 
 (defconst monk-resource-class-prefix "monk-"
@@ -903,6 +1051,10 @@ root."
                             (monk-resource-type resource))))))
   (unless (oref resource origin)
     (oset resource origin (cons monk--compile-file (oref resource name))))
+  (unless (memq (oref resource order) '(nil first last))
+    (signal 'monk-policy-error
+            (list (format "Resource %S: :order must be first or last, not %S"
+                          (oref resource name) (oref resource order)))))
   ;; A bad guard fails the compile, not the run: the policy author sees
   ;; the error at once, and a CEL string is parsed once, here.
   (when (oref resource when)
@@ -925,7 +1077,7 @@ root."
 
 (defconst monk--common-keys
   '(:only-if :not-if :classes :when :require :watch :watch-action :onchanges :onfail
-    :sudo)
+    :prereq :listen :retry :order :fatal :handled :sudo)
   "Keywords every resource constructor accepts.")
 
 (defun monk--common-initargs (plist)
@@ -985,6 +1137,9 @@ SPEC is a resource name string, a cons (SCOPE . NAME), or a plist
   (index 0)
   (selected t)
   result)
+
+(defconst monk-comment-mocked "not called, mocked"
+  "Comment on every result of a mock run.")
 
 (defconst monk-skip-not-selected "not selected for this run"
   "Comment on a node that a partial run left alone.")
@@ -1070,15 +1225,39 @@ Without :min or :fraction, every target must satisfy."
                              (monk-result-failed-p (monk-node-result n))))
             targets))
 
+(defconst monk-skip-prereq "prereq: nothing would change"
+  "Skip comment when no prereq target would change.")
+
+(defun monk--prereq-would-change-p (ref targets)
+  "Return non-nil when a node in TARGETS of prereq REF would change now.
+The targets run later, so their results are not in yet.  Their
+`monk-check' runs here: it is side-effect free by contract.  A target
+that is itself skipped by its own guards or requisites does not
+count, which is Salt's #68438 rule.  A check that signals counts as
+a change: the target will fail, and the prerequiring resource is
+better run than skipped."
+  (ignore ref)
+  (seq-some (lambda (target)
+              (let ((r (monk-node-resource target))
+                    (m (monk-node-machine target)))
+                (and (monk-node-selected target)
+                     (not (monk-resource-skip-reason r m))
+                     (condition-case nil
+                         (monk-check r m)
+                       (error t)))))
+            targets))
+
 (defun monk--requisite-verdict (node nodes)
   "Decide whether NODE can run given the results in NODES.
 Return (VERDICT . DETAIL).  VERDICT is `run', `skip', or `watch'.
-`watch' means run, and perform the watch action afterwards."
+`watch' means run, and perform the watch action afterwards.
+`listen' refs gate like `require' but never trigger here; their
+action runs once after the run converged."
   (let ((resource (monk-node-resource node))
         (verdict 'run)
         (detail nil))
     (catch 'done
-      (dolist (kind '(require watch))
+      (dolist (kind '(require watch listen))
         (dolist (ref (monk-resource-refs resource kind))
           (let ((targets (monk--nodes-for-ref ref node nodes)))
             (unless (monk--ref-satisfied-p ref targets)
@@ -1087,6 +1266,13 @@ Return (VERDICT . DETAIL).  VERDICT is `run', `skip', or `watch'.
             (when (and (eq kind 'watch) (monk--ref-changed-p targets))
               (setq verdict 'watch
                     detail (format "watch %s changed" (monk-ref-name ref)))))))
+      (let ((prereq (monk-resource-refs resource 'prereq)))
+        (when (and prereq
+                   (not (seq-some (lambda (ref)
+                                    (monk--prereq-would-change-p
+                                     ref (monk--nodes-for-ref ref node nodes)))
+                                  prereq)))
+          (throw 'done (setq verdict 'skip detail monk-skip-prereq))))
       (let ((onchanges (monk-resource-refs resource 'onchanges)))
         (when (and onchanges
                    (not (seq-some (lambda (ref)
@@ -1122,16 +1308,37 @@ resource runs."
                     (list (format "%s: %s ref %S asks for %d of %d"
                                   name kind (monk-ref-name ref)
                                   (monk-ref-min ref) (length targets)))))
-          (dolist (target targets)
-            (cl-pushnew target deps)))))
+          ;; prereq points the other way: this node runs before its targets.
+          (unless (eq kind 'prereq)
+            (dolist (target targets)
+              (cl-pushnew target deps))))))
+    ;; The targets of another node's prereq depend on that node.
+    (dolist (other nodes)
+      (unless (eq other node)
+        (dolist (ref (monk-resource-refs (monk-node-resource other) 'prereq))
+          (when (memq node (monk--nodes-for-ref ref other nodes))
+            (cl-pushnew other deps)))))
     deps))
+
+(defun monk--order-rank (node)
+  "Return 0, 1, or 2 for :order `first', nil, or `last' on NODE."
+  (pcase (oref (monk-node-resource node) order)
+    ('first 0) ('last 2) ('nil 1)
+    (other (signal 'monk-policy-error
+                   (list (format "%s: :order must be first or last, not %S"
+                                 (oref (monk-node-resource node) name) other))))))
+
+(defun monk--order-nodes (nodes)
+  "Return NODES with :order first ahead and :order last behind, stably.
+Only a tie-breaker: `monk-schedule' still lets requisites win."
+  (sort nodes (lambda (a b) (< (monk--order-rank a) (monk--order-rank b)))))
 
 (defun monk-schedule (nodes)
   "Return NODES in an order that respects requisites.
 Nodes without a dependency between them keep policy order, machine
 by machine in inventory order.  Signal `monk-requisite-error' on a
 cycle or a bad ref."
-  (let ((remaining (copy-sequence nodes))
+  (let ((remaining (monk--order-nodes (copy-sequence nodes)))
         (deps (make-hash-table :test #'eq))
         (done (make-hash-table :test #'eq))
         (ordered nil))
@@ -1168,52 +1375,154 @@ execution model."
                                      :type (monk-resource-type resource)
                                      :origin (oref resource origin))))
     (monk-progress 'node-start :node node)
-    (condition-case err
-        (pcase-let ((`(,verdict . ,detail)
-                     (let ((reason (and (monk-node-selected node)
-                                        (monk-resource-skip-reason resource machine))))
-                       (cond
-                        ((not (monk-node-selected node))
-                         (cons 'skip monk-skip-not-selected))
-                        (reason (cons 'skip reason))
-                        (t (monk--requisite-verdict node nodes))))))
-          (if (eq verdict 'skip)
-              (setf (monk-result-status result) monk-status-skipped
-                    (monk-result-comment result) detail)
-            (let* ((changes (monk-check resource machine))
-                   (degree (or (plist-get changes :degree) 0.0)))
-              (cond
-               ((and (null changes) (eq verdict 'watch))
-                (monk--perform-watch resource machine result detail dry-run))
-               ((null changes)
-                (setf (monk-result-status result) monk-status-kept
-                      (monk-result-degree result) monk-degree-satisfied))
-               (dry-run
-                (setf (monk-result-status result) monk-status-would-repair
-                      (monk-result-degree result) degree
-                      (monk-result-changes result) changes
-                      (monk-result-diff result)
-                      (and monk-show-diffs (monk-diff resource machine changes))))
-               (t
-                (setf (monk-result-diff result)
-                      (and monk-show-diffs (monk-diff resource machine changes))
-                      (monk-result-degree result) degree)
-                (setf (monk-result-comment result) (monk-repair resource machine changes)
-                      (monk-result-status result) monk-status-repaired
-                      (monk-result-degree result) monk-degree-satisfied
-                      (monk-result-changes result) changes))))))
-      (error
-       (setf (monk-result-status result)
-             (if (> (monk-result-degree result) 0.0) monk-status-partial monk-status-failed)
-             (monk-result-comment result) (error-message-string err))
-       (monk-log 'warn "%s: %s %s %s: %s"
-                 (oref machine name) (monk-resource-type resource)
-                 (oref resource name) (monk-result-status result)
-                 (error-message-string err))))
+    (pcase-let ((`(,verdict . ,detail)
+                 (let* ((mock (and monk--current-run (monk-run-mock monk--current-run)))
+                        (reason (and (monk-node-selected node)
+                                     (or (monk-resource-skip-reason resource machine)
+                                         ;; A mock run opens no connection,
+                                         ;; so it cannot ask what is installed.
+                                         (and (not mock)
+                                              (monk-resource-available-p resource machine))))))
+                   (cond
+                    ((not (monk-node-selected node))
+                     (cons 'skip monk-skip-not-selected))
+                    (reason (cons 'skip reason))
+                    (mock
+                     ;; Requisites still evaluate in a mock run, so
+                     ;; onchanges and onfail skips show up as they would.
+                     (let ((v (monk--requisite-verdict node nodes)))
+                       (if (eq (car v) 'skip) v (cons 'mock nil))))
+                    (t (monk--requisite-verdict node nodes))))))
+      (cond
+       ((eq verdict 'skip)
+        (setf (monk-result-status result) monk-status-skipped
+              (monk-result-comment result) detail))
+       ((eq verdict 'mock)
+        (setf (monk-result-status result) monk-status-kept
+              (monk-result-degree result) monk-degree-satisfied
+              (monk-result-comment result) monk-comment-mocked))
+       (t
+        (monk--class-init-once resource machine)
+        (monk--run-node-with-retry resource machine result verdict detail dry-run))))
     (setf (monk-result-duration result) (- (float-time) start)
           (monk-node-result node) result)
     (monk-progress 'node-end :node node :result result)
+    (monk--run-result-functions result)
     result))
+
+(defun monk--run-result-functions (result)
+  "Call `monk-result-functions' with RESULT and the current run."
+  (dolist (fn monk-result-functions)
+    (condition-case err
+        (funcall fn result monk--current-run)
+      (error (monk-log 'warn "result function %s: %s" fn (error-message-string err))))))
+
+(defun monk--class-init-once (resource machine)
+  "Run `monk-resource-class-init' once per run for RESOURCE's class on MACHINE."
+  (let ((key (list 'class-init (oref machine name) (eieio-object-class-name resource))))
+    (unless (monk-run-context-get key)
+      (monk-run-context-put key t)
+      (let ((comment (monk-resource-class-init resource machine)))
+        (when comment
+          (monk-log 'info "%s: %s: %s" (oref machine name)
+                    (monk-resource-type resource) comment))))))
+
+(defun monk--retry-plan (resource)
+  "Return the effective :retry plist of RESOURCE, or nil when it has none."
+  (let ((own (oref resource retry)))
+    (and own
+         (let ((plan (copy-sequence monk-retry-defaults)))
+           (cl-loop for (k v) on (if (eq own t) nil own) by #'cddr
+                    do (setq plan (plist-put plan k v)))
+           plan))))
+
+(defun monk--retry-wait (plan attempt)
+  "Sleep before try number ATTEMPT (2 or more) as PLAN says.
+Returns the seconds waited."
+  (let* ((base (* (float (plist-get plan :interval))
+                  (expt (float (plist-get plan :backoff)) (- attempt 2))))
+         (splay (let ((s (plist-get plan :splay)))
+                  (if (and s (> s 0)) (/ (random (round (* 1000 s))) 1000.0) 0)))
+         (wait (min monk-retry-max-interval (+ base splay))))
+    (when (> wait 0)
+      ;; `sit-for' rather than `sleep-for': redisplay runs, and C-g works.
+      (sit-for wait))
+    wait))
+
+(defun monk--run-node-with-retry (resource machine result verdict detail dry-run)
+  "Fill RESULT for RESOURCE on MACHINE, trying again per its :retry plist.
+See `monk--run-node-once' for one try.  VERDICT, DETAIL, and DRY-RUN
+pass through."
+  (let* ((plan (monk--retry-plan resource))
+         (attempts (if plan (max 1 (plist-get plan :attempts)) 1))
+         (until (if plan (plist-get plan :until) 'success))
+         (attempt 0)
+         (done nil))
+    (while (and (not done) (< attempt attempts))
+      (cl-incf attempt)
+      (when (> attempt 1)
+        (unless dry-run
+          (let ((waited (monk--retry-wait plan attempt)))
+            (monk-log 'info "%s: %s: retry %d of %d after %.1fs"
+                      (oref machine name) (oref resource name) attempt attempts waited))))
+      (monk--run-node-once resource machine result verdict detail dry-run)
+      (setq done (or dry-run
+                     (pcase until
+                       ('failure (monk-result-failed-p result))
+                       (_ (not (monk-result-failed-p result)))))))
+    (when (and plan (> attempt 1))
+      (setf (monk-result-comment result)
+            (format "%s (attempt %d of %d)" (or (monk-result-comment result) "") attempt attempts)))
+    (when (and plan dry-run)
+      (setf (monk-result-comment result)
+            (concat (or (monk-result-comment result) "")
+                    (format " [retry up to %d]" attempts))))
+    result))
+
+(defun monk--run-node-once (resource machine result verdict detail dry-run)
+  "One check-and-repair of RESOURCE on MACHINE into RESULT.
+VERDICT and DETAIL come from `monk--requisite-verdict'.  With DRY-RUN,
+report only.  After a repair, `monk-resource-verify' can still fail it."
+  (condition-case err
+      (let* ((changes (monk-check resource machine))
+             (degree (or (plist-get changes :degree) 0.0)))
+        (cond
+         ((and (null changes) (eq verdict 'watch))
+          (monk--perform-watch resource machine result detail dry-run))
+         ((null changes)
+          (setf (monk-result-status result) monk-status-kept
+                (monk-result-degree result) monk-degree-satisfied
+                (monk-result-comment result) nil))
+         (dry-run
+          (setf (monk-result-status result) monk-status-would-repair
+                (monk-result-degree result) degree
+                (monk-result-changes result) changes
+                (monk-result-diff result)
+                (and monk-show-diffs (monk-diff resource machine changes))))
+         (t
+          (setf (monk-result-diff result)
+                (and monk-show-diffs (monk-diff resource machine changes))
+                (monk-result-degree result) degree)
+          (setf (monk-result-comment result) (monk-repair resource machine changes)
+                (monk-result-status result) monk-status-repaired
+                (monk-result-degree result) monk-degree-satisfied
+                (monk-result-changes result) changes)
+          (let ((reason (monk-resource-verify resource machine)))
+            (when reason
+              ;; The repair ran, but the verification says the system is
+              ;; still wrong: that is a failure, whatever the degree.
+              (setf (monk-result-degree result) 0.0)
+              (signal 'monk-resource-error
+                      (list (format "repaired, but verify failed: %s" reason))))))))
+    (error
+     (setf (monk-result-status result)
+           (if (> (monk-result-degree result) 0.0) monk-status-partial monk-status-failed)
+           (monk-result-comment result) (error-message-string err))
+     (monk-log 'warn "%s: %s %s %s: %s"
+               (oref machine name) (monk-resource-type resource)
+               (oref resource name) (monk-result-status result)
+               (error-message-string err))))
+  result)
 
 (defun monk--perform-watch (resource machine result detail dry-run)
   "Run the watch action of RESOURCE on MACHINE and fill RESULT.
@@ -1243,23 +1552,210 @@ DETAIL names the changed ref.  With DRY-RUN, report only."
   (repaired 0)
   (repaired-keys nil))
 
+(defconst monk-skip-fatal "an earlier :fatal resource failed on this machine"
+  "Skip comment on nodes left after a :fatal failure on their machine.")
+
+(defun monk--aggregate-groups (nodes)
+  "Return NODES with aggregatable runs folded: a list of nodes and node lists.
+A group is consecutive ready nodes on one machine whose resources
+`monk-resource-aggregate' merges and that have no requisite between
+them.  `monk-schedule' already put dependents after dependencies, so
+consecutive same-class nodes with no refs among them are safe."
+  (let (out (i 0) (n (length nodes)))
+    (while (< i n)
+      (let* ((node (nth i nodes))
+             (r (monk-node-resource node))
+             (m (monk-node-machine node))
+             (group (list node))
+             (j (1+ i)))
+        (while (and (< j n)
+                    (let* ((other (nth j nodes))
+                           (ro (monk-node-resource other)))
+                      (and (eq (monk-node-machine other) m)
+                           (eq (eieio-object-class-name ro) (eieio-object-class-name r))
+                           (monk-node-selected other)
+                           (monk-node-selected node)
+                           (not (monk--refs-among-p (cons other group))))))
+          (push (nth j nodes) group)
+          (cl-incf j))
+        (setq group (nreverse group))
+        (if (and (cdr group)
+                 (monk-resource-aggregate r (mapcar #'monk-node-resource (cdr group)) m))
+            (progn (push group out) (setq i j))
+          (push node out) (cl-incf i))))
+    (nreverse out)))
+
+(defun monk--refs-among-p (nodes)
+  "Return non-nil when any node in NODES names another in a requisite.
+Refs that point outside NODES do not matter here."
+  (seq-some (lambda (a)
+              (seq-some (lambda (kind)
+                          (seq-some (lambda (ref)
+                                      (seq-some (lambda (b) (and (not (eq a b))
+                                                                 (memq b (monk--nodes-for-ref ref a nodes))))
+                                                nodes))
+                                    (monk-resource-refs (monk-node-resource a) kind)))
+                        monk-requisite-kinds))
+            nodes))
+
+(defun monk--run-group (group nodes dry-run)
+  "Check and repair the aggregatable GROUP of NODES as one.  Return the results.
+The aggregate resource runs once; each member gets a result built from
+its share of the changes, so the report still shows every member.
+With DRY-RUN, report only."
+  (let* ((first (car group))
+         (m (monk-node-machine first))
+         (members (mapcar #'monk-node-resource group))
+         (aggregate (monk-resource-aggregate (car members) (cdr members) m))
+         (start (float-time)))
+    (dolist (node group) (monk-progress 'node-start :node node))
+    (let* ((mock (and monk--current-run (monk-run-mock monk--current-run)))
+           (unavailable (and (not mock) (monk-resource-available-p aggregate m)))
+           (skips (mapcar (lambda (node)
+                            (or (and (not (monk-node-selected node)) monk-skip-not-selected)
+                                (monk-resource-skip-reason (monk-node-resource node) m)
+                                unavailable
+                                (let ((v (monk--requisite-verdict node nodes)))
+                                  (and (eq (car v) 'skip) (cdr v)))))
+                          group))
+           (all-changes nil)
+           (aggregate-result (monk-result-create :machine (oref m name)
+                                                 :name (oref aggregate name)
+                                                 :type (monk-resource-type aggregate))))
+      (cond
+       ((seq-every-p #'identity skips) nil)
+       (mock (setf (monk-result-status aggregate-result) monk-status-kept
+                   (monk-result-comment aggregate-result) monk-comment-mocked))
+       (t
+        (monk--class-init-once aggregate m)
+        (monk--run-node-once aggregate m aggregate-result 'run nil dry-run)
+        (setq all-changes (monk-result-changes aggregate-result))))
+      (cl-mapcar
+       (lambda (node skip)
+         (let* ((r (monk-node-resource node))
+                (mine (and all-changes (monk-resource-disaggregate aggregate r all-changes)))
+                (result (monk-result-create :machine (oref m name) :name (oref r name)
+                                            :type (monk-resource-type r)
+                                            :origin (oref r origin)
+                                            :duration (- (float-time) start))))
+           (cond
+            (skip (setf (monk-result-status result) monk-status-skipped
+                        (monk-result-comment result) skip))
+            ((monk-result-failed-p aggregate-result)
+             (setf (monk-result-status result) (monk-result-status aggregate-result)
+                   (monk-result-comment result) (monk-result-comment aggregate-result)
+                   (monk-result-changes result) mine))
+            ((null mine)
+             (setf (monk-result-status result) monk-status-kept
+                   (monk-result-degree result) monk-degree-satisfied
+                   (monk-result-comment result) (and mock monk-comment-mocked)))
+            (t (setf (monk-result-status result) (monk-result-status aggregate-result)
+                     (monk-result-degree result) monk-degree-satisfied
+                     (monk-result-changes result) mine
+                     (monk-result-comment result)
+                     (format "%s (aggregated with %d other%s)"
+                             (or (monk-result-comment aggregate-result) "")
+                             (1- (length group)) (if (= 2 (length group)) "" "s")))))
+           (setf (monk-node-result node) result)
+           (monk-progress 'node-end :node node :result result)
+           (monk--run-result-functions result)
+           result))
+       group skips))))
+
 (defun monk--pass (nodes dry-run)
   "Run one pass over NODES in order.  Return a `monk-pass'.
 Results from earlier passes are cleared first so requisites read this
 pass only.  When DRY-RUN is non-nil, report only.  Every node runs:
-a failure never stops the pass."
+a failure never stops the pass, except after a :fatal failure, which
+ends the pass on that machine only."
   (dolist (node nodes)
     (setf (monk-node-result node) nil))
-  (let (results (repaired 0) (repaired-keys nil))
-    (dolist (node nodes)
-      (let ((result (monk--run-node node nodes dry-run)))
-        (push result results)
-        (when (monk-result-changed-p result)
-          (cl-incf repaired)
-          (push (monk-result-key result) repaired-keys))))
+  (let (results (repaired 0) (repaired-keys nil) (fatal-machines nil))
+    (dolist (item (monk--aggregate-groups nodes))
+      (let* ((group (if (listp item) item (list item)))
+             (m (monk-node-machine (car group)))
+             (group-results
+              (if (memq m fatal-machines)
+                  (mapcar (lambda (node)
+                            (let ((r (monk-node-resource node)))
+                              (setf (monk-node-result node)
+                                    (monk-result-create :machine (oref m name)
+                                                        :name (oref r name)
+                                                        :type (monk-resource-type r)
+                                                        :origin (oref r origin)
+                                                        :status monk-status-skipped
+                                                        :comment monk-skip-fatal))))
+                          group)
+                (if (listp item)
+                    (monk--run-group group nodes dry-run)
+                  (list (monk--run-node item nodes dry-run))))))
+        (cl-mapc (lambda (node result)
+                   (push result results)
+                   (when (monk-result-changed-p result)
+                     (cl-incf repaired)
+                     (push (monk-result-key result) repaired-keys))
+                   (when (and (monk-result-failed-p result)
+                              (oref (monk-node-resource node) fatal)
+                              (not dry-run))
+                     (monk-log 'warn "%s: %s failed and is :fatal; the rest of this machine is skipped"
+                               (oref m name) (monk-result-name result))
+                     (cl-pushnew m fatal-machines)))
+                 group group-results)))
     (monk-pass-create :results (nreverse results)
                       :repaired repaired
                       :repaired-keys (nreverse repaired-keys))))
+
+(defun monk--run-listeners (nodes run dry-run)
+  "After convergence, run the watch action once per node in NODES with :listen.
+A listening node fires when any of its refs changed in any pass of
+RUN.  Results replace the node's result in RUN.  With DRY-RUN, report
+what would fire.  Return the number that fired."
+  (let ((changed-keys (apply #'append (monk-run-repaired-by-pass run)))
+        (fired 0))
+    (dolist (node nodes)
+      (let* ((resource (monk-node-resource node))
+             (machine (monk-node-machine node))
+             (refs (monk-resource-refs resource 'listen)))
+        (when (and refs (monk-node-selected node)
+                   (not (monk-resource-skip-reason resource machine))
+                   (monk-node-result node)
+                   (not (monk-result-failed-p (monk-node-result node))))
+          (let ((triggers (seq-filter
+                           (lambda (ref)
+                             (seq-some (lambda (target) (member (monk-node-key target) changed-keys))
+                                       (monk--nodes-for-ref ref node nodes)))
+                           refs)))
+            (when triggers
+              (cl-incf fired)
+              (let ((result (monk-result-create :machine (oref machine name)
+                                                :name (oref resource name)
+                                                :type (monk-resource-type resource)
+                                                :origin (oref resource origin))))
+                (condition-case err
+                    (monk--perform-watch resource machine result
+                                         (format "listen: %s changed"
+                                                 (mapconcat #'monk-ref-name triggers ", "))
+                                         dry-run)
+                  (error
+                   (setf (monk-result-status result) monk-status-failed
+                         (monk-result-comment result) (error-message-string err))))
+                (setf (monk-node-result node) result)
+                (setf (monk-run-results run)
+                      (monk--merge-pass-results (monk-run-results run) (list result)))))))))
+    fired))
+
+(defun monk--collect-rescued (nodes run)
+  "Record in RUN the failed keys of NODES that a :handled handler rescued."
+  (dolist (node nodes)
+    (let ((resource (monk-node-resource node))
+          (result (monk-node-result node)))
+      (when (and (oref resource handled) result
+                 (memq (monk-result-status result)
+                       (list monk-status-kept monk-status-repaired monk-status-would-repair)))
+        (dolist (ref (monk-resource-refs resource 'onfail))
+          (dolist (target (monk--nodes-for-ref ref node nodes))
+            (when (and (monk-node-result target) (monk-result-failed-p (monk-node-result target)))
+              (cl-pushnew (monk-node-key target) (monk-run-rescued run) :test #'equal))))))))
 
 (defun monk--merge-pass-results (previous current)
   "Merge CURRENT pass results into PREVIOUS.  Return the new list.
@@ -1309,11 +1805,13 @@ POLICY and OPTIONS are recorded on the run so `monk-apply' can repeat it."
                                          (cl-remf o :watch-reasons)
                                          o)
                               :plan (plist-get options :plan)
+                              :mock (plist-get options :mock)
                               :reasons (plist-get options :watch-reasons)))
         (ordered (monk-schedule nodes))
         (all-results nil)
         (pass 0)
         (continue t))
+    (setq monk--current-run run)
     (monk-progress 'run-start :run run :nodes ordered)
     ;; A quit or an error in a hook must still send run-end, or a
     ;; display keeps its spinner and its live state.
@@ -1333,8 +1831,18 @@ POLICY and OPTIONS are recorded on the run so `monk-apply' can repeat it."
             ;; A resource that repaired twice is in a cycle and will
             ;; repair again.  Stop now instead of at the cap.
             (setq continue (and (not dry-run)
+                                (not (monk-run-mock run))
                                 (> repaired 0)
                                 (not (monk-run-flapping-p run))))))
+      ;; Listeners fire once, after the passes, whatever changed when.
+      (unless (monk-run-mock run)
+        (let ((fired (condition-case err
+                         (monk--run-listeners ordered run dry-run)
+                       (error (monk-log 'warn "listeners: %s" (error-message-string err)) 0))))
+          (when (> fired 0)
+            (monk-log 'info "%d listener(s) fired after convergence" fired))))
+      (monk--collect-rescued ordered run)
+      (setq monk--current-run nil)
       (setf (monk-run-end-time run) (current-time))
       (monk-progress 'run-end :run run))
     (when (monk-run-flapping-p run)
@@ -1376,7 +1884,9 @@ overrides `monk-max-passes'.  Return a `monk-run'.")
   "Apply POLICY to MACHINES as one dependency graph.
 Requisites that point at other machines or groups resolve inside this
 run.  OPTIONS is a plist: :dry-run, :passes, :plan, an earlier dry run
-to compare against, and :only, a list of (MACHINE-NAME . RESOURCE-NAME)
+to compare against, :mock, which compiles and orders the graph and
+calls no resource (every result is kept with `monk-comment-mocked',
+requisites still evaluate), and :only, a list of (MACHINE-NAME . RESOURCE-NAME)
 keys.  With :only, just those resources and their transitive
 dependents run; the rest compile, so requisites resolve, and are
 skipped.  Return a `monk-run'."

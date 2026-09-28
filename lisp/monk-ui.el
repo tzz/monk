@@ -114,6 +114,12 @@
   "When non-nil, status glyphs use Unicode.  Nil uses ASCII."
   :type 'boolean)
 
+(defcustom monk-ui-fold-statuses (list monk-status-kept monk-status-skipped)
+  "Statuses whose group starts folded in a detail buffer.
+Salt's `state_output: changes': failures and changes open, the rest
+one line each.  TAB on the group heading unfolds it."
+  :type '(repeat symbol))
+
 (defcustom monk-ui-select-window 'command
   "When to move point into the report buffer after a run.
 `command' selects the window when the run came from an interactive
@@ -1333,19 +1339,27 @@ In an apply with a plan, results that differ from the plan come first."
         (dolist (status monk-ui-status-order)
           (let ((group (seq-filter (lambda (r) (eq (monk-result-status r) status)) results)))
             (when group
-              (insert "\n" (monk-ui-badge status (format "%s (%d)" status (length group))) "\n")
-              (dolist (r group)
-                (let ((planned (and plan (monk-run-result plan (monk-result-key r)))))
-                  (if (and planned (not (eq (monk--plan-verdict planned r) monk-plan-as-planned)))
-                      (insert (propertize
-                               (concat (monk-ui-badge status)
-                                       (make-string (max 1 (- 14 (length (symbol-name status)))) ?\s)
-                                       (propertize (format "%-14s" (monk-result-type r)) 'face 'monk-ui-skipped)
-                                       (monk-result-name r)
-                                       (propertize "  see above" 'face 'monk-ui-skipped))
-                               'monk-ui-result r)
-                              "\n")
-                    (monk-ui--insert-result r planned run)))))))
+              (insert "\n")
+              (monk-ui-insert-fold
+               (intern (format "status-%s" status))
+               (concat (monk-ui-badge status (format "%s (%d)" status (length group)))
+                       (if (memq status monk-ui-fold-statuses)
+                           (propertize "  (TAB to expand)" 'face 'monk-ui-skipped)
+                         ""))
+               (lambda ()
+                 (dolist (r group)
+                   (let ((planned (and plan (monk-run-result plan (monk-result-key r)))))
+                     (if (and planned (not (eq (monk--plan-verdict planned r) monk-plan-as-planned)))
+                         (insert (propertize
+                                  (concat (monk-ui-badge status)
+                                          (make-string (max 1 (- 14 (length (symbol-name status)))) ?\s)
+                                          (propertize (format "%-14s" (monk-result-type r)) 'face 'monk-ui-skipped)
+                                          (monk-result-name r)
+                                          (propertize "  see above" 'face 'monk-ui-skipped))
+                                  'monk-ui-result r)
+                                 "\n")
+                       (monk-ui--insert-result r planned run)))))
+               (not (memq status monk-ui-fold-statuses))))))
         (goto-char (point-min))))
     (pop-to-buffer buffer)))
 

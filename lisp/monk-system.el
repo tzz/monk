@@ -42,6 +42,12 @@
 (defconst monk-systemd-user-unit-directory "~/.config/systemd/user/"
   "Directory for user-level unit files.")
 
+(defconst monk-launchd-agent-directory "~/Library/LaunchAgents/"
+  "Directory for per-user launchd agents.")
+
+(defconst monk-launchd-daemon-directory "/Library/LaunchDaemons/"
+  "Directory for system launchd daemons.")
+
 (defconst monk-sysctl-config-file "/etc/sysctl.d/90-monk.conf"
   "File that stores persistent sysctl settings.")
 
@@ -323,6 +329,15 @@ Watching the whole checkout would fire on every edit inside it."
               :documentation "Manage a user unit with systemctl --user."))
   "A systemd unit NAME: its file, its enablement, and its active state.")
 
+(cl-defmethod monk-resource-available-p ((_r monk-systemd-unit-resource) (m monk-machine))
+  "Systemd units need systemctl on M."
+  (unless (monk-run-context-get (list 'systemctl (oref m name)))
+    (monk-run-context-put (list 'systemctl (oref m name))
+                          (if (monk-exec-ok-p (monk-exec m "sh" "-c" "command -v systemctl"))
+                              'yes 'no)))
+  (and (eq 'no (monk-run-context-get (list 'systemctl (oref m name))))
+       "systemctl is not on this machine"))
+
 (cl-defgeneric monk--systemctl (resource machine &rest args)
   "Run systemctl with ARGS for RESOURCE on MACHINE.  Return a `monk-exec'.")
 
@@ -416,6 +431,119 @@ ARGS: :content :enabled :started :user-unit and common keys."
                                            t)
                                 :user-unit (plist-get args :user-unit)))))
 
+;;;; launchd
+
+(defclass monk-launchd-resource (monk-resource)
+  ((plist :initarg :plist
+          :initform nil
+          :documentation "The job as an alist; see `monk-launchd-plist'.  Nil: do not manage the file.")
+   (loaded :initarg :loaded
+           :initform t
+           :documentation "Whether the job must be loaded in launchd.")
+   (daemon :initarg :daemon
+           :initform nil
+           :documentation "A system daemon under /Library/LaunchDaemons, else a user agent."))
+  "A launchd job NAME (its label): its plist file and its loaded state.
+The macOS counterpart of `monk-systemd-unit-resource'.")
+
+(cl-defmethod monk-resource-available-p ((_r monk-launchd-resource) (m monk-machine))
+  (monk-program-available-p m "launchctl"))
+
+(defun monk-launchd-plist (label alist)
+  "Return the XML property list for job LABEL from ALIST.
+ALIST keys are launchd keys as symbols or strings; values are strings,
+numbers, t, nil (false), lists of strings (arrays), or alists (dicts)."
+  (cl-labels ((value (v)
+                (cond
+                 ((eq v t) "<true/>")
+                 ((null v) "<false/>")
+                 ((numberp v) (format "<integer>%s</integer>" v))
+                 ((stringp v) (format "<string>%s</string>" (monk-launchd--escape v)))
+                 ((and (consp v) (consp (car v)))
+                  (concat "<dict>" (mapconcat (lambda (c) (concat (key (car c)) (value (cdr c)))) v "") "</dict>"))
+                 ((listp v) (concat "<array>" (mapconcat #'value v "") "</array>"))
+                 (t (format "<string>%s</string>" (monk-launchd--escape (format "%s" v))))))
+              (key (k) (format "<key>%s</key>" (monk-launchd--escape (format "%s" k)))))
+    (concat "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+            "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+            "<plist version=\"1.0\">\n<dict>\n"
+            (key "Label") (value label) "\n"
+            (mapconcat (lambda (c) (concat (key (car c)) (value (cdr c)) "\n")) alist "")
+            "</dict>\n</plist>\n")))
+
+(defun monk-launchd--escape (text)
+  "Return TEXT with XML special characters escaped."
+  (replace-regexp-in-string
+   "[&<>]" (lambda (c) (pcase c ("&" "&amp;") ("<" "&lt;") (">" "&gt;"))) text t t))
+
+(cl-defmethod monk--launchd-path ((r monk-launchd-resource))
+  "Return the plist file path for R."
+  (concat (if (oref r daemon) monk-launchd-daemon-directory monk-launchd-agent-directory)
+          (oref r name) ".plist"))
+
+(cl-defmethod monk--launchd-domain ((r monk-launchd-resource) (m monk-machine))
+  "Return the launchctl domain target for R on M: system or gui/UID."
+  (if (oref r daemon) "system"
+    (format "gui/%s" (monk-with-run-cache (list 'uid (oref m name))
+                       (monk-exec-string m "id" "-u")))))
+
+(cl-defmethod monk--launchd-loaded-p ((r monk-launchd-resource) (m monk-machine))
+  (monk-exec-ok-p (monk-exec m "launchctl" "print"
+                             (format "%s/%s" (monk--launchd-domain r m) (oref r name))
+                             :sudo (oref r daemon))))
+
+(cl-defmethod monk-check ((r monk-launchd-resource) (m monk-machine))
+  (let ((changes nil)
+        (sudo (oref r daemon)))
+    (when (oref r plist)
+      (unless (equal (monk-launchd-plist (oref r name) (oref r plist))
+                     (monk-file-read m (monk--launchd-path r) sudo))
+        (setq changes (plist-put changes :content t))))
+    (let ((loaded (monk--launchd-loaded-p r m)))
+      (unless (eq (and loaded t) (and (oref r loaded) t))
+        (setq changes (plist-put changes :loaded (list loaded (oref r loaded))))))
+    changes))
+
+(cl-defmethod monk-diff ((r monk-launchd-resource) (m monk-machine) changes)
+  (when (plist-get changes :content)
+    (monk--unified-diff (monk-file-read m (monk--launchd-path r) (oref r daemon))
+                        (monk-launchd-plist (oref r name) (oref r plist))
+                        (monk--launchd-path r))))
+
+(cl-defmethod monk-repair ((r monk-launchd-resource) (m monk-machine) changes)
+  (let* ((sudo (oref r daemon))
+         (domain (monk--launchd-domain r m))
+         (path (monk-machine-local-path (monk-machine-path m (monk--launchd-path r) sudo)))
+         (notes nil))
+    (when (plist-get changes :content)
+      ;; launchd reads the file at load: write, then reload below.
+      (monk-file-write m (monk--launchd-path r) (monk-launchd-plist (oref r name) (oref r plist)) sudo)
+      (push "wrote plist" notes)
+      (when (monk--launchd-loaded-p r m)
+        (monk-exec m "launchctl" "bootout" (format "%s/%s" domain (oref r name)) :sudo sudo)
+        (setf (plist-get changes :loaded) (list nil (oref r loaded)))))
+    (when (plist-get changes :loaded)
+      (if (oref r loaded)
+          (progn (monk-exec-string m "launchctl" "bootstrap" domain path :sudo sudo)
+                 (push "loaded" notes))
+        (monk-exec-string m "launchctl" "bootout" (format "%s/%s" domain (oref r name)) :sudo sudo)
+        (push "unloaded" notes)))
+    (string-join (nreverse notes) ", ")))
+
+(cl-defmethod monk-resource-paths ((r monk-launchd-resource))
+  (list (monk--launchd-path r)))
+
+(defun monk-launchd (label &rest args)
+  "Ensure launchd job LABEL.  ARGS: :plist ALIST, :loaded, :daemon, common keys."
+  (monk-add-resource
+   (apply #'monk-launchd-resource
+          :name label
+          (monk--resource-plist args
+                                :plist (plist-get args :plist)
+                                :loaded (if (plist-member args :loaded) (plist-get args :loaded) t)
+                                :daemon (plist-get args :daemon)))))
+
 ;;;; command
 
 (defclass monk-command-resource (monk-resource)
@@ -426,7 +554,13 @@ ARGS: :content :enabled :started :user-unit and common keys."
             :documentation "Path.  When it exists, the command is kept.")
    (unless-command :initarg :unless-command
                    :initform nil
-                   :documentation "List (PROGRAM . ARGS).  Zero exit means kept."))
+                   :documentation "List (PROGRAM . ARGS).  Zero exit means kept.")
+   (verify :initarg :verify
+           :initform nil
+           :documentation "After the command ran: a list (PROGRAM . ARGS) that must exit
+zero, or a function of the machine that returns nil when all is well
+and a reason string otherwise.  Salt's check_cmd.  A non-zero exit or
+a reason fails the resource, with the output as the comment."))
   "A command that runs unless CREATES exists or UNLESS-COMMAND succeeds.
 Without either guard the command is always kept and runs only as a
 watch action, so `:watch' makes it a handler in the Ansible sense.")
@@ -461,11 +595,25 @@ watch action, so `:watch' makes it a handler in the Ansible sense.")
 (cl-defmethod monk-resource-paths ((r monk-command-resource))
   (and (oref r creates) (list (oref r creates))))
 
+(cl-defmethod monk-resource-verify ((r monk-command-resource) (m monk-machine))
+  "Run the :verify of R on M after a repair.  Return nil or a reason."
+  (pcase (oref r verify)
+    ('nil nil)
+    ((and (pred functionp) fn) (funcall fn m))
+    (`(,program . ,arguments)
+     (let ((exec (apply #'monk-exec m program
+                        (append arguments (list :sudo (oref r sudo))))))
+       (unless (monk-exec-ok-p exec)
+         (format "%s exited %d: %s" program (monk-exec-exit-code exec)
+                 (string-trim (monk-exec-output exec))))))
+    (other (format ":verify must be a function or (PROGRAM . ARGS), not %S" other))))
+
 (defun monk-command (name program &rest args)
   "Ensure the effect of PROGRAM.  NAME identifies the resource.
-ARGS: :args LIST, :creates PATH, :unless (PROGRAM . ARGS), and common
-keys.  Without :creates or :unless the command runs only when a
-watched ref changed."
+ARGS: :args LIST, :creates PATH, :unless (PROGRAM . ARGS), :verify
+\(PROGRAM . ARGS) or a function of the machine, and common keys.
+Without :creates or :unless the command runs only when a watched ref
+changed."
   (monk-add-resource
    (apply #'monk-command-resource
           :name name
@@ -473,7 +621,8 @@ watched ref changed."
                                 :program program
                                 :args (plist-get args :args)
                                 :creates (plist-get args :creates)
-                                :unless-command (plist-get args :unless)))))
+                                :unless-command (plist-get args :unless)
+                                :verify (plist-get args :verify)))))
 
 (provide 'monk-system)
 ;;; monk-system.el ends here

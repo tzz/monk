@@ -137,6 +137,39 @@ The first run creates the file, so `reload-app` runs once, then `after-reload`. 
   (monk-requisite-error (error-message-string err)))
 ```
 
+Two more requisites come from Salt. `:prereq` runs a resource before its target and only when the target would change; Monk checks the target without repairing it to decide. `:listen` is a watch whose action runs once, after the run converged, however many refs changed in however many passes:
+
+```elisp
+(monk-converge tutorial-m
+  (lambda (m)
+    (monk-command "stop-app" "true" :creates "~/never" :prereq '("~/app.conf"))
+    (monk-file "~/app.conf" :content "v1\n")
+    (monk-file "~/app.env" :content "e1\n")
+    (monk-command "restart-app" "true" :listen '("~/app.conf" "~/app.env"))))
+```
+
+Run controls: `:retry` tries again inside a pass, with backoff; `:verify` checks a command's effect after it ran; `:order` breaks ties; `:fatal` ends the pass on that machine; `:handled` on an `:onfail` handler rescues the failure it covers:
+
+```elisp
+(monk-converge tutorial-m
+  (lambda (m)
+    (monk-command "flaky" "false" :creates "~/never"
+                  :retry '(:attempts 2 :interval 0))
+    (monk-command "checked" "true" :creates "~/never"
+                  :verify '("sh" "-c" "exit 1"))
+    (monk-directory "~/rescue" :onfail '("flaky") :handled t)))
+```
+
+A mock run orders the graph and calls nothing:
+
+```elisp
+(monk-orchestrate (list tutorial-m)
+  (lambda (m)
+    (monk-directory "~/a")
+    (monk-directory "~/b" :require '("~/a")))
+  :mock t)
+```
+
 ## 5. Convergence and flapping
 
 Monk runs passes until a pass repairs nothing, up to `monk-max-passes`. Two resources that disagree about one file never settle. Monk notices when any resource repairs a second time, stops, and names it:
