@@ -309,21 +309,23 @@ names only A.  A cap below 4 misses it and reports did-not-converge."
       (should (monk-run-oscillating-p short))
       (should (string-match-p "did not converge" (monk-run-report-string short))))))
 
-(ert-deftest monk-test-failure-stops-run-unless-ignored ()
+(ert-deftest monk-test-failure-does-not-stop-the-pass ()
+  "A failed resource is a result; unrelated resources still run.
+This is the Salt execution model.  Only dependents skip."
   (monk-test-with-tmpdir dir
     (let ((run (monk-test-converge
                 (lambda (_m)
                   (monk-line-in-file (concat dir "missing") "x")
-                  (monk-directory (concat dir "after"))))))
+                  (monk-directory (concat dir "after"))
+                  (monk-directory (concat dir "dependent")
+                                  :require (list (concat dir "missing#x")))))))
       (should (eq 'failed (monk-test-status run (concat dir "missing#x"))))
-      (should-not (monk-test-result run (concat dir "after")))
-      (should-not (monk-run-ok-p run)))
-    (let ((run (monk-test-converge
-                (lambda (_m)
-                  (monk-line-in-file (concat dir "missing") "x" :ignore-errors t)
-                  (monk-directory (concat dir "after"))))))
-      (should (eq 'failed (monk-test-status run (concat dir "missing#x"))))
-      (should (eq 'repaired (monk-test-status run (concat dir "after")))))))
+      (should (eq 'repaired (monk-test-status run (concat dir "after"))))
+      (should (eq 'skipped (monk-test-status run (concat dir "dependent"))))
+      (should (string-match-p "require" (monk-result-comment
+                                         (monk-test-result run (concat dir "dependent")))))
+      (should-not (monk-run-ok-p run))
+      (should-not (file-directory-p (concat dir "dependent"))))))
 
 (ert-deftest monk-test-watch-runs-action-once ()
   "A handler watched by two changed resources runs its action once."
@@ -360,7 +362,7 @@ names only A.  A cap below 4 misses it and reports did-not-converge."
   (monk-test-with-tmpdir dir
     (let ((run (monk-test-converge
                 (lambda (_m)
-                  (monk-line-in-file (concat dir "missing") "x" :ignore-errors t)
+                  (monk-line-in-file (concat dir "missing") "x")
                   (monk-directory (concat dir "after") :require (list (concat dir "missing#x")))
                   (monk-directory (concat dir "free")))
                 :passes 1)))
@@ -373,7 +375,7 @@ names only A.  A cap below 4 misses it and reports did-not-converge."
   (monk-test-with-tmpdir dir
     (let* ((policy (lambda (_m)
                      (monk-file (concat dir "a") :content "a")
-                     (monk-line-in-file (concat dir "missing") "x" :ignore-errors t)
+                     (monk-line-in-file (concat dir "missing") "x")
                      (monk-directory (concat dir "on-change") :onchanges (list (concat dir "a")))
                      (monk-directory (concat dir "on-fail") :onfail (list (concat dir "missing#x")))
                      (monk-directory (concat dir "on-no-fail") :onfail (list (concat dir "a")))))
@@ -477,7 +479,7 @@ names only A.  A cap below 4 misses it and reports did-not-converge."
 (ert-deftest monk-test-file-content-error-signals-when-neither ()
   "A file with neither content nor source fails at check time."
   (monk-test-with-tmpdir dir
-    (let ((run (monk-test-converge (lambda (_m) (monk-file (concat dir "x") :ignore-errors t)))))
+    (let ((run (monk-test-converge (lambda (_m) (monk-file (concat dir "x"))))))
       (should (eq 'failed (monk-test-status run (concat dir "x")))))))
 
 (ert-deftest monk-test-edit-line ()
@@ -567,7 +569,7 @@ names only A.  A cap below 4 misses it and reports did-not-converge."
       (let ((run (monk-test-converge
                   (lambda (_m)
                     (monk-command "u" "false" :unless '("true"))
-                    (monk-command "bare" "true" :ignore-errors t)))))
+                    (monk-command "bare" "true")))))
         (should (eq 'kept (monk-test-status run "u")))
         (should (eq 'kept (monk-test-status run "bare")))))))
 
@@ -641,6 +643,16 @@ names only A.  A cap below 4 misses it and reports did-not-converge."
                                    :output "jq installed\ncurl installed\nnope installed\n"))))
       (should-not (monk-check r m)))))
 
+(defun monk-test-brew-info-json (&rest formulae)
+  "Return brew info --json=v2 text for FORMULAE, each (NAME FULL ALIASES)."
+  (json-serialize
+   (list :formulae
+         (vconcat (mapcar (lambda (f)
+                            (list :name (nth 0 f) :full_name (nth 1 f)
+                                  :aliases (vconcat (nth 2 f)) :oldnames []))
+                          formulae))
+         :casks [])))
+
 (ert-deftest monk-test-brew-check-handles-tapped-names ()
   (let ((m (monk-test-machine))
         (r (monk-brew-resource :name "b" :packages '("jq" "DimitarPetrov/stegify/stegify"))))
@@ -648,9 +660,143 @@ names only A.  A cap below 4 misses it and reports did-not-converge."
                (lambda (&rest _) '("jq" "stegify"))))
       (should-not (monk-check r m)))
     (cl-letf (((symbol-function 'monk-exec-lines)
-               (lambda (&rest _) '("jq"))))
+               (lambda (&rest _) '("jq")))
+              ((symbol-function 'monk-exec)
+               (lambda (_m _p &rest args)
+                 (monk-exec-create :command args :exit-code 0
+                                   :output (monk-test-brew-info-json
+                                            '("stegify" "dimitarpetrov/stegify/stegify" ()))))))
       (should (equal '(:install ("DimitarPetrov/stegify/stegify") :degree 0.5)
                      (monk-check r m))))))
+
+(ert-deftest monk-test-brew-check-resolves-aliases ()
+  "rg lists as ripgrep: an installed alias is not missing.
+Found live: `brew install rg' on every pass reported flapping."
+  (let ((m (monk-test-machine))
+        (r (monk-brew-resource :name "b" :packages '("rg" "jq" "gone")))
+        (info-calls nil))
+    (cl-letf (((symbol-function 'monk-exec-lines)
+               (lambda (&rest _) '("ripgrep" "jq")))
+              ((symbol-function 'monk-exec)
+               (lambda (_m _p &rest args)
+                 (push args info-calls)
+                 (monk-exec-create :command args :exit-code 0
+                                   :output (monk-test-brew-info-json
+                                            '("ripgrep" "ripgrep" ("rg")))))))
+      (should (equal '(:install ("gone") :degree (/ 2.0 3))
+                     (let ((c (monk-check r m)))
+                       (list :install (plist-get c :install)
+                             :degree (if (< (abs (- (plist-get c :degree) (/ 2.0 3))) 1e-9)
+                                         '(/ 2.0 3)
+                                       (plist-get c :degree))))))
+      ;; One info call, only for the names that looked missing.
+      (should (= 1 (length info-calls)))
+      (should (equal '("info" "--json=v2" "--formula" "rg" "gone") (car info-calls))))
+    ;; brew info failing (unknown name) falls back to the literal name.
+    (cl-letf (((symbol-function 'monk-exec-lines)
+               (lambda (&rest _) '("jq")))
+              ((symbol-function 'monk-exec)
+               (lambda (_m _p &rest args)
+                 (monk-exec-create :command args :exit-code 1 :output "Error: No formulae"))))
+      (should (equal '("rg" "gone") (plist-get (monk-check r m) :install))))))
+
+(ert-deftest monk-test-fact-probe-order ()
+  "A new probe runs after the existing ones; re-registering keeps the slot."
+  (let ((monk-fact-probes (copy-alist monk-fact-probes)))
+    (monk-register-fact-probe 'zzz (lambda (_m) '((z . 1))))
+    (should (eq 'zzz (car (car (last monk-fact-probes)))))
+    (should (eq 'uname (car (car monk-fact-probes))))
+    (monk-register-fact-probe 'uname #'ignore)
+    (should (eq 'uname (car (car monk-fact-probes))))
+    (should (eq #'ignore (alist-get 'uname monk-fact-probes)))))
+
+(ert-deftest monk-test-ui-rerun-repeats-a-plan ()
+  "g in a plan buffer plans again and shows the new result."
+  (require 'monk-ui)
+  (monk-test-with-tmpdir dir
+    (let* ((policy (lambda (_m) (monk-directory (concat dir "d"))))
+           (m (monk-test-machine))
+           (monk-log-level nil)
+           (plan (monk-plan m policy))
+           (shown nil))
+      (should (= 1 (monk-run-count plan monk-status-would-repair)))
+      (with-temp-buffer
+        (monk-ui-mode)
+        (setq monk-ui--run plan)
+        (cl-letf (((symbol-function 'monk-run-report) (lambda (run &rest _) (setq shown run))))
+          (make-directory (concat dir "d"))
+          (monk-ui-rerun))
+        (should shown)
+        (should (monk-run-dry-run shown))
+        (should (= 0 (monk-run-count shown monk-status-would-repair)))
+        (should (= 1 (monk-run-count shown monk-status-kept)))))))
+
+(defconst monk-test-brew-untrusted-output
+  "Error: Refusing to load formula dimitarpetrov/stegify/stegify from untrusted tap dimitarpetrov/stegify.
+Run `brew trust --formula dimitarpetrov/stegify/stegify` or `brew trust dimitarpetrov/stegify` to trust it."
+  "What brew install prints for a tap that was never trusted.")
+
+(defun monk-test-fake-brew (script)
+  "Return a fake `monk-exec' that answers from SCRIPT and logs calls.
+SCRIPT maps the first brew argument to a list of (EXIT-CODE OUTPUT)
+answers, consumed in order.  The log is stored in the symbol property
+`calls' of `monk-test-fake-brew'."
+  (put 'monk-test-fake-brew 'calls nil)
+  (lambda (_m program &rest args)
+    (push (cons program args) (get 'monk-test-fake-brew 'calls))
+    (let* ((answers (assoc (car args) script))
+           (answer (or (cadr answers) '(0 ""))))
+      (when (cddr answers) (setcdr answers (cddr answers)))
+      (monk-exec-create :command (cons program args)
+                        :exit-code (car answer) :output (cadr answer)))))
+
+(ert-deftest monk-test-brew-install-trusts-tap-and-retries ()
+  "An untrusted-tap refusal runs brew trust once, then installs."
+  (let* ((m (monk-test-machine))
+         (r (monk-brew-resource :name "b" :packages '("DimitarPetrov/stegify/stegify")))
+         (script (list (list "install" (list 1 monk-test-brew-untrusted-output) '(0 "ok"))
+                       (list "trust" '(0 "")))))
+    (cl-letf (((symbol-function 'monk-exec) (monk-test-fake-brew script)))
+      (should (equal "installed DimitarPetrov/stegify/stegify (after brew trust dimitarpetrov/stegify)"
+                     (monk-repair r m '(:install ("DimitarPetrov/stegify/stegify")))))
+      (should (equal '(("brew" "install" "DimitarPetrov/stegify/stegify")
+                       ("brew" "trust" "dimitarpetrov/stegify")
+                       ("brew" "install" "DimitarPetrov/stegify/stegify"))
+                     (reverse (get 'monk-test-fake-brew 'calls)))))))
+
+(ert-deftest monk-test-brew-install-other-failure-propagates ()
+  "A failure that is not an untrusted tap signals without a retry."
+  (let* ((m (monk-test-machine))
+         (r (monk-brew-resource :name "b" :packages '("nope")))
+         (script (list (list "install" '(1 "Error: No available formula with the name \"nope\".")))))
+    (cl-letf (((symbol-function 'monk-exec) (monk-test-fake-brew script)))
+      (should-error (monk-repair r m '(:install ("nope"))) :type 'monk-exec-error)
+      (should (= 1 (length (get 'monk-test-fake-brew 'calls)))))))
+
+(ert-deftest monk-test-brew-install-trust-unsupported-propagates ()
+  "When brew trust itself fails (old Homebrew), the original error signals."
+  (let* ((m (monk-test-machine))
+         (r (monk-brew-resource :name "b" :packages '("x/y/z")))
+         (script (list (list "install" (list 1 monk-test-brew-untrusted-output))
+                       (list "trust" '(1 "Error: Unknown command: trust")))))
+    (cl-letf (((symbol-function 'monk-exec) (monk-test-fake-brew script)))
+      (let ((err (should-error (monk-repair r m '(:install ("x/y/z"))) :type 'monk-exec-error)))
+        (should (string-match-p "untrusted tap" (format "%s" (car (last err))))))
+      (should (= 2 (length (get 'monk-test-fake-brew 'calls)))))))
+
+(ert-deftest monk-test-brew-tap-trusts-after-tapping ()
+  "Tapping also trusts; the comment says which happened."
+  (let ((m (monk-test-machine))
+        (r (monk-brew-tap-resource :name "a/b")))
+    (cl-letf (((symbol-function 'monk-exec)
+               (monk-test-fake-brew (list (list "tap" '(0 "")) (list "trust" '(0 ""))))))
+      (should (equal "tapped and trusted" (monk-repair r m '(:tap "a/b"))))
+      (should (equal '(("brew" "tap" "a/b") ("brew" "trust" "a/b"))
+                     (reverse (get 'monk-test-fake-brew 'calls)))))
+    (cl-letf (((symbol-function 'monk-exec)
+               (monk-test-fake-brew (list (list "tap" '(0 ""))
+                                          (list "trust" '(1 "Error: Unknown command: trust"))))))
+      (should (equal "tapped" (monk-repair r m '(:tap "a/b")))))))
 
 ;;;; Inventory
 
@@ -740,26 +886,24 @@ names only A.  A cap below 4 misses it and reports did-not-converge."
            (run (monk-test-converge
                  (lambda (_m)
                    ;; Needs the file, which the next resource creates.
-                   (monk-line-in-file f "x" :ignore-errors t)
+                   (monk-line-in-file f "x")
                    (monk-file f :content "x\n")))))
       (should (eq 'kept (monk-test-status run (concat f "#x"))))
       (should (eq 'repaired (monk-test-status run f)))
       (should (monk-run-ok-p run))
       (should (= 2 (monk-run-passes run))))))
 
-(ert-deftest monk-test-fatal-failure-runs-one-pass ()
-  "A fatal failure stops the run.  It does not re-run earlier repairs."
+(ert-deftest monk-test-failure-still-confirms-repairs ()
+  "A failure does not cut the run short: repairs still get a second pass.
+The failed resource is checked again in that pass and stays failed."
   (monk-test-with-tmpdir dir
-    (let* ((marker (concat dir "count"))
-           (run (monk-test-converge
+    (let* ((run (monk-test-converge
                  (lambda (_m)
-                   (monk-command "counter" "sh"
-                                 :args (list "-c" (format "echo 1 >> %s" marker))
-                                 :creates (concat dir "never"))
+                   (monk-directory (concat dir "made"))
                    (monk-line-in-file (concat dir "missing") "x")))))
-      (should (= 1 (monk-run-passes run)))
+      (should (= 2 (monk-run-passes run)))
       (should-not (monk-run-oscillating-p run))
-      (should (= 1 (with-temp-buffer (insert-file-contents marker) (count-lines 1 (point-max)))))
+      (should (eq 'repaired (monk-test-status run (concat dir "made"))))
       (should (eq 'failed (monk-test-status run (concat dir "missing#x")))))))
 
 (ert-deftest monk-test-systemd-enabled-states ()
@@ -897,7 +1041,7 @@ A :degree threshold on a require lets a follower run anyway."
                 (monk-converge
                  m
                  (lambda (_m)
-                   (monk-apt "pkgs" '("a" "b" "c" "d") :ignore-errors t)
+                   (monk-apt "pkgs" '("a" "b" "c" "d"))
                    (monk-command "needs-all" "true" :require '("pkgs"))
                    (monk-command "needs-half" "true" :require '((:ref "pkgs" :degree 0.5))))
                  :passes 1))))
@@ -1104,7 +1248,7 @@ change appears, and one resource fails."
     (let* ((policy (lambda (_m)
                      (monk-directory (concat dir "planned"))
                      (monk-file (concat dir "stable") :content "same\n")
-                     (monk-line-in-file (concat dir "fragile") "x" :ignore-errors t)))
+                     (monk-line-in-file (concat dir "fragile") "x")))
            (m (monk-test-machine))
            (monk-log-level nil))
       (with-temp-file (concat dir "stable") (insert "same\n"))
@@ -2111,6 +2255,470 @@ refuses to run from a side window."
     (cl-letf (((symbol-function 'monk-exec)
                (lambda (&rest _) (monk-exec-create :exit-code 0 :output "512\n"))))
       (should-not (monk-check r m)))))
+
+;;;; CELL and CEL
+
+(defun monk-test-cell-machines ()
+  "Return three machines with distinct facts, vars, and groups for guard tests."
+  (let ((mac (monk-local-machine :name "foxy"))
+        (moi (monk-machine :name "moi" :address "moi.local"))
+        (pi (monk-machine :name "kamen" :address "kamen.local")))
+    (oset mac groups '(macs home))
+    (oset mac vars '((home_leader . t) (disk . 50)))
+    (oset mac facts '((kernel . "Darwin") (arch . "arm64") (os-family . "Darwin")))
+    (oset moi groups '(macs home))
+    (oset moi facts '((kernel . "Darwin") (arch . "x86_64") (os-family . "Darwin")))
+    (oset pi groups '(unix home))
+    (oset pi vars '((disk . 200)))
+    (oset pi facts '((kernel . "Linux") (arch . "aarch64") (os-family . "Debian")
+                     (distribution . "Raspbian")))
+    (dolist (m (list mac moi pi))
+      (oset m classes (monk-hard-classes m)))
+    (list mac moi pi)))
+
+(defun monk-test-cell-names (guard machines)
+  "Return the names of MACHINES that GUARD matches, as one string."
+  (mapconcat (lambda (m) (oref m name)) (monk-cell-select guard machines) ","))
+
+(ert-deftest monk-test-cell-eval-operators ()
+  "Every CELL operator evaluates against a machine."
+  (pcase-let ((`(,mac ,_moi ,pi) (monk-test-cell-machines)))
+    (should (monk-cell-eval mac '(class darwin)))
+    (should-not (monk-cell-eval mac '(class linux)))
+    (should (monk-cell-eval mac '(group macs)))
+    (should (equal "arm64" (monk-cell-eval mac '(fact arch))))
+    (should (equal 50 (monk-cell-eval mac '(var disk))))
+    (should (equal "foxy" (monk-cell-eval mac '(name))))
+    (should (monk-cell-eval mac '(local)))
+    (should-not (monk-cell-eval pi '(local)))
+    (should (monk-cell-eval mac '(has (var disk))))
+    (should-not (monk-cell-eval mac '(has (fact distribution))))
+    (should (monk-cell-eval pi '(has (fact distribution))))
+    (should (monk-cell-eval pi '(and (class linux) (> (var disk) 100))))
+    (should (monk-cell-eval mac '(or (class linux) (= (fact arch) "arm64"))))
+    (should (monk-cell-eval mac '(not (class linux))))
+    (should (equal "big" (monk-cell-eval pi '(if (>= (var disk) 200) "big" "small"))))
+    (should (monk-cell-eval mac '(/= (fact arch) "x86_64")))
+    (should (monk-cell-eval mac '(in "arm64" (list "arm64" "aarch64"))))
+    (should (monk-cell-eval mac '(in "macs" (groups))))
+    (should (monk-cell-eval pi '(starts-with (name) "ka")))
+    (should (monk-cell-eval pi '(ends-with (fact distribution) "bian")))
+    (should (monk-cell-eval pi '(contains (fact distribution) "asp")))
+    (should (monk-cell-eval pi '(match (fact kernel) "^Lin")))
+    (should (equal 4 (monk-cell-eval mac '(size "abcd"))))
+    (should (equal 2 (monk-cell-eval mac '(size (groups)))))
+    (should (equal 7 (monk-cell-eval mac '(+ 3 4))))
+    (should (equal "ab" (monk-cell-eval mac '(+ "a" "b"))))
+    (should (equal 1 (monk-cell-eval mac '(% 7 3))))
+    (should (equal "x" (monk-cell-eval mac "x")))
+    (should (null (monk-cell-eval mac '(fact missing))))))
+
+(ert-deftest monk-test-cell-eval-short-circuit ()
+  "and/or stop at the first deciding part, so a bad later part never runs."
+  (let ((m (car (monk-test-cell-machines))))
+    (should-not (monk-cell-eval m '(and (class linux) (frob))))
+    (should (monk-cell-eval m '(or (class darwin) (frob))))
+    (should-error (monk-cell-eval m '(and (class darwin) (frob))) :type 'monk-guard-error)))
+
+(ert-deftest monk-test-cell-errors ()
+  "Bad forms signal `monk-guard-error' with a message that names the problem."
+  (let ((m (car (monk-test-cell-machines))))
+    (dolist (case '(((frob 1) . "Unknown CELL operator")
+                    ((fact) . "takes 1 argument")
+                    ((= 1) . "takes 2 arguments")
+                    ((has (name)) . "has needs")
+                    ((< "a" 1) . "cannot compare")
+                    ((size 3) . "needs a string or list")
+                    ((/ 1 0) . "division by zero")
+                    (frob . "Not a CELL form")))
+      (let ((err (should-error (monk-cell-eval m (car case)) :type 'monk-guard-error)))
+        (should (string-match-p (cdr case) (cadr err)))))
+    (should-error (monk-cell-check '(and (class a) (nope))) :type 'monk-guard-error)
+    (should (equal '(and (class a)) (monk-cell-check '(and (class a)))))))
+
+(ert-deftest monk-test-cell-select-and-matches ()
+  "Selection filters machines; matches keeps errors per machine."
+  (let ((machines (monk-test-cell-machines)))
+    (should (equal "foxy,moi" (monk-test-cell-names '(class darwin) machines)))
+    (should (equal "kamen" (monk-test-cell-names '(> (var disk) 100) machines)))
+    (should (equal "foxy" (monk-test-cell-names '(local) machines)))
+    (should (equal "foxy,moi,kamen" (monk-test-cell-names '(group home) machines)))
+    ;; moi has no disk var: (> nil 100) signals, so moi does not match
+    ;; in select and carries the error in matches.
+    (should (equal "kamen" (monk-test-cell-names '(> (var disk) 100) machines)))
+    (let ((matches (monk-cell-matches '(> (var disk) 100) machines)))
+      (should (= 3 (length matches)))
+      (should-not (cdr (assoc (car machines) matches)))
+      (should (monk-cell-error-p (cdr (assoc (nth 1 machines) matches))))
+      (should (eq t (cdr (assoc (nth 2 machines) matches)))))))
+
+(ert-deftest monk-test-cell-explain ()
+  "Explanations name the deciding clause."
+  (pcase-let ((`(,mac ,_moi ,pi) (monk-test-cell-machines)))
+    (should (equal "class linux is absent"
+                   (monk-cell-explain mac '(and (class darwin) (class linux)))))
+    (should (string-match-p "every part is false"
+                            (monk-cell-explain mac '(or (class linux) (= (fact arch) "x86_64")))))
+    (should (equal "(class darwin) is true, so (not (class darwin)) is false"
+                   (monk-cell-explain mac '(not (class darwin)))))
+    (should (equal "'darwin' in classes is true, so !'darwin' in classes is false"
+                   (monk-cell-explain mac '(not (class darwin)) 'cel)))
+    (should (string-match-p "(var disk) = 200"
+                            (monk-cell-explain pi '(> (var disk) 100))))
+    (should (string-match-p "is true" (monk-cell-explain pi '(and (class linux) (group unix)))))))
+
+(ert-deftest monk-test-cel-parse ()
+  "CEL text parses to the expected CELL forms."
+  (dolist (case '(("'darwin' in classes" . (class darwin))
+                  ("'macs' in groups" . (group macs))
+                  ("'arch' in facts" . (has (fact arch)))
+                  ("facts.arch == 'arm64'" . (= (fact arch) "arm64"))
+                  ("facts['arch'] != \"x86_64\"" . (/= (fact arch) "x86_64"))
+                  ("vars.disk > 100 && !local" . (and (> (var disk) 100) (not (local))))
+                  ("a in classes || b in classes" . error)
+                  ("'a' in classes || 'b' in classes || 'c' in classes"
+                   . (or (class a) (class b) (class c)))
+                  ("has(vars.disk)" . (has (var disk)))
+                  ("size(classes) >= 3" . (>= (size (classes)) 3))
+                  ("name.startsWith('ka')" . (starts-with (name) "ka"))
+                  ("facts.kernel.matches('^Lin')" . (match (fact kernel) "^Lin"))
+                  ("local ? 'here' : 'there'" . (if (local) "here" "there"))
+                  ("facts.arch in ['arm64', 'aarch64']" . (in (fact arch) (list "arm64" "aarch64")))
+                  ("1 + 2 * 3" . (+ 1 (* 2 3)))
+                  ("(1 + 2) * 3" . (* (+ 1 2) 3))
+                  ("-vars.disk" . (- 0 (var disk)))
+                  ("-5" . -5)
+                  ("true && !false" . (and t (not nil)))
+                  ("'it\\'s'" . "it's")
+                  ("" . error)
+                  ("facts.arch ==" . error)
+                  ("foo == 1" . error)
+                  ("facts.a.b" . error)
+                  ("classes.arch" . error)
+                  ("frob(1)" . error)
+                  ("name.frob(1)" . error)
+                  ("1 2" . error)
+                  ("facts.arch == 'x' @" . error)))
+    (if (eq (cdr case) 'error)
+        (should-error (monk-cel-parse (car case)) :type 'monk-cel-error)
+      (should (equal (cdr case) (monk-cel-parse (car case)))))))
+
+(ert-deftest monk-test-cel-roundtrip ()
+  "CELL prints as CEL with minimal parentheses and parses back equal."
+  (dolist (case '(((and (class darwin) (= (fact arch) "arm64"))
+                   . "'darwin' in classes && facts.arch == 'arm64'")
+                  ((or (and (class a) (class b)) (class c))
+                   . "'a' in classes && 'b' in classes || 'c' in classes")
+                  ((and (or (class a) (class b)) (class c))
+                   . "('a' in classes || 'b' in classes) && 'c' in classes")
+                  ((not (and (class a) (class b))) . "!('a' in classes && 'b' in classes)")
+                  ((- 1 (- 2 3)) . "1 - (2 - 3)")
+                  ((- (- 1 2) 3) . "1 - 2 - 3")
+                  ((* (+ 1 2) 3) . "(1 + 2) * 3")
+                  ((if (class a) (if (class b) 1 2) 3) . "'a' in classes ? ('b' in classes ? 1 : 2) : 3")
+                  ((in "x" (list "x" "y")) . "'x' in ['x', 'y']")
+                  ((starts-with (name) "it's") . "name.startsWith('it\\'s')")
+                  ((has (var disk)) . "has(vars.disk)")
+                  ((not (not (local))) . "!!local")))
+    (should (equal (cdr case) (monk-cell-to-cel (car case))))
+    (should (equal (car case) (monk-cel-parse (cdr case))))))
+
+(ert-deftest monk-test-cell-read ()
+  "`monk-cell-read' takes CELL in parentheses and CEL otherwise."
+  (should (equal '(class a) (monk-cell-read "  (class a) ")))
+  (should (equal '(class a) (monk-cell-read "'a' in classes")))
+  (should-error (monk-cell-read "(nope a)") :type 'monk-guard-error)
+  (should-error (monk-cell-read "nope") :type 'monk-cel-error))
+
+(ert-deftest monk-test-when-guard-skips-with-reason ()
+  "A :when guard skips a resource and the comment names the false clause."
+  (monk-test-with-tmpdir dir
+    (let ((run (monk-test-converge
+                (lambda (_m)
+                  (monk-directory (concat dir "linux") :when '(class linux))
+                  (monk-directory (concat dir "cel") :when "'darwin' in classes && vars.x == 1")
+                  (monk-directory (concat dir "both") :classes '(linux) :when '(= (fact arch) "x86_64"))
+                  (monk-directory (concat dir "yes") :when "'linux' in classes && facts.arch == 'x86_64'")
+                  (monk-directory (concat dir "fn") :only-if (lambda (_m) nil))))))
+      (should (eq monk-status-repaired (monk-test-status run (concat dir "linux"))))
+      (should (eq monk-status-skipped (monk-test-status run (concat dir "cel"))))
+      (should (equal "class darwin is absent"
+                     (monk-result-comment (monk-test-result run (concat dir "cel")))))
+      (should (eq monk-status-repaired (monk-test-status run (concat dir "both"))))
+      (should (eq monk-status-repaired (monk-test-status run (concat dir "yes"))))
+      (should (equal monk-skip-only-if
+                     (monk-result-comment (monk-test-result run (concat dir "fn")))))
+      (should-not (file-directory-p (concat dir "cel"))))))
+
+(ert-deftest monk-test-when-guard-checked-at-compile ()
+  "A bad :when guard fails the compile with the resource name."
+  (let ((err (should-error (monk-compile (monk-test-machine)
+                                         (lambda (_m) (monk-directory "~/x" :when "nope == 1")))
+                           :type 'monk-policy-error)))
+    (should (string-match-p "~/x.*bad :when guard.*Unknown name nope" (cadr err))))
+  (should-error (monk-compile (monk-test-machine)
+                              (lambda (_m) (monk-directory "~/x" :when '(frob))))
+                :type 'monk-policy-error))
+
+(ert-deftest monk-test-resource-guard-combines-classes-and-when ()
+  ":classes and :when form one CELL guard; the compile stores the parsed form."
+  (let* ((resources (monk-compile (monk-test-machine)
+                                  (lambda (_m)
+                                    (monk-directory "~/a" :classes '(x y))
+                                    (monk-directory "~/b" :when "'x' in classes")
+                                    (monk-directory "~/c" :classes '(x) :when '(local))
+                                    (monk-directory "~/d"))))
+         (guard (lambda (i) (monk-resource-guard (nth i resources)))))
+    (should (equal '(and (class x) (class y)) (funcall guard 0)))
+    (should (equal '(class x) (funcall guard 1)))
+    (should (equal '(and (class x) (local)) (funcall guard 2)))
+    (should (null (funcall guard 3)))
+    (should (equal '(class x) (oref (nth 1 resources) when)))))
+
+(ert-deftest monk-test-machine-describe ()
+  "The description lists what guards can see, sorted by key."
+  (let* ((m (car (monk-test-cell-machines)))
+         (d (monk-machine-describe m))
+         (text (monk-machine-describe-string m "  ")))
+    (should (memq 'darwin (alist-get 'classes d)))
+    (should (equal '(macs home) (alist-get 'groups d)))
+    (should (equal '(arch kernel os-family) (mapcar #'car (alist-get 'facts d))))
+    (should (equal '(disk home_leader) (mapcar #'car (alist-get 'vars d))))
+    (should (string-match-p "^  classes: .*darwin" text))
+    (should (string-match-p "^    arch +\"arm64\"" text))))
+
+(ert-deftest monk-test-report-verbose-describes-machine ()
+  "The verbose text report includes the machine facts under its header."
+  (monk-test-with-tmpdir dir
+    (let* ((run (monk-test-converge (lambda (_m) (monk-directory (concat dir "d")))))
+           (verbose (monk-run-report-string run t))
+           (terse (monk-run-report-string run)))
+      (should (string-match-p "   classes: " verbose))
+      (should (string-match-p "kernel +\"Linux\"" verbose))
+      (should-not (string-match-p "classes: " terse)))))
+
+;;;; Origins and jump to source
+
+(ert-deftest monk-test-resource-origin-from-file ()
+  "A policy loaded from a file stamps each resource with that file."
+  (monk-test-with-tmpdir dir
+    (let ((policy-file (concat dir "policy.el")))
+      (with-temp-file policy-file
+        (insert ";; -*- lexical-binding: t; -*-\n"
+                "(defun monk-test-origin-policy (_m)\n"
+                "  (monk-directory \"~/from-file\"))\n"))
+      (load policy-file nil t)
+      (let* ((m (monk-test-machine))
+             (resources (monk-compile m #'monk-test-origin-policy))
+             (origin (oref (car resources) origin)))
+        (should (equal (cdr origin) "~/from-file"))
+        (should (equal (file-name-sans-extension (car origin))
+                       (file-name-sans-extension policy-file)))
+        (should (equal (monk-origin-file origin) policy-file))
+        ;; the result carries it through a run
+        (let* ((monk-log-level nil)
+               (run (monk-plan m #'monk-test-origin-policy))
+               (result (car (monk-run-results run))))
+          (should (equal origin (monk-result-origin result)))
+          (save-window-excursion
+            (monk-result-find-definition result)
+            (should (equal (buffer-file-name) policy-file))
+            (should (looking-at ".*monk-directory \"~/from-file\"")))
+          (kill-buffer (get-file-buffer policy-file))))
+      (fmakunbound 'monk-test-origin-policy))))
+
+(ert-deftest monk-test-lambda-policy-origin-is-visited-file ()
+  "A lambda policy compiled while visiting a file is credited to that file."
+  (monk-test-with-tmpdir dir
+    (let ((file (concat dir "scratch.el")))
+      (with-temp-file file (insert "(monk-directory \"~/x\")\n"))
+      (with-current-buffer (find-file-noselect file)
+        (let ((resources (monk-compile (monk-test-machine)
+                                       (lambda (_m) (monk-directory "~/x")))))
+          (should (equal (cons file "~/x") (oref (car resources) origin)))))
+      (kill-buffer (get-file-buffer file)))))
+
+(ert-deftest monk-test-origin-without-file ()
+  "Without a file, the origin has no path and jumping is a user error."
+  (let* ((load-file-name nil)
+         (resources (with-temp-buffer
+                      (monk-compile (monk-test-machine) (lambda (_m) (monk-directory "~/x"))))))
+    (should (null (car (oref (car resources) origin))))
+    (should-error (monk-find-origin (oref (car resources) origin)) :type 'user-error)))
+
+(ert-deftest monk-test-inventory-origin ()
+  "Machines remember the file that defined the inventory."
+  (monk-test-with-tmpdir dir
+    (let ((file (concat dir "inventory.el")))
+      (with-temp-file file
+        (insert "(monk-inventory-define '(world :hosts ((alpha) (beta :address \"b\"))))\n"))
+      (let ((monk-inventory nil))
+        (load file nil t)
+        (should (equal (cons file "alpha") (oref (monk-inventory-find 'alpha) origin)))
+        (save-window-excursion
+          (monk-machine-find-definition (monk-inventory-find 'beta))
+          (should (equal (buffer-file-name) file))
+          (should (looking-at ".*beta")))
+        (kill-buffer (get-file-buffer file))))))
+
+(ert-deftest monk-test-event-carries-source ()
+  "The event record carries the policy file under native.source and restores it."
+  (require 'monk-event)
+  (let* ((result (monk-result-create :machine "m" :name "~/x" :type "directory"
+                                     :status monk-status-kept
+                                     :origin '("/tmp/policy" . "~/x")))
+         (run (monk-run-create :machines nil :results (list result) :passes 1))
+         (event (monk-event-result result run 1))
+         (back (monk-event-to-result (monk-event-parse (monk-event-line event)))))
+    (should (equal "/tmp/policy" (alist-get 'source (alist-get 'native event))))
+    (should (equal '("/tmp/policy" . "~/x") (monk-result-origin back)))))
+
+(ert-deftest monk-test-ui-find-definition-from-buffers ()
+  "`.' in the detail, inspector, and query buffers finds the thing at point."
+  (require 'monk-ui)
+  (monk-test-with-tmpdir dir
+    (let ((policy-file (concat dir "policy.el"))
+          (inventory-file (concat dir "inventory.el")))
+      (with-temp-file policy-file
+        (insert ";; -*- lexical-binding: t; -*-\n"
+                "(defun monk-test-jump-policy (_m) (monk-directory \"~/jump\"))\n"))
+      (with-temp-file inventory-file
+        (insert "(monk-inventory-define '(world :hosts ((testbox))))\n"))
+      (load policy-file nil t)
+      (let ((monk-inventory nil) (monk-log-level nil))
+        (load inventory-file nil t)
+        (let* ((m (monk-inventory-find 'testbox))
+               (run (progn (oset m facts monk-test-fake-facts)
+                           (oset m classes (monk-hard-classes m))
+                           (monk-plan m #'monk-test-jump-policy))))
+          (with-temp-buffer
+            (monk-ui-mode)
+            (setq monk-ui--run run)
+            (monk-ui-refresh)
+            ;; machine row in *monk*
+            (goto-char (point-min))
+            (forward-line 1)
+            (save-window-excursion
+              (monk-ui-find-definition)
+              (should (equal (buffer-file-name) inventory-file)))
+            ;; result line in the detail buffer
+            (save-window-excursion (monk-ui-show-machine "testbox"))
+            (with-current-buffer (format monk-ui-detail-buffer-format "testbox")
+              (goto-char (point-min))
+              (should (search-forward "~/jump" nil t))
+              (save-window-excursion
+                (monk-ui-find-definition)
+                (should (equal (buffer-file-name) policy-file))
+                (should (looking-at ".*~/jump")))
+              ;; machine heading in the same buffer
+              (goto-char (point-min))
+              (should (search-forward "testbox: " nil t))
+              (save-window-excursion
+                (monk-ui-find-definition)
+                (should (equal (buffer-file-name) inventory-file))))
+            (kill-buffer (format monk-ui-detail-buffer-format "testbox")))
+          ;; query buffer
+          (save-window-excursion (monk-ui-query "'linux' in classes" (list m)))
+          (with-current-buffer monk-ui-query-buffer-name
+            (goto-char (point-min))
+            (should (search-forward "✓ testbox" nil t))
+            (save-window-excursion
+              (monk-ui-find-definition)
+              (should (equal (buffer-file-name) inventory-file))))
+          (kill-buffer monk-ui-query-buffer-name)))
+      (dolist (f (list policy-file inventory-file))
+        (when (get-file-buffer f) (kill-buffer (get-file-buffer f))))
+      (fmakunbound 'monk-test-jump-policy))))
+
+;;;; UI: folds, inspector, query
+
+(ert-deftest monk-test-ui-fold ()
+  "A fold starts closed, TAB opens it, and the indicator follows."
+  (require 'monk-ui)
+  (with-temp-buffer
+    (monk-ui-detail-mode)
+    (let ((inhibit-read-only t) heading)
+      (insert "top\n")
+      (setq heading (monk-ui-insert-fold 'x "Section" (lambda () (insert "body line\n"))))
+      (insert "after\n")
+      (goto-char heading)
+      (should (get-text-property (1+ (line-end-position)) 'invisible))
+      (should (equal (get-text-property heading 'display) monk-ui-fold-indicator-closed))
+      (goto-char heading)
+      (monk-ui-toggle-fold)
+      (should-not (get-text-property (1+ (line-end-position)) 'invisible))
+      (should (equal (get-text-property heading 'display) monk-ui-fold-indicator-open))
+      (monk-ui-toggle-fold)
+      (should (get-text-property (1+ (line-end-position)) 'invisible))
+      ;; the text after the fold stays visible either way
+      (goto-char (point-max))
+      (should-not (get-text-property (line-beginning-position 0) 'invisible)))))
+
+(ert-deftest monk-test-ui-detail-has-machine-fold ()
+  "The per-machine detail buffer carries a folded machine section."
+  (require 'monk-ui)
+  (monk-test-with-tmpdir dir
+    (let ((run (monk-test-converge (lambda (_m) (monk-directory (concat dir "d"))))))
+      (with-temp-buffer
+        (monk-ui-mode)
+        (setq monk-ui--run run)
+        (save-window-excursion
+          (monk-ui-show-machine "testbox"))
+        (with-current-buffer (format monk-ui-detail-buffer-format "testbox")
+          (should (derived-mode-p 'monk-ui-detail-mode))
+          (should (eq (key-binding "q") 'quit-window))
+          (goto-char (point-min))
+          (should (search-forward "testbox: " nil t))
+          (should (search-forward "\"Linux\"" nil t))
+          (should (get-text-property (point) 'invisible)))
+        (kill-buffer (format monk-ui-detail-buffer-format "testbox"))))))
+
+(ert-deftest monk-test-ui-inspect-machine ()
+  "The inspector shows the machine of the run, unfolded."
+  (require 'monk-ui)
+  (monk-test-with-tmpdir dir
+    (let ((run (monk-test-converge (lambda (_m) (monk-directory (concat dir "d")))))
+          (name (format monk-ui-detail-buffer-format "testbox facts")))
+      (with-temp-buffer
+        (monk-ui-mode)
+        (setq monk-ui--run run)
+        (save-window-excursion (monk-ui-inspect-machine "testbox"))
+        (with-current-buffer name
+          (goto-char (point-min))
+          (should (search-forward "\"Linux\"" nil t))
+          (should-not (get-text-property (point) 'invisible)))
+        (kill-buffer name)))))
+
+(ert-deftest monk-test-ui-query ()
+  "The query buffer lists matches, explanations, and parse errors."
+  (require 'monk-ui)
+  (let ((machines (monk-test-cell-machines)))
+    (save-window-excursion
+      (monk-ui-query "'darwin' in classes && facts.arch == 'arm64'" machines))
+    (with-current-buffer monk-ui-query-buffer-name
+      (should (derived-mode-p 'monk-ui-query-mode))
+      (should (eq (key-binding "q") 'quit-window))
+      (goto-char (point-min))
+      (should (search-forward "1 of 3 machines match" nil t))
+      (should (search-forward "✓ foxy" nil t))
+      (should (search-forward "– moi" nil t))
+      (should (search-forward "facts.arch == 'arm64' is false" nil t))
+      (should (search-forward "– kamen" nil t))
+      (should (search-forward "class darwin is absent" nil t))
+      ;; the CELL translation is shown
+      (goto-char (point-min))
+      (should (search-forward "(and (class darwin) (= (fact arch) \"arm64\"))" nil t)))
+    (save-window-excursion (monk-ui-query "vars.disk > 100" machines))
+    (with-current-buffer monk-ui-query-buffer-name
+      (goto-char (point-min))
+      (should (search-forward "1 of 3" nil t))
+      (should (search-forward "? moi" nil t))
+      (should (search-forward "cannot compare" nil t)))
+    (save-window-excursion (monk-ui-query "frob == 1" machines))
+    (with-current-buffer monk-ui-query-buffer-name
+      (goto-char (point-min))
+      (should (search-forward "Unknown name frob" nil t)))
+    (kill-buffer monk-ui-query-buffer-name)))
 
 (provide 'monk-test)
 ;;; monk-test.el ends here

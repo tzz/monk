@@ -241,6 +241,47 @@ The result is shown in the echo area.  A `monk-run' is also shown in
     (monk-file \"~/only-if\" :content \"guard\\n\"
                :only-if (lambda (m) (monk-class-p m 'linux)))))
 
+;; :when takes a CELL form: CEL in Lisp.  CELL is data, so Monk can
+;; check it when the policy compiles, and a skipped resource says
+;; which clause was false.  (class X), (fact KEY), (var KEY), (group
+;; X), and (local) read the machine.  and, or, not, =, <, in,
+;; starts-with, match, and size combine them.
+
+(monk-cell-eval tutorial-m '(and (class tutorial) (= (fact kernel) \"Linux\")))
+
+;; The same guard as a CEL string.  Monk translates CEL to CELL once,
+;; at compile time.  Both notations are one language.
+
+(monk-cel-parse \"'tutorial' in classes && facts.kernel == 'Linux'\")
+
+(monk-cell-to-cel '(or (class mars) (> (size (classes)) 100)))
+
+;; A skipped resource names the false clause in its comment.
+
+(monk-converge tutorial-m
+  (lambda (m)
+    (monk-file \"~/when-cell\" :content \"cell\\n\"
+               :when '(and (class tutorial) (not (class mars))))
+    (monk-file \"~/when-cel\" :content \"cel\\n\"
+               :when \"'mars' in classes || facts.arch == 'nope'\")))
+
+;; Ask why.  monk-cell-explain walks the guard to the deciding part.
+
+(monk-cell-explain tutorial-m '(and (class tutorial) (class mars)))
+
+;; Which machines match?  monk-cell-select filters a list of machines.
+;; In the *monk* buffer, / opens the same question as a buffer with
+;; every machine, its verdict, and its facts folded under it.
+
+(mapcar (lambda (m) (oref m name))
+        (monk-cell-select \"'tutorial' in classes\" (list tutorial-m)))
+
+;; What can a guard see?  monk-machine-describe lists classes, groups,
+;; facts, and vars.  In *monk*, i shows this for the machine at point,
+;; and each detail buffer starts with it folded; TAB opens it.
+
+(monk-machine-describe tutorial-m)
+
 ;;; * 4. Requisites: require, watch, onchanges, onfail
 
 ;; :require orders and gates.  :watch also runs an action when the
@@ -308,7 +349,7 @@ The result is shown in the echo area.  A `monk-run' is also shown in
     (oset m classes (monk-hard-classes m))
     (monk-converge m
       (lambda (_m)
-        (monk-apt \"pkgs\" '(\"a\" \"b\" \"c\" \"d\") :ignore-errors t)
+        (monk-apt \"pkgs\" '(\"a\" \"b\" \"c\" \"d\"))
         (monk-command \"needs-all\" \"true\" :require '(\"pkgs\"))
         (monk-command \"needs-half\" \"true\" :require '((:ref \"pkgs\" :degree 0.5))))
       :passes 1)))

@@ -63,8 +63,7 @@ that shape, do not add machinery.
 
 **Meta parameters as one struct.** `engine/metaparams.go:74`: `Noop,
 Retry, RetryReset, Delay, Timeout, Poll, Limit, Burst, Reset, Sema,
-Rewatch, Dollar, Hidden, Export, Realize`. Monk has `:ignore-errors`
-and `:sudo`. Worth adding, in order: `:retry N` with `:delay`,
+Rewatch, Dollar, Hidden, Export, Realize`. Monk has `:sudo`. Worth adding, in order: `:retry N` with `:delay`,
 `:timeout`, `:poll SECONDS` for resources that cannot be watched, and
 `:sema NAME` so two resources never run at once across a run. Skip
 `Limit/Burst` (rate limiting a converge loop is not a Monk problem),

@@ -58,6 +58,43 @@
   (apply #'monk-exec-lines m monk-brew-program "list" "-1"
          (if (oref r cask) '("--cask") '("--formula"))))
 
+(defun monk--brew-json-names (entry cask)
+  "Return every name that brew ENTRY, a parsed JSON object, answers to.
+For a formula: name, full_name, aliases, oldnames.  For a CASK:
+token, full_token, old_tokens."
+  (let ((get (lambda (key) (gethash key entry))))
+    (delq nil
+          (if cask
+              (append (list (funcall get "token") (funcall get "full_token"))
+                      (append (funcall get "old_tokens") nil))
+            (append (list (funcall get "name") (funcall get "full_name"))
+                    (append (funcall get "aliases") nil)
+                    (append (funcall get "oldnames") nil))))))
+
+(cl-defmethod monk--brew-canonical ((r monk-brew-resource) (m monk-machine) names)
+  "Return an alist (NAME . INSTALLED-NAME) for NAMES of R on M.
+INSTALLED-NAME is what `brew list' shows for NAME: the formula name
+for an alias such as rg for ripgrep, the short name for a tapped
+formula.  A name brew does not know maps to itself.  This runs one
+`brew info --json=v2' call, and only for names that look missing."
+  (let* ((exec (apply #'monk-exec m monk-brew-program "info" "--json=v2"
+                      (if (oref r cask) "--cask" "--formula") names))
+         (entries (and (monk-exec-ok-p exec)
+                       (condition-case nil
+                           (let ((parsed (json-parse-string (monk-exec-output exec))))
+                             (append (gethash (if (oref r cask) "casks" "formulae") parsed) nil))
+                         (error nil)))))
+    (mapcar (lambda (name)
+              (let ((entry (seq-find (lambda (e)
+                                       (member name (monk--brew-json-names e (oref r cask))))
+                                     entries)))
+                (cons name
+                      (if entry
+                          (file-name-nondirectory
+                           (gethash (if (oref r cask) "token" "name") entry))
+                        (file-name-nondirectory name)))))
+            names)))
+
 (cl-defmethod monk-check ((r monk-brew-resource) (m monk-machine))
   (let* ((installed (monk--brew-installed r m))
          (missing (seq-remove
@@ -65,14 +102,51 @@
                      ;; Tapped formulae list under their short name.
                      (member (file-name-nondirectory name) installed))
                    (oref r packages))))
+    ;; An alias such as rg lists as ripgrep.  Without this step the
+    ;; resource installs rg on every pass and reports flapping.
+    (when missing
+      (let ((canonical (monk--brew-canonical r m missing)))
+        (setq missing (seq-remove
+                       (lambda (name) (member (cdr (assoc name canonical)) installed))
+                       missing))))
     (when missing
       (list :install missing
             :degree (monk-set-degree (length (oref r packages)) (length missing))))))
 
+(defconst monk-brew-untrusted-tap-regexp
+  "untrusted tap \\([^ .\n]+\\)"
+  "Matches the Homebrew refusal to install from a tap that is not trusted.
+Group 1 is the tap name.")
+
+(defun monk--brew-trust (m tap)
+  "Run `brew trust TAP' on M.  Return non-nil when the command succeeded.
+Older Homebrew has no `trust' subcommand.  Then the call fails and
+this returns nil, and the caller proceeds as before."
+  (let ((exec (monk-exec m monk-brew-program "trust" tap)))
+    (if (monk-exec-ok-p exec)
+        (progn (monk-log 'info "%s: trusted tap %s" (oref m name) tap) t)
+      (monk-log 'debug "%s: brew trust %s failed: %s" (oref m name) tap
+                (string-trim (monk-exec-output exec)))
+      nil)))
+
 (cl-defmethod monk-repair ((r monk-brew-resource) (m monk-machine) changes)
-  (apply #'monk-exec-string m monk-brew-program "install"
-         (append (and (oref r cask) '("--cask")) (plist-get changes :install)))
-  (format "installed %s" (string-join (plist-get changes :install) " ")))
+  (let ((arguments (append (list "install")
+                           (and (oref r cask) '("--cask"))
+                           (plist-get changes :install)))
+        (trusted nil))
+    (condition-case err
+        (apply #'monk-exec-string m monk-brew-program arguments)
+      (monk-exec-error
+       ;; Homebrew refuses formulae from a tap nobody ran `brew trust'
+       ;; on.  Trust it once and retry; a second refusal propagates.
+       (let ((output (format "%s" (car (last err)))))
+         (unless (and (string-match monk-brew-untrusted-tap-regexp output)
+                      (monk--brew-trust m (match-string 1 output)))
+           (signal (car err) (cdr err)))
+         (setq trusted (match-string 1 output))
+         (apply #'monk-exec-string m monk-brew-program arguments))))
+    (format "installed %s%s" (string-join (plist-get changes :install) " ")
+            (if trusted (format " (after brew trust %s)" trusted) ""))))
 
 (defun monk-brew (name packages &rest args)
   "Ensure Homebrew PACKAGES are installed.  NAME identifies the set.
@@ -98,7 +172,11 @@ ARGS: :cask and common keys."
 
 (cl-defmethod monk-repair ((r monk-brew-tap-resource) (m monk-machine) _changes)
   (monk-exec-string m monk-brew-program "tap" (oref r name))
-  "tapped")
+  ;; A tap is only useful when brew will install from it, so trust it
+  ;; where Homebrew knows the concept.
+  (if (monk--brew-trust m (oref r name))
+      "tapped and trusted"
+    "tapped"))
 
 (defun monk-brew-tap (name &rest args)
   "Ensure Homebrew tap NAME is present.  ARGS: common keys."

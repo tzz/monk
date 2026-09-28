@@ -422,7 +422,7 @@ so `~' in the policy lands there."
       (let ((run (monk-converge
                   m (lambda (_m)
                       (monk-command "after" "true" :creates "~/never" :require '("~/gate"))
-                      (monk-line-in-file "~/absent-file" "x" :ignore-errors t)
+                      (monk-line-in-file "~/absent-file" "x")
                       (monk-command "gated-off" "true" :creates "~/never" :require '("~/absent-file#x"))
                       (monk-directory "~/gate"))
                   :passes 1)))

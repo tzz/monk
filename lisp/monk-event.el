@@ -100,7 +100,8 @@ Values that JSON cannot carry become their printed representation."
     (comment . ,(monk-result-comment result))
     (duration_ms . ,(* 1000.0 (monk-result-duration result)))
     (dry_run . ,(if (monk-run-dry-run run) t :false))
-    (native . ((tool . "monk")))))
+    (native . ((tool . "monk")
+               (source . ,(car (monk-result-origin result)))))))
 
 (defun monk-event-run (kind run)
   "Return the event alist for the start or end of RUN.  KIND is a symbol."
@@ -173,7 +174,9 @@ Arrays become vectors, so a parsed event can be serialized again:
    :changes (alist-get 'changes event)
    :comment (alist-get 'comment event)
    :diff (alist-get 'diff event)
-   :duration (/ (or (alist-get 'duration_ms event) 0) 1000.0)))
+   :duration (/ (or (alist-get 'duration_ms event) 0) 1000.0)
+   :origin (let ((source (alist-get 'source (alist-get 'native event))))
+             (and source (cons source (alist-get 'name event))))))
 
 (defun monk-events-to-run (events)
   "Rebuild a `monk-run' from EVENTS, a list of alists from one run.

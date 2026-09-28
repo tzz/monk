@@ -69,6 +69,49 @@ Facts become classes: `linux` or `darwin`, the distribution, the machine name. I
                :only-if (lambda (m) (monk-class-p m 'linux)))))
 ```
 
+`:when` takes a CELL form: CEL in Lisp. CELL is data, so Monk checks it when the policy compiles, and a skipped resource says which clause was false. `(class X)`, `(fact KEY)`, `(var KEY)`, `(group X)`, and `(local)` read the machine. `and`, `or`, `not`, `=`, `<`, `in`, `starts-with`, `match`, and `size` combine them:
+
+```elisp
+(monk-cell-eval tutorial-m '(and (class tutorial) (= (fact kernel) "Linux")))
+```
+
+The same guard as a CEL string. Monk translates CEL to CELL once, at compile time. Both notations are one language:
+
+```elisp
+(monk-cel-parse "'tutorial' in classes && facts.kernel == 'Linux'")
+(monk-cell-to-cel '(or (class mars) (> (size (classes)) 100)))
+```
+
+A skipped resource names the false clause in its comment:
+
+```elisp
+(monk-converge tutorial-m
+  (lambda (m)
+    (monk-file "~/when-cell" :content "cell\n"
+               :when '(and (class tutorial) (not (class mars))))
+    (monk-file "~/when-cel" :content "cel\n"
+               :when "'mars' in classes || facts.arch == 'nope'")))
+```
+
+Ask why. `monk-cell-explain` walks the guard to the deciding part:
+
+```elisp
+(monk-cell-explain tutorial-m '(and (class tutorial) (class mars)))
+```
+
+Which machines match? `monk-cell-select` filters a list of machines. In the `*monk*` buffer, `/` asks the same question and shows every machine, its verdict, and its facts folded under it:
+
+```elisp
+(mapcar (lambda (m) (oref m name))
+        (monk-cell-select "'tutorial' in classes" (list tutorial-m)))
+```
+
+What can a guard see? `monk-machine-describe` lists classes, groups, facts, and vars. In `*monk*`, `i` shows this for the machine at point, and each detail buffer starts with it folded. `TAB` opens it:
+
+```elisp
+(monk-machine-describe tutorial-m)
+```
+
 ## 4. Requisites: require, watch, onchanges, onfail
 
 `:require` orders and gates: the resource runs after its refs, and only when they succeeded. `:watch` does the same and also runs an action when a watched ref changed in this run. A systemd unit restarts; a command runs. A command without `:creates` or `:unless` is always `kept`, so with `:watch` it is a handler:
@@ -123,7 +166,7 @@ A set resource reports how much of it holds. This lesson fakes a package manager
     (oset m classes (monk-hard-classes m))
     (monk-converge m
       (lambda (_m)
-        (monk-apt "pkgs" '("a" "b" "c" "d") :ignore-errors t)
+        (monk-apt "pkgs" '("a" "b" "c" "d"))
         (monk-command "needs-all" "true" :require '("pkgs"))
         (monk-command "needs-half" "true" :require '((:ref "pkgs" :degree 0.5))))
       :passes 1)))

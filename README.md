@@ -12,7 +12,11 @@ Each result carries the machine, the resource name, its type, a degree from 0 to
 
 Conditions are classes. Facts produce hard classes such as `darwin`, `debian`, `ubuntu`, `noble`, `arm64`. Inventory variables with the value `t` produce soft classes such as `home_leader`. Group names produce classes too. A resource with `:classes '(debian)` runs only on Debian-family hosts.
 
-Monk runs passes until a pass repairs nothing, with a cap of `monk-max-passes`. A second pass after repairs confirms that the repairs held. A resource that repairs in more than one pass is flapping: a repair that held would be kept afterwards, so a second repair means another resource undid it, or its check and repair disagree. The passes need not be adjacent. With A undoing B, B undoing C, and C undoing A, each repairs every third pass. The classic two-resource case is one that installs a package and one that removes it. The run stops at the second repair of any resource, the report names the flapping resources, and `monk-run-flapping` returns their keys. `monk-max-passes`, default 6, bounds the cycle length Monk can name. When the cap is reached with repairs still happening and no single resource flaps, the report says `did not converge` and `monk-run-oscillating-p` returns non-nil. `monk-run-converged-p` is true only when neither happened. A fatal failure stops the run after one pass.
+Richer conditions are CELL guards. See [Guards: CELL and CEL](#guards-cell-and-cel).
+
+Monk runs passes until a pass repairs nothing, with a cap of `monk-max-passes`. A second pass after repairs confirms that the repairs held. A resource that repairs in more than one pass is flapping: a repair that held would be kept afterwards, so a second repair means another resource undid it, or its check and repair disagree. The passes need not be adjacent. With A undoing B, B undoing C, and C undoing A, each repairs every third pass. The classic two-resource case is one that installs a package and one that removes it. The run stops at the second repair of any resource, the report names the flapping resources, and `monk-run-flapping` returns their keys. `monk-max-passes`, default 6, bounds the cycle length Monk can name. When the cap is reached with repairs still happening and no single resource flaps, the report says `did not converge` and `monk-run-oscillating-p` returns non-nil. `monk-run-converged-p` is true only when neither happened.
+
+A failure never stops a run. This is the Salt execution model, not the Ansible one. A failed resource is a result with status `failed`, the pass goes on to the next resource, and only resources that `:require` or `:watch` the failed one skip because of it, with a comment that names the unsatisfied ref. Everything unrelated converges. `monk-run-ok-p` is nil when any result failed.
 
 ## Requisites
 
@@ -78,6 +82,29 @@ A command without `:creates` or `:unless` is always kept. With `:watch` it becom
 (monk-watch-start (monk-inventory-select 'home) #'my-policy)
 ```
 
+## Guards: CELL and CEL
+
+`:when GUARD` runs a resource only when GUARD is true. GUARD is a CELL form or a CEL string. CELL is CEL in Lisp: a guard language over the classes, facts, inventory variables, and groups of a machine. A CELL form is data. It has no side effects, it always terminates, and Monk evaluates it on the controller without a connection to the host. Because it is data, Monk checks it when the policy compiles, and a skipped resource reports the clause that was false, for example `class linux is absent` or `(> (var disk) 100) is false: (var disk) = 50, 100 = 100`.
+
+```elisp
+(monk-symlink "~/.config/niri/config.kdl" "~/autodist/files/niri.kdl"
+  :when '(and (class linux) (= (fact arch) "x86_64") (var home_leader)))
+```
+
+The forms are `(class SYM)`, `(group SYM)`, `(fact KEY)`, `(var KEY)`, `(name)`, `(local)`, the whole collections `(classes)`, `(groups)`, `(facts)`, `(vars)`, presence with `(has (fact KEY))` and `(has (var KEY))`, the logic `and`, `or`, `not`, `if`, the comparisons `=`, `/=`, `<`, `<=`, `>`, `>=`, `in`, the string tests `starts-with`, `ends-with`, `contains`, `match`, and `size`, `list`, `+`, `-`, `*`, `/`, `%`. Strings, numbers, `t`, and `nil` are literals. `:classes LIST` is sugar for `(and (class A) (class B) ...)` and combines with `:when`.
+
+CEL is Google's Common Expression Language. A string guard is CEL. Monk translates it to CELL once, at compile time, with `monk-cel-parse`. In CEL, `classes` and `groups` are lists, `facts` and `vars` are maps, `name` is a string, and `local` is a bool. The functions `has()`, `size()`, `startsWith()`, `endsWith()`, `contains()`, and `matches()` work. `'linux' in classes` becomes `(class linux)`, so the report can name the class.
+
+```elisp
+(monk-brew "gui" '("ghostty") :when "'darwin' in classes && facts.arch == 'arm64'")
+```
+
+`monk-cell-to-cel` prints a CELL form as CEL with the fewest parentheses that CEL precedence allows, and the output parses back to an equal form. `monk-cell-explain MACHINE FORM` returns why a guard is true or false. `monk-cell-select GUARD MACHINES` returns the machines that match. `monk-cell-matches` keeps the result or error per machine.
+
+`:only-if FN` and `:not-if FN` stay for guards that must run code on the host. Their skip comment only names the function, because Monk cannot look inside it.
+
+`M-x monk-ui-query`, or `/` in `*monk*`, asks for a guard and shows every inventory machine with its verdict, the explanation, and its facts folded under it. `e` edits the guard, `g` gathers facts over the network for machines that have none, `TAB` unfolds a machine, `q` closes. A guard that starts with a parenthesis is CELL; anything else is CEL.
+
 ## Paths
 
 Paths are interpreted on the target machine. A leading `~` is the home of the login user, or of root under `:sudo`. File primitives expand it through TRAMP. A symlink target with a leading `~` is expanded on the target through the `home` fact before the link is made, because a literal `~` in a link is dangling. Inside a policy, `(monk-expand "~/x")` returns the same expansion for any other use, such as a command argument.
@@ -92,7 +119,7 @@ The policy file must set `monk-batch-policy` to the policy function.
 
 ## Resources
 
-Every constructor accepts these keywords. `:only-if FN` runs the resource only when `(funcall FN machine)` is non-nil. `:not-if FN` skips it when non-nil. `:classes LIST` runs it only when the machine has every class in the list. `:require`, `:watch`, `:onchanges`, and `:onfail` are described above. `:sudo BOOL` performs the resource as root through a TRAMP sudo hop. `:ignore-errors BOOL` records a failure and continues instead of stopping the run.
+Every constructor accepts these keywords. `:only-if FN` runs the resource only when `(funcall FN machine)` is non-nil. `:not-if FN` skips it when non-nil. `:classes LIST` runs it only when the machine has every class in the list. `:when GUARD` runs it only when the CELL form or CEL string GUARD is true. `:require`, `:watch`, `:onchanges`, and `:onfail` are described above. `:sudo BOOL` performs the resource as root through a TRAMP sudo hop.
 
 File resources in `monk-file.el`:
 
@@ -121,8 +148,8 @@ Package and macOS resources in `monk-package.el`:
 
 | Constructor | Purpose |
 |---|---|
-| `(monk-brew NAME PACKAGES &key cask)` | Missing Homebrew formulae installed in one call. Class `darwin`. |
-| `(monk-brew-tap NAME)` | Homebrew tap present. Class `darwin`. |
+| `(monk-brew NAME PACKAGES &key cask)` | Missing Homebrew formulae installed in one call. When brew refuses a formula from an untrusted tap, Monk runs `brew trust TAP` once and retries. Class `darwin`. |
+| `(monk-brew-tap NAME)` | Homebrew tap present and trusted, where brew has `trust`. Class `darwin`. |
 | `(monk-apt NAME PACKAGES)` | Missing Debian packages installed in one call. Class `debian`. |
 | `(monk-osx-default DOMAIN KEY VALUE &key type)` | macOS user default. Types `string`, `int`, `float`, `bool`, `array`. Class `darwin`. |
 
@@ -221,7 +248,7 @@ The endpoint takes one JSON object per line and answers in JSON Lines. `{"op":"s
 
 ## Report
 
-`monk-ui.el` draws the run. Load it and `monk-run-report` shows a `*monk*` buffer with one row per machine: name, state badge, a stacked progress bar, counts, and time. The bar has one layer per status, failures on the left edge. While a run is in progress the row of the current machine shows a spinner and the bar grows as nodes finish. `RET` on a row opens a detail buffer with results grouped by status and with fontified diffs. `t` switches between SVG and text drawing. `g` redraws. `?` lists the keys.
+`monk-ui.el` draws the run. Load it and `monk-run-report` shows a `*monk*` buffer with one row per machine: name, state badge, a stacked progress bar, counts, and time. The bar has one layer per status, failures on the left edge. While a run is in progress the row of the current machine shows a spinner and the bar grows as nodes finish. `RET` on a row opens a detail buffer with results grouped by status and with fontified diffs. The detail buffer starts with the classes, groups, facts, and vars of the machine, folded. `TAB` on that line unfolds it. `i` on a row opens the same data on its own, unfolded. `/` asks for a CELL or CEL guard and shows which inventory machines match. `.` or `M-.` jumps to the source: on a machine row or heading, the inventory file at that host; on a result line in a detail buffer, the policy file at that resource. `M-,` comes back. Each resource remembers the file its policy was defined in, and each machine the file that defined the inventory; the event record carries the policy file as `native.source`. `t` switches between SVG and text drawing. `g` runs the same thing again: a plan plans again, an apply applies again against its plan. `C-u g` only redraws. `q` closes any Monk buffer. `?` lists the keys. After a run you started, point moves into `*monk*` so the keys work at once. A run that a watch triggered only displays the buffer. `monk-ui-select-window` changes this.
 
 A plan and an apply look different. A plan has a purple `PLAN` badge in the header, a purple header face, a `Would` column instead of `Changed`, and the hint `a to apply`. Pressing `a` asks for confirmation with the machine names and the number of changes, runs `monk-apply`, and replaces the plan in the buffer with the apply report. An apply from a plan has a blue `APPLY from plan` badge, a `Plan` column with one cell per machine that says `as planned` or lists the verdicts that differ, and a verdict strip in the header. `p` opens the plan an apply came from. The detail buffer of such an apply starts with a `differs from plan` section that pairs each drifted result with what the plan said.
 

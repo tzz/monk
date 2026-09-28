@@ -92,9 +92,12 @@
   "Set `monk-inventory' from TREE.  Return the machine list.
 Signal `monk-inventory-error' on duplicate host names."
   (let* ((machines (monk--inventory-walk tree nil nil))
-         (names (mapcar (lambda (m) (oref m name)) machines)))
+         (names (mapcar (lambda (m) (oref m name)) machines))
+         (file (or load-file-name (buffer-file-name))))
     (when (/= (length names) (length (delete-dups (copy-sequence names))))
       (signal 'monk-inventory-error (list "Duplicate host names" names)))
+    (dolist (m machines)
+      (oset m origin (cons file (oref m name))))
     (setq monk-inventory (nreverse machines))))
 
 (defun monk-inventory-find (name)

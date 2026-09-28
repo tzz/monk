@@ -73,6 +73,7 @@
 (require 'seq)
 (require 'subr-x)
 (require 'tramp)
+(require 'xref)
 
 (defgroup monk nil
   "Configuration management in Emacs."
@@ -210,7 +211,8 @@ Each is called with two arguments: EVENT, one of `run-start',
   changes
   comment
   diff
-  (duration 0.0))
+  (duration 0.0)
+  origin)               ; (FILE . NAME): where the resource was defined
 
 (defun monk-result-changed-p (result)
   "Return non-nil when RESULT repaired or would repair."
@@ -384,7 +386,10 @@ That means two or more resources disagree about the same state."
           :documentation "Alist of facts.  Filled by `monk-gather-facts'.")
    (classes :initarg :classes
             :initform nil
-            :documentation "List of class symbols.  Filled by `monk-gather-facts'."))
+            :documentation "List of class symbols.  Filled by `monk-gather-facts'.")
+   (origin :initarg :origin
+           :initform nil
+           :documentation "Where the inventory defined this machine: (FILE . NAME)."))
   "A machine that Monk manages.")
 
 (cl-defmethod monk-machine-local-p ((m monk-machine))
@@ -558,8 +563,13 @@ Each FUNCTION takes a machine and returns an alist of facts to
 merge.  Probes run in list order.")
 
 (defun monk-register-fact-probe (name function)
-  "Register FUNCTION as the fact probe NAME."
-  (setf (alist-get name monk-fact-probes) function))
+  "Register FUNCTION as the fact probe NAME.
+A new probe runs after the existing ones, so a probe can read the
+facts of earlier probes: the os probe needs `kernel' from uname.
+Registering NAME again replaces the function in place."
+  (if (assq name monk-fact-probes)
+      (setf (alist-get name monk-fact-probes) function)
+    (setq monk-fact-probes (append monk-fact-probes (list (cons name function))))))
 
 (defun monk--probe-uname (m)
   "Return kernel facts for M."
@@ -694,6 +704,10 @@ Keys are `classes' (list), `groups' (list), `facts' (alist), and
   ((name :initarg :name
          :type string
          :documentation "Unique name within a policy.  Usually the target path.")
+   (origin :initarg :origin
+           :initform nil
+           :documentation "Where the policy defined this resource: (FILE . NAME).
+Filled by `monk-add-resource'.  Nil when the policy came from no file.")
    (only-if :initarg :only-if
             :initform nil
             :documentation "Guard.  Function of the machine.  Run when non-nil.")
@@ -723,15 +737,10 @@ Nil means the value of `monk-default-watch-action'.")
               :documentation "Refs.  Run only when one of them changed in this run.")
    (onfail :initarg :onfail
            :initform nil
-           :documentation "Refs.  Run only when one of them failed in this run.
-The failed ref needs :ignore-errors, or its failure stops the run
-before this resource is reached.")
+           :documentation "Refs.  Run only when one of them failed in this run.")
    (sudo :initarg :sudo
          :initform nil
-         :documentation "Perform the resource as root.")
-   (ignore-errors :initarg :ignore-errors
-                  :initform nil
-                  :documentation "Report failure but do not stop the run."))
+         :documentation "Perform the resource as root."))
   :abstract t
   :documentation "Base class.  Subclasses implement `monk-check' and `monk-repair'.")
 
@@ -836,6 +845,30 @@ and :not-if functions are opaque, so their reason only names them."
 (defvar monk--compile-machine nil
   "Machine for the current compile.")
 
+(defvar monk--compile-file nil
+  "File that defines the policy of the current compile, or nil.")
+
+(defun monk-definition-file (function)
+  "Return the file that defines FUNCTION, or nil.
+A named function is looked up in `load-history'.  Anything else, such
+as a lambda, is credited to the file being loaded or visited when the
+compile started, because that is where a policy lambda is written."
+  (or (and (symbolp function)
+           (let ((file (symbol-file function 'defun)))
+             (and file (file-name-sans-extension file))))
+      load-file-name
+      (and (buffer-file-name) (buffer-file-name))))
+
+(defun monk-origin-file (origin)
+  "Return the source file for ORIGIN, with the .el extension present.
+ORIGIN is (FILE . NAME).  A FILE without extension gets .el, and a
+compiled .elc turns into its .el."
+  (when (car origin)
+    (let ((file (car origin)))
+      (cond ((string-suffix-p ".elc" file) (concat (file-name-sans-extension file) ".el"))
+            ((string-suffix-p ".el" file) file)
+            (t (concat file ".el"))))))
+
 (defun monk-current-machine ()
   "Return the machine of the current compile.  Signal outside a compile."
   (or monk--compile-machine
@@ -862,6 +895,8 @@ root."
                             (oref resource name)
                             (monk-resource-type existing)
                             (monk-resource-type resource))))))
+  (unless (oref resource origin)
+    (oset resource origin (cons monk--compile-file (oref resource name))))
   ;; A bad guard fails the compile, not the run: the policy author sees
   ;; the error at once, and a CEL string is parsed once, here.
   (when (oref resource when)
@@ -877,13 +912,14 @@ root."
 (cl-defmethod monk-compile ((m monk-machine) policy)
   "Run POLICY for M.  Return the list of resources in policy order."
   (let ((monk--compile-resources nil)
-        (monk--compile-machine m))
+        (monk--compile-machine m)
+        (monk--compile-file (monk-definition-file policy)))
     (funcall policy m)
     (nreverse monk--compile-resources)))
 
 (defconst monk--common-keys
   '(:only-if :not-if :classes :when :require :watch :watch-action :onchanges :onfail
-    :sudo :ignore-errors)
+    :sudo)
   "Keywords every resource constructor accepts.")
 
 (defun monk--common-initargs (plist)
@@ -1114,14 +1150,17 @@ cycle or a bad ref."
 (defun monk--run-node (node nodes dry-run)
   "Check and repair NODE.  Return a `monk-result'.
 NODES carries the results of earlier nodes for requisites.  When
-DRY-RUN is non-nil, report instead of repairing.  A fatal failure
-signals `monk-resource-error' with the result."
+DRY-RUN is non-nil, report instead of repairing.  A failure is a
+result like any other: the pass goes on, and only resources that
+:require or :watch this one skip because of it.  This is the Salt
+execution model."
   (let* ((resource (monk-node-resource node))
          (machine (monk-node-machine node))
          (start (float-time))
          (result (monk-result-create :machine (oref machine name)
                                      :name (oref resource name)
-                                     :type (monk-resource-type resource))))
+                                     :type (monk-resource-type resource)
+                                     :origin (oref resource origin))))
     (monk-progress 'node-start :node node)
     (condition-case err
         (pcase-let ((`(,verdict . ,detail)
@@ -1164,12 +1203,7 @@ signals `monk-resource-error' with the result."
        (monk-log 'warn "%s: %s %s %s: %s"
                  (oref machine name) (monk-resource-type resource)
                  (oref resource name) (monk-result-status result)
-                 (error-message-string err))
-       (unless (oref resource ignore-errors)
-         (setf (monk-result-duration result) (- (float-time) start)
-               (monk-node-result node) result)
-         (monk-progress 'node-end :node node :result result)
-         (signal 'monk-resource-error (list result)))))
+                 (error-message-string err))))
     (setf (monk-result-duration result) (- (float-time) start)
           (monk-node-result node) result)
     (monk-progress 'node-end :node node :result result)
@@ -1201,32 +1235,25 @@ DETAIL names the changed ref.  With DRY-RUN, report only."
   "Outcome of one pass over all nodes."
   results
   (repaired 0)
-  (repaired-keys nil)
-  stopped)
+  (repaired-keys nil))
 
 (defun monk--pass (nodes dry-run)
   "Run one pass over NODES in order.  Return a `monk-pass'.
 Results from earlier passes are cleared first so requisites read this
-pass only.  When DRY-RUN is non-nil, report only."
+pass only.  When DRY-RUN is non-nil, report only.  Every node runs:
+a failure never stops the pass."
   (dolist (node nodes)
     (setf (monk-node-result node) nil))
-  (let (results (repaired 0) (repaired-keys nil) (stopped nil))
-    (catch 'monk-stop
-      (dolist (node nodes)
-        (let ((result (condition-case err
-                          (monk--run-node node nodes dry-run)
-                        (monk-resource-error
-                         (push (cadr err) results)
-                         (setq stopped t)
-                         (throw 'monk-stop nil)))))
-          (push result results)
-          (when (monk-result-changed-p result)
-            (cl-incf repaired)
-            (push (monk-result-key result) repaired-keys)))))
+  (let (results (repaired 0) (repaired-keys nil))
+    (dolist (node nodes)
+      (let ((result (monk--run-node node nodes dry-run)))
+        (push result results)
+        (when (monk-result-changed-p result)
+          (cl-incf repaired)
+          (push (monk-result-key result) repaired-keys))))
     (monk-pass-create :results (nreverse results)
                       :repaired repaired
-                      :repaired-keys (nreverse repaired-keys)
-                      :stopped stopped)))
+                      :repaired-keys (nreverse repaired-keys))))
 
 (defun monk--merge-pass-results (previous current)
   "Merge CURRENT pass results into PREVIOUS.  Return the new list.
@@ -1291,18 +1318,15 @@ POLICY and OPTIONS are recorded on the run so `monk-apply' can repeat it."
                  (repaired (monk-pass-repaired outcome)))
             (setq all-results (monk--merge-pass-results all-results
                                                         (monk-pass-results outcome)))
-            (setf (monk-run-last-pass-repaired run)
-                  (if (monk-pass-stopped outcome) 0 repaired)
+            (setf (monk-run-last-pass-repaired run) repaired
                   (monk-run-passes run) pass
                   (monk-run-results run) all-results)
             (push (monk-pass-repaired-keys outcome) (monk-run-repaired-by-pass run))
-            (monk-log 'info "pass %d over %d node(s) repaired %d%s" pass (length ordered)
-                      repaired (if (monk-pass-stopped outcome) ", stopped on failure" ""))
+            (monk-log 'info "pass %d over %d node(s) repaired %d" pass (length ordered) repaired)
             (monk-progress 'pass-end :run run :pass pass :repaired repaired)
             ;; A resource that repaired twice is in a cycle and will
             ;; repair again.  Stop now instead of at the cap.
             (setq continue (and (not dry-run)
-                                (not (monk-pass-stopped outcome))
                                 (> repaired 0)
                                 (not (monk-run-flapping-p run))))))
       (setf (monk-run-end-time run) (current-time))
@@ -1530,6 +1554,39 @@ Without VERBOSE, omit kept and skipped results."
 VERBOSE passes through to the report function."
   (funcall monk-report-function run verbose)
   run)
+
+;;;; Jumping to definitions
+
+(defun monk-find-origin (origin &optional other-window)
+  "Open the file of ORIGIN and move point to the definition of its name.
+ORIGIN is (FILE . NAME).  The file is searched for NAME as a string
+literal first, then as a bare word, from the top.  With OTHER-WINDOW,
+show it in another window.  Push a marker so `M-,' comes back.
+Signal `user-error' when ORIGIN has no file."
+  (let ((file (monk-origin-file origin))
+        (name (cdr origin)))
+    (unless (and file (file-readable-p file))
+      (user-error "No source file recorded for %s%s" name
+                  (if file (format " (%s is not readable)" file) "")))
+    (xref-push-marker-stack)
+    (funcall (if other-window #'find-file-other-window #'find-file) file)
+    (goto-char (point-min))
+    (unless (or (search-forward (format "%S" name) nil t)
+                (re-search-forward (concat "\_<" (regexp-quote name) "\_>") nil t))
+      (message "Opened %s; %s is not written literally there" file name))
+    (beginning-of-line)
+    (recenter)))
+
+(defun monk-result-find-definition (result &optional other-window)
+  "Jump to the policy line that defined RESULT.  OTHER-WINDOW as in `find-file'."
+  (monk-find-origin (or (monk-result-origin result)
+                        (cons nil (monk-result-name result)))
+                    other-window))
+
+(cl-defmethod monk-machine-find-definition ((m monk-machine) &optional other-window)
+  "Jump to the inventory entry that defined machine M.
+OTHER-WINDOW as in `find-file-other-window'."
+  (monk-find-origin (or (oref m origin) (cons nil (oref m name))) other-window))
 
 ;;;; Batch entry point
 

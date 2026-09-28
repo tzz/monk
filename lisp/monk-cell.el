@@ -255,33 +255,45 @@ and wrong arities at policy load time."
 
 ;;;; Explaining
 
-(defun monk-cell-explain (m form)
+(defvar monk-cell-explain-notation 'cell
+  "How `monk-cell-explain' prints forms: `cell' or `cel'.
+Bind it to `cel' when the guard came from CEL text, so the
+explanation reads in the notation the author wrote.")
+
+(defun monk-cell--show (form)
+  "Return FORM in the notation of `monk-cell-explain-notation'."
+  (if (eq monk-cell-explain-notation 'cel)
+      (monk-cell-to-cel form)
+    (monk-cell-format form)))
+
+(defun monk-cell-explain (m form &optional notation)
   "Return why FORM is false or true on machine M, as one line.
 For a false `and', name the first false part.  For a false `or', say
-that every part was false.  For a comparison, show the values."
-  (let ((value (monk-cell-eval m form)))
+that every part was false.  For a comparison, show the values.
+NOTATION is `cell' (default) or `cel' and sets how forms print."
+  (let ((monk-cell-explain-notation (or notation monk-cell-explain-notation))
+        (value (monk-cell-eval m form)))
     (pcase form
       (`(and . ,parts)
        (if value
-           (format "%s is true" (monk-cell-format form))
+           (format "%s is true" (monk-cell--show form))
          (monk-cell-explain m (seq-find (lambda (p) (not (monk-cell-eval m p))) parts))))
       (`(or . ,parts)
        (if value
            (monk-cell-explain m (seq-find (lambda (p) (monk-cell-eval m p)) parts))
-         (format "%s: every part is false" (monk-cell-format form))))
+         (format "%s: every part is false" (monk-cell--show form))))
       (`(not ,inner)
        (if value
-           (format "%s is false, so %s is true" (monk-cell-format inner) (monk-cell-format form))
-         (format "%s is true, so %s is false" (monk-cell-format inner) (monk-cell-format form))))
-      (`(,(and op (or '= '/= '< '<= '> '>= 'in 'starts-with 'ends-with 'contains 'match)) ,a ,b)
-       (ignore op)
+           (format "%s is false, so %s is true" (monk-cell--show inner) (monk-cell--show form))
+         (format "%s is true, so %s is false" (monk-cell--show inner) (monk-cell--show form))))
+      (`(,(or '= '/= '< '<= '> '>= 'in 'starts-with 'ends-with 'contains 'match) ,a ,b)
        (format "%s is %s: %s = %S, %s = %S"
-               (monk-cell-format form) (if value "true" "false")
-               (monk-cell-format a) (monk-cell-eval m a)
-               (monk-cell-format b) (monk-cell-eval m b)))
+               (monk-cell--show form) (if value "true" "false")
+               (monk-cell--show a) (monk-cell-eval m a)
+               (monk-cell--show b) (monk-cell-eval m b)))
       (`(class ,c) (format "class %s is %s" c (if value "present" "absent")))
       (`(group ,g) (format "group %s is %s" g (if value "present" "absent")))
-      (_ (format "%s is %S" (monk-cell-format form) value)))))
+      (_ (format "%s is %S" (monk-cell--show form) value)))))
 
 (defun monk-cell-format (form)
   "Return FORM printed as CELL, without a quote."
@@ -318,6 +330,10 @@ example because a fact is missing, does not match."
                       (monk-cell-eval m form)
                     (monk-guard-error nil)))
                 (or machines monk-inventory))))
+
+(defun monk-cell-error-p (value)
+  "Return non-nil when VALUE is an error condition from `monk-cell-matches'."
+  (and (consp value) (symbolp (car value)) (get (car value) 'error-conditions) t))
 
 (defun monk-cell-matches (guard &optional machines gather)
   "Return an alist (MACHINE . RESULT) for GUARD over MACHINES.
@@ -520,7 +536,7 @@ SYM) form, so the report can name the class."
         (monk-cel--next)
         (let ((token (monk-cel--next)))
           (unless (eq (car token) 'ident)
-            (monk-cel--error "Expected a name after ."))
+            (monk-cel--error "Expected a name after the dot"))
           (if (monk-cel--op-p "(")
               (setq form (monk-cel--method form (cdr token) (monk-cel--arguments)))
             (setq form (monk-cel--member form (cdr token)))))))
@@ -599,11 +615,11 @@ SYM) form, so the report can name the class."
     ("has"
      (unless (and (= 1 (length arguments))
                   (memq (car-safe (car arguments)) '(fact var)))
-       (monk-cel--error "has() takes one facts.KEY or vars.KEY argument"))
+       (monk-cel--error "The function has() takes one facts.KEY or vars.KEY argument"))
      (list 'has (car arguments)))
     ("size"
      (unless (= 1 (length arguments))
-       (monk-cel--error "size() takes one argument"))
+       (monk-cel--error "The function size() takes one argument"))
      (list 'size (car arguments)))
     (_ (monk-cel--error "Unknown function %s" name))))
 

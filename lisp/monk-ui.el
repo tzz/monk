@@ -647,15 +647,19 @@ merged results of finished passes."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "RET") #'monk-ui-show-machine)
     (define-key map (kbd "d") #'monk-ui-show-machine)
-    (define-key map (kbd "g") #'monk-ui-refresh)
+    (define-key map (kbd "g") #'monk-ui-rerun)
     (define-key map (kbd "t") #'monk-ui-toggle-style)
     (define-key map (kbd "a") #'monk-ui-apply)
     (define-key map (kbd "p") #'monk-ui-show-plan)
     (define-key map (kbd "w") #'monk-ui-show-watch-log)
     (define-key map (kbd "W") #'monk-ui-toggle-watch-mode)
+    (define-key map (kbd "i") #'monk-ui-inspect-machine)
+    (define-key map (kbd "/") #'monk-ui-query)
+    (define-key map (kbd ".") #'monk-ui-find-definition)
+    (define-key map (kbd "M-.") #'monk-ui-find-definition)
     (define-key map (kbd "?") #'monk-ui-help)
     map)
-  "Keymap for `monk-ui-mode'.")
+  "Keymap for `monk-ui-mode'.  `q' comes from `tabulated-list-mode'.")
 
 (defun monk-ui--format ()
   "Return the `tabulated-list-format' for the run in this buffer.
@@ -693,7 +697,7 @@ a plan gains a Plan column."
   "Show the keys of the report buffer."
   (interactive)
   (message "%s" (substitute-command-keys
-                 "\\[monk-ui-show-machine] detail  \\[monk-ui-apply] apply plan  \\[monk-ui-show-plan] show plan  \\[monk-ui-show-watch-log] watch log  \\[monk-ui-toggle-watch-mode] watch mode  \\[monk-ui-toggle-style] svg/text  \\[monk-ui-refresh] refresh")))
+                 "\\[monk-ui-show-machine] detail  \\[monk-ui-inspect-machine] facts  \\[monk-ui-find-definition] source  \\[monk-ui-query] query  \\[monk-ui-apply] apply plan  \\[monk-ui-show-plan] show plan  \\[monk-ui-show-watch-log] watch log  \\[monk-ui-toggle-watch-mode] watch mode  \\[monk-ui-toggle-style] svg/text  \\[monk-ui-rerun] rerun (C-u: redraw only)  \\[quit-window] quit")))
 
 (declare-function monk-watch-status "monk-watch")
 (declare-function monk-watch-toggle-mode "monk-watch")
@@ -865,6 +869,28 @@ a plan gains a Plan column."
                        'face header-face)
          "")))))
 
+(defun monk-ui-rerun (&optional redraw-only)
+  "Run the policy of this buffer again and show the new result.
+A plan is planned again.  An apply is applied again, against the
+same plan when it had one.  With REDRAW-ONLY, the prefix argument,
+only redraw the buffer from the stored run."
+  (interactive "P")
+  (cond
+   (redraw-only (monk-ui-refresh))
+   ((or (null monk-ui--run) (null (monk-run-policy monk-ui--run)))
+    (user-error "No run to repeat here; redrawing")
+    (monk-ui-refresh))
+   (monk-ui--live-run
+    (user-error "A run is in progress"))
+   (t
+    (let* ((run monk-ui--run)
+           (options (copy-sequence (monk-run-options run))))
+      (when (monk-run-plan run)
+        (setq options (plist-put options :plan (monk-run-plan run))))
+      (monk-run-report
+       (apply #'monk-orchestrate (monk-run-machines run) (monk-run-policy run)
+              :dry-run (monk-run-dry-run run) options))))))
+
 (defun monk-ui-refresh ()
   "Redraw the report buffer.
 The column set depends on the run kind, so rebuild the header when it
@@ -915,11 +941,13 @@ here; without it the user sees nothing until the run returns."
   "Insert one RESULT into the detail buffer.
 With PLANNED, the matching result from the plan, add a plan verdict
 and the planned status when it differs.  RUN supplies drift reasons."
-  (let ((status (monk-result-status result)))
+  (let ((status (monk-result-status result))
+        (start (point)))
     (insert (monk-ui-badge status)
             (make-string (max 1 (- 14 (length (symbol-name status)))) ?\s)
             (propertize (format "%-14s" (monk-result-type result)) 'face 'monk-ui-skipped)
             (monk-result-name result))
+    (put-text-property start (point) 'monk-ui-result result)
     (let ((reason (and run
                        (alist-get (monk-result-key result) (monk-run-reasons run)
                                   nil nil #'equal))))
@@ -964,6 +992,278 @@ and the planned status when it differs.  RUN supplies drift reasons."
                                (list 'face face))))
       (forward-line 1))))
 
+;;;; Folded sections
+
+(defvar monk-ui-fold-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "TAB") #'monk-ui-toggle-fold)
+    (define-key map (kbd "<tab>") #'monk-ui-toggle-fold)
+    (define-key map (kbd "RET") #'monk-ui-toggle-fold)
+    (define-key map [mouse-1] #'monk-ui-toggle-fold)
+    map)
+  "Keymap on a fold heading.")
+
+(defun monk-ui--fold-heading-at (pos)
+  "Return the start of the fold heading that owns POS, or nil."
+  (let ((id (get-text-property pos 'monk-ui-fold)))
+    (when id
+      (if (and (> pos (point-min)) (eq (get-text-property (1- pos) 'monk-ui-fold) id))
+          (previous-single-property-change pos 'monk-ui-fold)
+        pos))))
+
+(defun monk-ui--fold-body (heading)
+  "Return (START . END) of the body under fold HEADING."
+  (let* ((id (get-text-property heading 'monk-ui-fold))
+         (start (next-single-property-change heading 'monk-ui-fold nil (point-max)))
+         (end (or (text-property-any start (point-max) 'monk-ui-fold-end id) (point-max))))
+    (cons start end)))
+
+(defun monk-ui--fold-set (heading closed)
+  "Fold the body under HEADING when CLOSED is non-nil, else unfold it.
+The indicator glyph is a `display' property on the first character of
+the heading, so the text and its properties never change."
+  (pcase-let ((`(,start . ,end) (monk-ui--fold-body heading))
+              (inhibit-read-only t))
+    (put-text-property start end 'invisible (and closed 'monk-ui-fold))
+    (put-text-property heading (1+ heading) 'display
+                       (if closed monk-ui-fold-indicator-closed monk-ui-fold-indicator-open))))
+
+(defun monk-ui--fold-closed-p (heading)
+  "Return non-nil when the body under HEADING is folded."
+  (get-text-property (car (monk-ui--fold-body heading)) 'invisible))
+
+(defun monk-ui-toggle-fold ()
+  "Fold or unfold the section at point."
+  (interactive)
+  (let ((heading (or (monk-ui--fold-heading-at (point))
+                     (monk-ui--fold-heading-at (line-beginning-position))
+                     (user-error "No foldable section at point"))))
+    (monk-ui--fold-set heading (not (monk-ui--fold-closed-p heading)))))
+
+(defun monk-ui-insert-fold (id heading body-function &optional open)
+  "Insert HEADING, then the output of BODY-FUNCTION, as fold ID.
+The body starts folded unless OPEN is non-nil.  BODY-FUNCTION inserts
+at point.  A folded body is invisible; TAB on the heading toggles it."
+  (let ((heading-start (point)))
+    (insert (propertize (concat monk-ui-fold-indicator-closed " " heading "\n")
+                        'face 'monk-ui-fold
+                        'monk-ui-fold id
+                        'keymap monk-ui-fold-map
+                        'help-echo "TAB: fold or unfold"))
+    (put-text-property heading-start (1+ heading-start) 'display
+                       (if open monk-ui-fold-indicator-open monk-ui-fold-indicator-closed))
+    (let ((body-start (point)))
+      (funcall body-function)
+      (insert (propertize "\n" 'monk-ui-fold-end id))
+      (unless open
+        (put-text-property body-start (point) 'invisible 'monk-ui-fold)))
+    heading-start))
+
+(defun monk-ui--thing-at-point ()
+  "Return (KIND . OBJECT) for the line at point: `result' or `machine', or nil."
+  (let ((result (or (get-text-property (point) 'monk-ui-result)
+                    (get-text-property (line-beginning-position) 'monk-ui-result)))
+        (machine (or (get-text-property (point) 'monk-ui-machine)
+                     (get-text-property (line-beginning-position) 'monk-ui-machine))))
+    (cond (result (cons 'result result))
+          (machine (cons 'machine machine))
+          ((and (derived-mode-p 'monk-ui-mode) (tabulated-list-get-id))
+           (let ((m (monk-ui--run-machine (tabulated-list-get-id))))
+             (and m (cons 'machine m)))))))
+
+(defun monk-ui-find-definition (&optional other-window)
+  "Jump to the source of the thing at point.
+On a result line, open the policy file at the resource.  On a machine
+row or heading, open the inventory at the host.  With OTHER-WINDOW,
+the prefix argument, show the file in another window.  `M-,' returns."
+  (interactive "P")
+  (pcase (monk-ui--thing-at-point)
+    (`(result . ,result) (monk-result-find-definition result other-window))
+    (`(machine . ,m) (monk-machine-find-definition m other-window))
+    (_ (user-error "Nothing at point has a definition to jump to"))))
+
+(defvar monk-ui-detail-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map special-mode-map)
+    (define-key map (kbd "TAB") #'monk-ui-toggle-fold)
+    (define-key map (kbd "<tab>") #'monk-ui-toggle-fold)
+    (define-key map (kbd ".") #'monk-ui-find-definition)
+    (define-key map (kbd "M-.") #'monk-ui-find-definition)
+    map)
+  "Keymap for `monk-ui-detail-mode'.  `q' comes from `special-mode'.")
+
+(define-derived-mode monk-ui-detail-mode special-mode "Monk-Detail"
+  "Per-machine results, or the machine inspector.
+\\{monk-ui-detail-mode-map}")
+
+;;;; Machine inspector
+
+(defun monk-ui--insert-machine-description (m)
+  "Insert the classes, groups, facts, and vars of machine M at point."
+  (let ((description (monk-machine-describe m)))
+    (insert "  " (propertize "classes " 'face 'monk-ui-key))
+    (dolist (class (alist-get 'classes description))
+      (insert (propertize (format " %s " class) 'face 'monk-ui-class) " "))
+    (insert "\n  " (propertize "groups  " 'face 'monk-ui-key)
+            (mapconcat #'symbol-name (alist-get 'groups description) " ") "\n")
+    (dolist (section '(facts vars))
+      (insert "  " (propertize (format "%s" section) 'face 'monk-ui-key) "\n")
+      (if (null (alist-get section description))
+          (insert (propertize "    none\n" 'face 'monk-ui-skipped))
+        (dolist (cell (alist-get section description))
+          (insert (format "    %-24s" (propertize (symbol-name (car cell)) 'face 'monk-ui-key))
+                  (format "%S" (cdr cell)) "\n"))))))
+
+(defun monk-ui-insert-machine-fold (m &optional open)
+  "Insert a folded section with the description of machine M.
+OPEN unfolds it.  Return the heading position.  The heading carries
+M in the `monk-ui-machine' property, so `.' jumps to the inventory."
+  (let ((heading (monk-ui-insert-fold (intern (format "machine-%s" (oref m name)))
+                                      (format "%s: %d classes, %d facts, %d vars  (TAB to expand)"
+                                              (oref m name)
+                                              (length (oref m classes))
+                                              (length (oref m facts))
+                                              (length (oref m vars)))
+                                      (lambda () (monk-ui--insert-machine-description m))
+                                      open)))
+    (put-text-property heading (save-excursion (goto-char heading) (line-end-position))
+                       'monk-ui-machine m)
+    heading))
+
+(defun monk-ui--run-machine (name)
+  "Return the machine object called NAME in the run of this buffer, or nil."
+  (let ((run (or monk-ui--live-run monk-ui--run)))
+    (and run (seq-find (lambda (m) (equal (oref m name) name)) (monk-run-machines run)))))
+
+(defun monk-ui-inspect-machine (&optional machine-name)
+  "Show classes, groups, facts, and vars of MACHINE-NAME, or the machine at point.
+The buffer is `*monk: NAME facts*'.  Press `q' to close it."
+  (interactive)
+  (let* ((name (or machine-name (tabulated-list-get-id)
+                   (user-error "No machine at point")))
+         (m (or (monk-ui--run-machine name)
+                (and (featurep 'monk-inventory) (monk-inventory-find name))
+                (user-error "No machine %s in this run" name)))
+         (buffer (get-buffer-create (format monk-ui-detail-buffer-format
+                                            (concat name " facts")))))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (monk-ui-detail-mode)
+        (insert (propertize (format " %s " name) 'face '(monk-ui-header monk-ui-machine))
+                (propertize " what guards can see\n" 'face 'monk-ui-header))
+        (insert (propertize "\n" 'face 'monk-ui-separator))
+        (monk-ui-insert-machine-fold m t)
+        (goto-char (point-min))))
+    (pop-to-buffer buffer)))
+
+
+;;;; Query: which machines match a guard
+
+(defvar monk-inventory)
+(declare-function monk-inventory-find "monk-inventory" (name))
+
+(defvar monk-ui-query-history nil
+  "Minibuffer history for `monk-ui-query'.")
+
+(defvar-local monk-ui--query-text nil
+  "The guard text shown in the query buffer.")
+
+(defvar-local monk-ui--query-machines nil
+  "The machines the query buffer evaluates against.")
+
+(defun monk-ui--query-render (text machines gather)
+  "Fill the current buffer with the matches of guard TEXT over MACHINES.
+GATHER passes to `monk-cell-matches'."
+  (let* ((inhibit-read-only t)
+         (notation (if (string-prefix-p "(" (string-trim text)) 'cell 'cel))
+         (form (condition-case err
+                   (monk-cell-read text)
+                 (monk-guard-error (cons 'error (cadr err)))))
+         (matches (unless (eq (car-safe form) 'error)
+                    (monk-cell-matches form machines gather)))
+         (hits (seq-count (lambda (cell) (and (cdr cell) (not (monk-cell-error-p (cdr cell)))))
+                          matches)))
+    (erase-buffer)
+    (insert (propertize " QUERY " 'face 'monk-ui-plan-badge)
+            (propertize (format " %s\n" text) 'face 'monk-ui-plan-header))
+    (insert (propertize "\n" 'face 'monk-ui-separator))
+    (if (eq (car-safe form) 'error)
+        (insert (propertize (format "\n  %s\n" (cdr form)) 'face 'monk-ui-failed)
+                (propertize "\n  Edit the guard with e.\n" 'face 'monk-ui-skipped))
+      (insert (format "\n  %-6s %s\n  %-6s %s\n\n"
+                      (propertize "CELL" 'face 'monk-ui-key) (monk-cell-format form)
+                      (propertize "CEL" 'face 'monk-ui-key) (monk-cell-to-cel form)))
+      (insert (format "  %d of %d machine%s match\n\n"
+                      hits (length matches) (if (= 1 (length matches)) "" "s")))
+      (dolist (cell matches)
+        (let* ((m (car cell))
+               (result (cdr cell))
+               (failed (monk-cell-error-p result)))
+          (insert (propertize
+                   (cond (failed (propertize "  ? " 'face 'monk-ui-failed))
+                         (result (propertize "  ✓ " 'face 'monk-ui-match))
+                         (t (propertize "  – " 'face 'monk-ui-no-match)))
+                   'monk-ui-machine m)
+                  (propertize (format "%-20s" (oref m name))
+                              'face (cond (failed 'monk-ui-failed)
+                                          (result 'monk-ui-match)
+                                          (t 'monk-ui-no-match))
+                              'monk-ui-machine m)
+                  (propertize (cond (failed (format "%s" (cadr result)))
+                                    ((null (oref m facts)) "no facts gathered yet; g gathers")
+                                    (t (monk-cell-explain m form notation)))
+                              'face 'monk-ui-skipped)
+                  "\n")
+          (monk-ui-insert-machine-fold m))))
+    (goto-char (point-min))))
+
+(defvar monk-ui-query-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map special-mode-map)
+    (define-key map (kbd "e") #'monk-ui-query-edit)
+    (define-key map (kbd "g") #'monk-ui-query-gather)
+    (define-key map (kbd "TAB") #'monk-ui-toggle-fold)
+    (define-key map (kbd "<tab>") #'monk-ui-toggle-fold)
+    (define-key map (kbd ".") #'monk-ui-find-definition)
+    (define-key map (kbd "M-.") #'monk-ui-find-definition)
+    map)
+  "Keymap for `monk-ui-query-mode'.")
+
+(define-derived-mode monk-ui-query-mode special-mode "Monk-Query"
+  "Which machines a CEL or CELL guard matches.
+\\{monk-ui-query-mode-map}")
+
+(defun monk-ui-query (text &optional machines)
+  "Show which of MACHINES match guard TEXT in `monk-ui-query-buffer-name'.
+TEXT is CEL, or CELL when it starts with a parenthesis.  MACHINES
+defaults to `monk-inventory'.  Machines without gathered facts show
+their inventory data only; press `g' in the buffer to gather facts
+over the network.  Press `e' to edit the guard, `q' to close."
+  (interactive
+   (list (read-string "Guard (CEL, or CELL in parentheses): " nil 'monk-ui-query-history)))
+  (unless (or machines (bound-and-true-p monk-inventory))
+    (user-error "The inventory is empty; load a policy file first"))
+  (let ((buffer (get-buffer-create monk-ui-query-buffer-name)))
+    (with-current-buffer buffer
+      (monk-ui-query-mode)
+      (setq monk-ui--query-text text
+            monk-ui--query-machines (or machines monk-inventory))
+      (monk-ui--query-render text monk-ui--query-machines nil))
+    (pop-to-buffer buffer)))
+
+(defun monk-ui-query-edit ()
+  "Edit the guard of this query buffer and evaluate it again."
+  (interactive)
+  (let ((text (read-string "Guard: " monk-ui--query-text 'monk-ui-query-history)))
+    (setq monk-ui--query-text text)
+    (monk-ui--query-render text monk-ui--query-machines nil)))
+
+(defun monk-ui-query-gather ()
+  "Gather facts for machines in this query that have none, then evaluate again."
+  (interactive)
+  (monk-ui--query-render monk-ui--query-text monk-ui--query-machines t))
+
 (defun monk-ui-show-machine (&optional machine-name)
   "Show the results for MACHINE-NAME, or the machine at point.
 In an apply with a plan, results that differ from the plan come first."
@@ -973,12 +1273,13 @@ In an apply with a plan, results that differ from the plan come first."
          (run (or monk-ui--live-run monk-ui--run))
          (plan (and run (not monk-ui--live-run) (monk-run-plan run)))
          (results (monk-ui--results name))
+         (machine (monk-ui--run-machine name))
          (header-face (if (and run (monk-run-dry-run run)) 'monk-ui-plan-header 'monk-ui-header))
          (buffer (get-buffer-create (format monk-ui-detail-buffer-format name))))
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (special-mode)
+        (monk-ui-detail-mode)
         (insert (propertize (if (and run (monk-run-dry-run run)) " PLAN " " APPLY ")
                             'face (if (and run (monk-run-dry-run run))
                                       'monk-ui-plan-badge 'monk-ui-apply-badge))
@@ -986,6 +1287,8 @@ In an apply with a plan, results that differ from the plan come first."
                 (propertize (format " %s\n" (if run (monk-run-summary run name) ""))
                             'face header-face))
         (insert (propertize "\n" 'face 'monk-ui-separator))
+        (when machine
+          (monk-ui-insert-machine-fold machine))
         (when plan
           (let ((off (seq-remove
                       (lambda (r) (eq (monk--plan-verdict (monk-run-result plan (monk-result-key r)) r)
@@ -1006,11 +1309,13 @@ In an apply with a plan, results that differ from the plan come first."
               (dolist (r group)
                 (let ((planned (and plan (monk-run-result plan (monk-result-key r)))))
                   (if (and planned (not (eq (monk--plan-verdict planned r) monk-plan-as-planned)))
-                      (insert (monk-ui-badge status)
-                              (make-string (max 1 (- 14 (length (symbol-name status)))) ?\s)
-                              (propertize (format "%-14s" (monk-result-type r)) 'face 'monk-ui-skipped)
-                              (monk-result-name r)
-                              (propertize "  see above" 'face 'monk-ui-skipped)
+                      (insert (propertize
+                               (concat (monk-ui-badge status)
+                                       (make-string (max 1 (- 14 (length (symbol-name status)))) ?\s)
+                                       (propertize (format "%-14s" (monk-result-type r)) 'face 'monk-ui-skipped)
+                                       (monk-result-name r)
+                                       (propertize "  see above" 'face 'monk-ui-skipped))
+                               'monk-ui-result r)
                               "\n")
                     (monk-ui--insert-result r planned run)))))))
         (goto-char (point-min))))
