@@ -260,6 +260,12 @@ Remote machines have no notification channel over TRAMP. Monk polls them: every 
 
 A compiled-in notification library does not guarantee delivery. Sandboxes and some network filesystems report `inotify` and deliver nothing. `monk-watch-notifications-work-p` writes a probe file and waits for its event; `monk-watch-start` logs a warning when the probe fails, and local drift then goes unseen until the next manual run.
 
+## Import from and export to Ansible and Salt
+
+`<` in `*monk*` turns an Ansible playbook, role, or tasks file, or a Salt SLS, into a Monk policy for the machine at point; `>` turns the policy of the machine at point into a playbook or an SLS. Both ask which dialect. A language model does the mapping, through `monk-translate-ask-function`, by default efrit's `efrit-ask-once`: one request, off any session. Monk does the exact parts around it. The model receives the Monk catalog, generated from `monk-resource-specs` when you press the key, so it maps against the constructors, parameters, types, defaults, and choices that exist in this Emacs, not against what it remembers; the export side hands it each compiled resource as data (type, name, arguments, guard as CEL, requisites, tags), not Lisp. Anything with no native constructor is told to become `monk-ansible` or `monk-salt` with the original arguments, never an invented one.
+
+Nothing the model returns runs. An import lands in `*monk-import*` as Lisp, is read as data, and is compiled with `monk-check-policy` against the machine, with no connection; `*monk-check*` shows the resources. When it does not compile, the errors and the previous answer go back to the model, up to `monk-translate-repair-rounds` (3) times, then the buffer is yours with the errors at the end. `C-c C-c` checks again after you edit, `C-c C-k` sends it back once more. An export lands in `*monk-export*` and is checked with `ansible-playbook --syntax-check` or `salt-call --local state.show_sls` when the tool is installed; `C-c C-c` checks again. For Salt with `salt-call` present, `monk-salt-insert-sls` below gives an exact import of the low state as `monk-salt` forms; the model then only has to make them native.
+
 ## Salt import and matchers
 
 `(monk-salt-import-sls MACHINE "demo" FILE-ROOT PILLAR-ROOT)` runs `state.show_low_sls` and returns one `(monk-salt ...)` form per low chunk, in Salt's order, with `require`, `watch`, `onchanges`, `onfail`, `prereq`, and `listen` carried over as Monk requisites on the id. `M-x monk-salt-insert-sls` inserts them at point. Paste them into a policy and edit.

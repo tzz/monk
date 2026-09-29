@@ -721,9 +721,39 @@ made for this one.  The buffer stays, so the next report reuses it."
     (define-key map (kbd "h") #'monk-ui-history)
     (define-key map (kbd ".") #'monk-ui-find-definition)
     (define-key map (kbd "M-.") #'monk-ui-find-definition)
+    (define-key map (kbd "<") #'monk-ui-import)
+    (define-key map (kbd ">") #'monk-ui-export)
     (define-key map (kbd "?") #'monk-ui-help)
     map)
   "Keymap for `monk-ui-mode'.")
+
+(declare-function monk-translate-import "monk-translate" (dialect source machine))
+(declare-function monk-translate-export "monk-translate" (dialect machine policy))
+
+(defun monk-ui-import ()
+  "Translate an Ansible or Salt file into a Monk policy for the machine at point.
+Asks the dialect and the file; the answer opens in `*monk-import*'.
+See `monk-translate-import'."
+  (interactive)
+  (require 'monk-translate)
+  (let ((machine (or (and (tabulated-list-get-id) (monk-ui--run-machine (tabulated-list-get-id)))
+                     (monk-local-machine))))
+    (funcall-interactively
+     (lambda (dialect file)
+       (monk-translate-import dialect
+                              (with-temp-buffer (insert-file-contents file) (buffer-string))
+                              machine))
+     (cdr (assoc (completing-read "Import from: " '(("ansible") ("salt")) nil t)
+                 '(("ansible" . ansible) ("salt" . salt))))
+     (read-file-name "Playbook, tasks file, or SLS: " nil nil t))))
+
+(defun monk-ui-export ()
+  "Write the policy of the machine at point as an Ansible playbook or Salt SLS.
+Asks the dialect; the answer opens in `*monk-export*'.  See
+`monk-translate-export'."
+  (interactive)
+  (require 'monk-translate)
+  (call-interactively #'monk-translate-export))
 
 (defun monk-ui--format ()
   "Return the `tabulated-list-format' for the run in this buffer.
@@ -761,7 +791,7 @@ a plan gains a Plan column."
   "Show the keys of the report buffer."
   (interactive)
   (message "%s" (substitute-command-keys
-                 "\\[monk-ui-show-machine] detail  \\[monk-ui-inspect-machine] facts  \\[monk-ui-find-definition] source  \\[monk-ui-query] query  \\[monk-ui-history] history  \\[monk-ui-apply] apply plan  \\[monk-ui-show-plan] show plan  \\[monk-ui-show-watch-log] watch log  \\[monk-ui-toggle-watch-mode] watch mode  \\[monk-ui-toggle-style] svg/text  \\[monk-ui-rerun] rerun (C-u: redraw only)  \\[monk-ui-quit] quit")))
+                 "\\[monk-ui-show-machine] detail  \\[monk-ui-inspect-machine] facts  \\[monk-ui-find-definition] source  \\[monk-ui-query] query  \\[monk-ui-history] history  \\[monk-ui-apply] apply plan  \\[monk-ui-show-plan] show plan  \\[monk-ui-show-watch-log] watch log  \\[monk-ui-toggle-watch-mode] watch mode  \\[monk-ui-toggle-style] svg/text  \\[monk-ui-rerun] rerun (C-u: redraw only)  \\[monk-ui-import] import ansible/salt  \\[monk-ui-export] export  \\[monk-ui-quit] quit")))
 
 (declare-function monk-watch-status "monk-watch")
 (declare-function monk-watch-toggle-mode "monk-watch")

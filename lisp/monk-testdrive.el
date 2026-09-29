@@ -64,6 +64,7 @@
 (require 'monk-bridge)
 (require 'monk-sync)
 (require 'monk-cli)
+(require 'monk-translate)
 
 ;; The drive checks history when monk-history is loaded; it needs an
 ;; Emacs with SQLite, so it is not required here.
@@ -1093,6 +1094,65 @@ so `~' in the policy lands there."
           (monk-testdrive--checks
            (cons (= 2 converges) (format "%d converges, wanted 2 (start + changed)" converges))))))))
 
+(defun monk-testdrive--section-translate ()
+  "Import and export through a scripted model: catalog, repair loop, round trip."
+  (monk-testdrive--out "\n## Translate (Ansible and Salt)")
+  (require 'monk-translate)
+  (let ((m (monk-testdrive--machine)))
+    (monk-testdrive--step "translate" "the catalog lists every declared constructor with its parameters"
+      (let ((text (monk-translate-catalog)))
+        (monk-testdrive--checks
+         (cons (= (length monk-resource-specs)
+                  (with-temp-buffer (insert text) (count-matches "^(monk-" (point-min) (point-max))))
+               "constructor count")
+         (cons (string-match-p ":mode <mode>" text) "mode param")
+         (cons (string-match-p "COMMON KEYS" text) "common keys"))))
+    (monk-testdrive--step "translate" "import: a bad answer is repaired with the compile errors, then checked"
+      (let* ((bad "(defun monk-translate--imported-policy (m) (monk-directory \"~/imp\" :mdoe 1))")
+             (good ";; -*- lexical-binding: t; -*-\n(defun monk-translate--imported-policy (m)\n  (monk-directory \"~/imp\" :mode #o700 :tags '(base))\n  (monk-line-in-file \"~/imp/f\" \"x=1\" :create t :require '(\"~/imp\")))\n")
+             (answers (list bad good))
+             (prompts nil)
+             (monk-translate-ask-function
+              (lambda (prompt callback &rest _)
+                (push prompt prompts)
+                (funcall callback (pop answers) nil)))
+             (checked nil))
+        (cl-letf (((symbol-function 'monk-ui-check-policy) (lambda (mm p &rest _) (setq checked (list (oref mm name) p)) nil))
+                  ((symbol-function 'pop-to-buffer) #'set-buffer))
+          (with-current-buffer (monk-translate-import 'ansible "- name: imp\n  file: path=~/imp state=directory\n" m)
+            (monk-testdrive--checks
+             (cons (equal good (buffer-string)) (format "buffer holds %S" (buffer-string)))
+             (cons (= 1 monk-translate--round) (format "%d rounds" monk-translate--round))
+             (cons (= 2 (length prompts)) (format "%d prompts" (length prompts)))
+             (cons (string-match-p "Unsupported parameter for monk-directory: :mdoe" (car prompts)) "repair prompt lacks the error")
+             (cons (string-match-p "MONK RESOURCE CATALOG" (cadr prompts)) "first prompt lacks the catalog")
+             (cons (equal (list "drive" 'monk-translate--imported-policy) checked) (format "check %S" checked)))))))
+    (monk-testdrive--step "translate" "export sends the policy as data and lands YAML; a re-import matches"
+      (let* ((policy (lambda (_m)
+                       (monk-directory "~/exp" :mode #o700 :tags '(base))
+                       (monk-file "~/exp/f" :content "hi\n" :require '("~/exp") :when "'drive' in classes")))
+             (yaml "---\n- hosts: all\n  tasks:\n    - name: \"~/exp\"\n      file: {path: \"~/exp\", state: directory, mode: \"0700\"}\n      tags: [base]\n    - name: \"~/exp/f\"\n      copy: {dest: \"~/exp/f\", content: \"hi\\n\"}\n      when: \"'drive' in group_names\"\n")
+             (back ";; -*- lexical-binding: t; -*-\n(defun monk-translate--imported-policy (m)\n  (monk-directory \"~/exp\" :mode #o700 :tags '(base))\n  (monk-file \"~/exp/f\" :content \"hi\\n\" :require '(\"~/exp\") :when \"'drive' in classes\"))\n")
+             (answers (list (concat "```yaml\n" yaml "```") back))
+             (prompts nil)
+             (monk-translate-ask-function
+              (lambda (prompt callback &rest _)
+                (push prompt prompts)
+                (funcall callback (pop answers) nil)))
+             (before (monk-translate-policy-data m policy))
+             (exported nil))
+        (cl-letf (((symbol-function 'monk-ui-check-policy) (lambda (&rest _) nil))
+                  ((symbol-function 'pop-to-buffer) #'set-buffer))
+          (with-current-buffer (monk-translate-export 'ansible m policy)
+            (setq exported (buffer-string)))
+          (with-current-buffer (monk-translate-import 'ansible exported m)
+            (monk-testdrive--checks
+             (cons (equal yaml exported) (format "export buffer %S" exported))
+             (cons (string-match-p "(when . \"'drive' in classes\")" (cadr prompts)) "export prompt lacks the CEL guard")
+             (cons (string-match-p "(tags base)" (cadr prompts)) "export prompt lacks tags")
+             (cons (equal before (monk-translate-policy-data m 'monk-translate--imported-policy))
+                   (format "round trip differs: %S" (monk-translate-policy-data m 'monk-translate--imported-policy))))))))))
+
 (defun monk-testdrive--section-facts ()
   "Fact cache, facts.d, structured diffs, generic package and service."
   (monk-testdrive--out "\n## Facts and diffs")
@@ -1175,6 +1235,7 @@ so `~' in the policy lands there."
     ("Ansible-style features" monk-testdrive--section-ansible)
     ("Facts and diffs" monk-testdrive--section-facts)
     ("Fleet controls" monk-testdrive--section-fleet)
+    ("Translate" monk-testdrive--section-translate)
     ("Watch" monk-testdrive--section-watch)
     ("Agent and events" monk-testdrive--section-agent))
   "The drive's sections: (TITLE FUNCTION).")
@@ -1341,6 +1402,50 @@ so `~' in the policy lands there."
         (fmakunbound 'monk-testdrive--check-policy)
         (when (get-buffer monk-ui-check-buffer-name) (kill-buffer monk-ui-check-buffer-name))))))
 
+(defun monk-testdrive--tour-translate ()
+  "Import and export with the real model, when efrit is loaded."
+  (monk-testdrive--step "tour" "> exports this drive's policy as an Ansible playbook through the model"
+    (if (not (and (require 'efrit-ask nil t) (fboundp 'efrit-ask-once)))
+        (cons 'SKIP "efrit is not loaded; the translate stops need a model")
+      (require 'monk-translate)
+      (let ((m (monk-testdrive--machine))
+            (monk-translate-ask-function nil)
+            (done nil))
+        (monk-ui-show (monk-plan m #'monk-testdrive--policy))
+        (monk-testdrive--focus-monk)
+        ;; Wait for the answer here, with the wait outside the step's
+        ;; clock, so the question comes when the buffer is full.
+        (cl-letf* ((real #'monk-translate--export-arrived)
+                   ((symbol-function 'monk-translate--export-arrived)
+                    (lambda (&rest args) (unwind-protect (apply real args) (setq done t)))))
+          (monk-translate-export 'ansible m #'monk-testdrive--policy)
+          (let ((t0 (float-time)))
+            (while (and (not done) (< (- (float-time) t0) 120))
+              (accept-process-output nil 0.2))
+            (cl-incf monk-testdrive--waited (- (float-time) t0))))
+        (pop-to-buffer monk-translate-export-buffer-name)
+        (delete-other-windows)
+        (monk-testdrive--ask "A *monk-export* buffer with a playbook: one play, hosts: all, one task per drive resource in policy order (two directories, two symlinks as file state=link, the app.conf copy, the motd lineinfile, an app-reload handler notified by app.conf)?  The echo area said whether ansible-playbook accepted it or is not installed?"))))
+  (monk-testdrive--step "tour" "< imports that playbook back into a policy that compiles"
+    (if (not (and (require 'efrit-ask nil t) (fboundp 'efrit-ask-once) (get-buffer monk-translate-export-buffer-name)))
+        (cons 'SKIP "no model, or no export to import")
+      (let ((m (monk-testdrive--machine))
+            (monk-translate-ask-function nil)
+            (yaml (with-current-buffer monk-translate-export-buffer-name (buffer-string)))
+            (done nil))
+        (cl-letf* ((real #'monk-ui-check-policy)
+                   ((symbol-function 'monk-ui-check-policy)
+                    (lambda (&rest args) (unwind-protect (apply real args) (setq done t)))))
+          (monk-translate-import 'ansible yaml m)
+          (let ((t0 (float-time)))
+            (while (and (not done) (< (- (float-time) t0) 240))
+              (accept-process-output nil 0.2))
+            (cl-incf monk-testdrive--waited (- (float-time) t0))))
+        (delete-other-windows)
+        (pop-to-buffer monk-translate-import-buffer-name)
+        (display-buffer monk-ui-check-buffer-name '(display-buffer-below-selected))
+        (monk-testdrive--ask "Two buffers: *monk-import* with a (defun monk-translate--imported-policy (m) ...) that uses native constructors (monk-directory, monk-file, monk-line-in-file, monk-command with :watch), and *monk-check* under it saying CHECK OK with the same resource names?  The echo area named the repair rounds, if any?")))))
+
 (defun monk-testdrive--tour-history ()
   "The history buffer."
   (monk-testdrive--step "tour" "h opens the history list; RET, c, r"
@@ -1359,6 +1464,7 @@ so `~' in the policy lands there."
     ("History" monk-testdrive--tour-history)
     ("Facts and diffs" monk-testdrive--tour-facts)
     ("Fleet controls" monk-testdrive--tour-fleet)
+    ("Translate" monk-testdrive--tour-translate)
     ("Watch" monk-testdrive--tour-watch)
     ("Text fallback" monk-testdrive--tour-text))
   "The tour's stops: (TITLE FUNCTION).")
