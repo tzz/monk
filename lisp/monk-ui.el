@@ -844,12 +844,7 @@ a plan gains a Plan column."
                          (alist-get monk-status-partial counts 0))))
          (list name
                (vconcat
-                (list (let ((m (monk-ui--run-machine name)))
-                        (concat (propertize name 'face 'monk-ui-machine)
-                                (if (and m (not (string-empty-p (monk-ui-facts-badge m))))
-                                    (concat " " (monk-ui-facts-badge m))
-                                  "")
-                                (monk-ui-batch-badge name)))
+                (list (monk-ui--machine-cell name)
                       (if (eq verdict monk-status-running)
                           (concat (monk-ui-spinner) " "
                                   (propertize "running" 'face 'monk-ui-running))
@@ -863,6 +858,21 @@ a plan gains a Plan column."
                      (list (if comparison (monk-ui--machine-plan-cell name comparison) "")))
                 (list (format "%.1fs" (monk-ui--machine-duration name)))))))
      (monk-ui--machine-names))))
+
+(defun monk-ui--machine-cell (name)
+  "Return the first column for machine NAME: the name and its badges.
+`tabulated-list-print-col' keeps a cell's own `help-echo' only when
+the first character has one, else it wraps the whole cell in
+\"Machine: ...\".  So the name carries the tooltips of its badges."
+  (let* ((m (monk-ui--run-machine name))
+         (facts (if m (monk-ui-facts-badge m) ""))
+         (batch (monk-ui-batch-badge name))
+         (tips (delq nil (list (and (not (string-empty-p facts)) (get-text-property 0 'help-echo facts))
+                               (and (not (string-empty-p batch)) (get-text-property 1 'help-echo batch))))))
+    (concat (propertize name 'face 'monk-ui-machine
+                        'help-echo (if tips (string-join tips "\n") (format "Machine: %s" name)))
+            (if (string-empty-p facts) "" (concat " " facts))
+            batch)))
 
 (defun monk-ui-batch-badge (name)
   "Return a badge with the batch number of machine NAME, or the empty string.
@@ -1473,9 +1483,13 @@ first.  `.' jumps to a resource's definition, `q' closes."
   "Show the results for MACHINE-NAME, or the machine at point.
 In an apply with a plan, results that differ from the plan come first."
   (interactive)
-  (let* ((name (or machine-name (tabulated-list-get-id)
-                   (user-error "No machine at point")))
-         (run (or monk-ui--live-run monk-ui--run))
+  (pop-to-buffer (monk-ui-detail-buffer (or machine-name (tabulated-list-get-id)
+                                            (user-error "No machine at point")))))
+
+(defun monk-ui-detail-buffer (name)
+  "Fill and return the detail buffer for machine NAME, without showing it.
+Reads the run of the current buffer, so call it from `*monk*'."
+  (let* ((run (or monk-ui--live-run monk-ui--run))
          (plan (and run (not monk-ui--live-run) (monk-run-plan run)))
          (results (monk-ui--results name))
          (machine (monk-ui--run-machine name))
@@ -1536,7 +1550,7 @@ In an apply with a plan, results that differ from the plan come first."
                        (monk-ui--insert-result r planned run)))))
                (not (memq status monk-ui-fold-statuses))))))
         (goto-char (point-min))))
-    (pop-to-buffer buffer)))
+    buffer))
 
 (defun monk-ui-show-plan ()
   "Show the plan that the apply in this buffer came from."

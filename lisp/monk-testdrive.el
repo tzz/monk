@@ -252,14 +252,27 @@ tour ends."
     (force-mode-line-update t)))
 
 (defun monk-testdrive--focus-detail (name)
-  "Show the detail buffer for machine NAME below `*monk*', and select it."
+  "Show the detail buffer for machine NAME below `*monk*', and select it.
+The buffer is built without `pop-to-buffer', so `display-buffer-alist'
+has no say: exactly one window shows it, under `*monk*'."
   (monk-testdrive--focus-monk)
-  (with-current-buffer monk-ui-buffer-name
-    (save-window-excursion (monk-ui-show-machine name)))
-  (let ((detail (get-buffer (format monk-ui-detail-buffer-format name))))
-    (select-window (split-window-below (max 6 (/ (window-height) 4))))
-    (switch-to-buffer detail)
+  (let ((detail (with-current-buffer monk-ui-buffer-name (monk-ui-detail-buffer name)))
+        ;; Through `display-buffer', so the window remembers it was made
+        ;; for this buffer and `q' deletes it instead of showing *monk*
+        ;; twice.  The overriding action keeps `display-buffer-alist' out.
+        (display-buffer-overriding-action
+         (list #'display-buffer-below-selected
+               (cons 'window-height (lambda (w) (fit-window-to-buffer w nil (- (frame-height) 8)))))))
+    (pop-to-buffer detail)
     (goto-char (point-min))))
+
+(defun monk-testdrive--windows-showing (buffer)
+  "Return how many windows on any frame show BUFFER, with their frames' names."
+  (let ((windows (get-buffer-window-list buffer nil t)))
+    (cons (length windows)
+          (mapcar (lambda (w) (format "%s%s" (frame-parameter (window-frame w) 'name)
+                                      (if (window-parameter w 'window-side) " (side window)" "")))
+                  windows))))
 
 (defun monk-testdrive--ask (prompt)
   "Ask PROMPT about what is on screen; return PASS, FAIL with a note, or SKIP."
@@ -389,7 +402,7 @@ so `~' in the policy lands there."
                "PLAN badge face missing"))))
     (monk-testdrive--step "plan" "diff is in the detail buffer"
       (with-current-buffer (get-buffer monk-ui-buffer-name)
-        (save-window-excursion (monk-ui-show-machine "drive")))
+        (monk-ui-detail-buffer "drive"))
       (with-current-buffer (get-buffer (format monk-ui-detail-buffer-format "drive"))
         (let ((text (buffer-substring-no-properties (point-min) (point-max))))
           (monk-testdrive--checks
@@ -696,7 +709,7 @@ so `~' in the policy lands there."
                (cons (equal "~/from-file" (cdr origin)) "origin name"))))
           (monk-testdrive--step "inspect" "detail buffer: folded machine section, . jumps to the policy"
             (with-current-buffer (monk-ui-show plan)
-              (save-window-excursion (monk-ui-show-machine "drive")))
+              (monk-ui-detail-buffer "drive"))
             (with-current-buffer (format monk-ui-detail-buffer-format "drive")
               (goto-char (point-min))
               (let ((heading (search-forward "drive: " nil t))
@@ -906,9 +919,11 @@ so `~' in the policy lands there."
            (cons (not monk-cli--tty) "drive stderr is a tty?")
            (cons (not (seq-some (lambda (l) (string-search "\e[2K" l)) lines)) "escape bytes off a tty")))))
     (monk-testdrive--step "salt" "compound matcher translates to CELL and selects machines"
-      (let ((form (monk-salt-matcher-to-cell "G@kernel:Linux and not L@nobody")))
+      (let* ((kernel (monk-machine-fact m 'kernel))
+             (form (monk-salt-matcher-to-cell (format "G@kernel:%s and not L@nobody" kernel))))
         (monk-testdrive--checks
-         (cons (equal '(and (class linux) (not (in (name) (list "nobody")))) form) (format "%S" form))
+         (cons (equal `(and (class ,(intern (downcase kernel))) (not (in (name) (list "nobody")))) form)
+               (format "%S" form))
          (cons (equal '("drive") (mapcar (lambda (x) (oref x name)) (monk-cell-select form (list m))))
                "drive did not match"))))))
 
@@ -1243,7 +1258,11 @@ so `~' in the policy lands there."
     (monk-ui-show (monk-converge m #'monk-testdrive--policy))
     (monk-testdrive--step "tour" "detail buffer opens with a folded machine line; TAB unfolds"
       (monk-testdrive--focus-detail "drive")
-      (monk-testdrive--ask "Second line reads '▸ drive: N classes, N facts, N vars (TAB to expand)'.  Press TAB on it: does it turn into ▾ with class chips and a facts table under it?  Below, is the 'kept (N)' group folded with '(TAB to expand)' while 'repaired' is open?  Press q: does the detail close and *monk* stay?"))
+      (let ((showing (monk-testdrive--windows-showing (format monk-ui-detail-buffer-format "drive"))))
+        (if (/= 1 (car showing))
+            (cons 'FAIL (format "%d windows show the detail buffer: %S; display-buffer-alist has %d entries"
+                                (car showing) (cdr showing) (length display-buffer-alist)))
+          (monk-testdrive--ask "Second line reads '▸ drive: N classes, N facts, N vars (TAB to expand)'.  Press TAB on it: does it turn into ▾ with class chips and a facts table under it?  Below, is the 'kept (N)' group folded with '(TAB to expand)' while 'repaired' is open?  Press q: does the detail close and *monk* stay?"))))
     (monk-testdrive--step "tour" "/ query: matches, explanations, folded facts"
       (monk-testdrive--focus-monk)
       (save-window-excursion (monk-ui-query "'drive' in classes && facts.arch == 'nope'" (list m)))
@@ -1252,11 +1271,16 @@ so `~' in the policy lands there."
       (prog1 (monk-testdrive--ask "Purple QUERY line at the top, then CELL and CEL renderings, '0 of 1 machine match', a grey '– drive' row with 'facts.arch == 'nope' is false: ...' after it, and a folded ▸ drive line?  Press e: does it ask for a new guard (C-g to cancel)?")
         (kill-buffer monk-ui-query-buffer-name)))
     (monk-testdrive--step "tour" "focus lands in *monk* after a command run"
-      (with-current-buffer (monk-testdrive--buf) (delete-other-windows (get-buffer-window (current-buffer) t)))
+      (delete-other-windows)
       (switch-to-buffer (monk-testdrive--buf))
-      (monk-run-report (monk-plan m #'monk-testdrive--policy))
-      (redisplay)
-      (monk-testdrive--ask "The cursor is now in the *monk* window (not in the report), so 'a' would apply at once?"))))
+      (let ((before (buffer-name (window-buffer (selected-window)))))
+        (monk-run-report (monk-plan m #'monk-testdrive--policy))
+        (redisplay)
+        (let ((after (buffer-name (window-buffer (selected-window)))))
+          (if (not (equal after monk-ui-buffer-name))
+              (cons 'FAIL (format "selected window shows %s (was %s); monk-ui-select-window is %S, display-buffer-alist has %d entries"
+                                  after before monk-ui-select-window (length display-buffer-alist)))
+            (monk-testdrive--ask "The cursor is in the *monk* window (not in the report), so 'a' would apply at once?")))))))
 
 (defun monk-testdrive--tour-facts ()
   "The fact age badge, fresh and stale, and the structured diff."
@@ -1298,13 +1322,24 @@ so `~' in the policy lands there."
       (monk-testdrive--focus-monk)
       (monk-testdrive--ask "Rows t1 t2 t3 carry badges b1, b2×, b3×, the × ones dimmed?  Hover b2×: does the tooltip say the batch never started?  Does the header show a red 'stopped at batch 1/3'?")))
   (monk-testdrive--step "tour" "the check buffer lists resources with tags and marks a selection"
-    (let ((m (monk-testdrive--machine)))
-      (monk-ui-check-policy m (lambda (_m)
-                                (monk-directory "~/tour-c1" :tags '(base))
-                                (monk-file "~/tour-c2" :content "x" :tags '(ssh))
-                                (monk-directory "~/tour-c3" :require '("nope")))
-                            :tags '(ssh))
-      (monk-testdrive--ask "A *monk-check* buffer: a red 'CHECK FAILED' badge, an 'unresolved' line naming nope, a tags row with base and ssh as pills, and three resource lines where only ~/tour-c2 has the kept glyph and the others are dimmed?  Press . on a line: does it jump to this drive's source?  q closes?"))))
+    (let ((m (monk-testdrive--machine))
+          (policy-file (monk-testdrive--path "check-policy.el")))
+      ;; A policy from a file, so `.' has a source to jump to; a lambda
+      ;; typed here would have none.
+      (with-temp-file policy-file
+        (insert ";; -*- lexical-binding: t; -*-\n"
+                "(defun monk-testdrive--check-policy (_m)\n"
+                "  (monk-directory \"~/tour-c1\" :tags '(base))\n"
+                "  (monk-file \"~/tour-c2\" :content \"x\" :tags '(ssh))\n"
+                "  (monk-directory \"~/tour-c3\" :require '(\"nope\")))\n"))
+      (load policy-file nil t)
+      (unwind-protect
+          (progn
+            (monk-ui-check-policy m 'monk-testdrive--check-policy :tags '(ssh))
+            (delete-other-windows)
+            (monk-testdrive--ask "A *monk-check* buffer: a red 'CHECK FAILED' badge, an 'unresolved' line naming nope, a tags row with base and ssh as pills, and three resource lines where only ~/tour-c2 has the kept glyph and the others are dimmed?  Press . on a resource line: does it open check-policy.el at that line (M-, comes back)?  q closes?"))
+        (fmakunbound 'monk-testdrive--check-policy)
+        (when (get-buffer monk-ui-check-buffer-name) (kill-buffer monk-ui-check-buffer-name))))))
 
 (defun monk-testdrive--tour-history ()
   "The history buffer."

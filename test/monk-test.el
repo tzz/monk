@@ -3042,7 +3042,7 @@ refuses to run from a side window."
         (monk-ui-mode)
         (setq monk-ui--run plan)
         (monk-ui-refresh)
-        (save-window-excursion (monk-ui-show-machine "testbox")))
+        (monk-ui-detail-buffer "testbox"))
       (with-current-buffer detail
         (should (eq (key-binding "a") 'monk-ui-apply))
         (should (eq monk-ui--run plan))
@@ -3564,7 +3564,7 @@ the run is not ok, and the exit code says 4."
       (with-temp-buffer
         (monk-ui-mode)
         (setq monk-ui--run run)
-        (save-window-excursion (monk-ui-show-machine "testbox"))
+        (monk-ui-detail-buffer "testbox")
         (with-current-buffer (format monk-ui-detail-buffer-format "testbox")
           (goto-char (point-min))
           (search-forward "repaired (1)")
@@ -4198,7 +4198,7 @@ the run is not ok, and the exit code says 4."
               (monk-ui-find-definition)
               (should (equal (buffer-file-name) inventory-file)))
             ;; result line in the detail buffer
-            (save-window-excursion (monk-ui-show-machine "testbox"))
+            (monk-ui-detail-buffer "testbox")
             (with-current-buffer (format monk-ui-detail-buffer-format "testbox")
               (goto-char (point-min))
               (should (search-forward "~/jump" nil t))
