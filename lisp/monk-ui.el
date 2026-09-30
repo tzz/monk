@@ -1897,5 +1897,6 @@ watch, not from a command."
 (add-hook 'monk-progress-functions #'monk-ui--progress)
 (setq monk-report-function #'monk-ui-report)
 
+(monk-note-load 'monk-ui)
 (provide 'monk-ui)
 ;;; monk-ui.el ends here

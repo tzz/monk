@@ -539,5 +539,6 @@ until, dry_run, changed, limit, offset."
 (monk-history-mode 1)
 (monk-history-install-fact-cache)
 
+(monk-note-load 'monk-history)
 (provide 'monk-history)
 ;;; monk-history.el ends here

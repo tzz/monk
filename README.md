@@ -364,6 +364,10 @@ Facts are cached when `monk-history` is loaded. A gather stores them in the hist
 
 `monk-diff` returns a list of `monk-diff-entry` structs, not a string. An entry has a kind: `content`, a unified diff of text; `attributes`, before and after values of mode, owner, and group; or `rendered`, text a resource produced itself. `monk-result-diff-text` renders a result's entries for the report, and the event stream carries them structured, so a consumer can tell a mode change from a content change without parsing a diff.
 
+## Version
+
+`M-x monk-version` prints `Monk 0.3.1 build 2026-09-30.3 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
+
 ## Test drive, tour, tutorial
 
 `M-x monk-testdrive` runs every feature against a throwaway home and reports in `*monk-testdrive*`: converge, plan and apply, requisites, flapping, drift watching, the agent ledger and query handler, the report buffers. Every check is done by code that reads files, run results, and the text and properties of the `*monk*` buffers; nothing asks you anything while it runs. `C-u` runs one section. `M-x monk-testdrive-tour` is for your eyes: it sets up one thing at a time with nothing running underneath and asks whether it looked right, for the plan header and bars, the diff in the detail buffer, the apply comparison, the flapping badge, the watch badge, and the text fallback.

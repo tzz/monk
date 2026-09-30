@@ -53,6 +53,10 @@
 ;;; Code:
 
 (require 'cl-lib)
+(declare-function monk-note-load "monk" (feature))
+(declare-function monk-stale-libraries "monk")
+(defvar monk-version)
+(defvar monk-build)
 (require 'seq)
 
 ;; The reloader must load without the rest of Monk, so it names what it
@@ -202,6 +206,7 @@ With VERBOSE, list each file as it loads."
         (loaded 0)
         (failed nil)
         (start (float-time))
+        (before (and (boundp 'monk-build) (format "%s %s" monk-version monk-build)))
         (watch (monk-reload--snapshot-watch))
         (stored (monk-reload--stored-runs-p)))
     (when (and (boundp 'monk-ui--spinner-timer) monk-ui--spinner-timer)
@@ -228,12 +233,20 @@ With VERBOSE, list each file as it loads."
         (error (push (cons 'monk-watch (error-message-string err)) failed)))
       (setq monk-reload-last-failures (reverse failed))
       (let ((summary
-             (format "monk: reloaded %d librar%s in %.1fs, %d buffer%s rekeyed, %d cache%s cleared%s%s%s"
+             (format "monk: %s%s, reloaded %d librar%s in %.1fs, %d buffer%s rekeyed, %d cache%s cleared%s%s%s%s"
+                     (if (boundp 'monk-build) (format "%s build %s" monk-version monk-build) "no version")
+                     (if (and before (not (equal before (format "%s %s" monk-version monk-build))))
+                         (format " (was %s)" before)
+                       "")
                      loaded (if (= loaded 1) "y" "ies")
                      (- (float-time) start)
                      buffers (if (= buffers 1) "" "s")
                      caches (if (= caches 1) "" "s")
                      (if watch ", watch restarted" "")
+                     (let ((stale (and (fboundp 'monk-stale-libraries) (monk-stale-libraries))))
+                       (if stale
+                           (format "; STALE after reload: %s" (mapconcat (lambda (c) (symbol-name (car c))) stale ", "))
+                         ""))
                      (if stored "; a stored run in *monk* predates the reload: rerun it if a struct slot changed" "")
                      (if failed
                          (format "; %d failed: %s" (length failed)
@@ -244,5 +257,6 @@ With VERBOSE, list each file as it loads."
         (message "%s" summary)
         loaded))))
 
+(when (fboundp 'monk-note-load) (monk-note-load 'monk-reload))
 (provide 'monk-reload)
 ;;; monk-reload.el ends here

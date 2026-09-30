@@ -359,5 +359,6 @@ to stop.  Uses a raw HTTP request over `make-network-process' because
     (monk-log 'info "etcd: watching %s" prefix)
     proc))
 
+(monk-note-load 'monk-etcd)
 (provide 'monk-etcd)
 ;;; monk-etcd.el ends here

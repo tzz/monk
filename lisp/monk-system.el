@@ -674,5 +674,6 @@ and runs only as a watch action, so with :watch it is a handler."
    (failed-when :type any :doc "Function of the exec, or CELL over (rc) (stdout) (stderr): replaces the exit-code rule."))
   :exclusive ((changed-when creates) (changed-when unless)))
 
+(monk-note-load 'monk-system)
 (provide 'monk-system)
 ;;; monk-system.el ends here

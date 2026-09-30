@@ -296,5 +296,6 @@ CHANGES: the two can differ when the source moved in between."
    (options :type list :doc "Extra rsync arguments, verbatim.")
    (reachable :type string :doc "Host to probe on the ssh port first; unreachable means skipped.")))
 
+(monk-note-load 'monk-sync)
 (provide 'monk-sync)
 ;;; monk-sync.el ends here

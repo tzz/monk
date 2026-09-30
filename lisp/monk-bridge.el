@@ -861,5 +861,6 @@ Independent salt resources on a machine run as one `state.high' call."
    (args :type alist :doc "State arguments as (KEY . VALUE)."))
   ((id :type string :doc "An SLS id that differs from the name, kept for import round trips.")))
 
+(monk-note-load 'monk-bridge)
 (provide 'monk-bridge)
 ;;; monk-bridge.el ends here

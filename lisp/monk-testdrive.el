@@ -1505,8 +1505,9 @@ so `~' in the policy lands there."
     (let ((inhibit-read-only t)) (erase-buffer)))
   (monk-testdrive--show-report)
   (setq monk-testdrive--layout (current-window-configuration))
-  (monk-testdrive--out "%s\n%s  Emacs %s  notifications %s\n" title (format-time-string "%F %T")
-                       emacs-version (or file-notify--library "none"))
+  (monk-testdrive--out "%s\n%s  Emacs %s  notifications %s\n%s\n" title (format-time-string "%F %T")
+                       emacs-version (or file-notify--library "none")
+                       (monk-version-string))
   (with-current-buffer (monk-testdrive--buf)
     (setq monk-testdrive--summary-marker (copy-marker (point-max))))
   (unless (or noninteractive
@@ -1584,5 +1585,6 @@ buffer, and asks whether it looked right."
   (monk-testdrive--restore-layout)
   (pop-to-buffer monk-testdrive-buffer-name))
 
+(monk-note-load 'monk-testdrive)
 (provide 'monk-testdrive)
 ;;; monk-testdrive.el ends here

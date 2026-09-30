@@ -358,5 +358,6 @@ Detects the terminal once.  Safe to call more than once."
   (setq monk-cli--timer nil monk-cli--tty nil
         monk-batch-print-function (lambda (line) (message "%s" line))))
 
+(monk-note-load 'monk-cli)
 (provide 'monk-cli)
 ;;; monk-cli.el ends here

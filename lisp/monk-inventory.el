@@ -228,5 +228,6 @@ OPTIONS pass to `monk-converge'.  Return a list of `monk-run'."
 
 (add-hook 'monk-facts-ready-functions #'monk-inventory--on-facts)
 
+(monk-note-load 'monk-inventory)
 (provide 'monk-inventory)
 ;;; monk-inventory.el ends here

@@ -4821,5 +4821,25 @@ the run is not ok, and the exit code says 4."
                 ((symbol-function 'call-process) (lambda (&rest _) 0)))
         (should-not (monk-translate-check-export 'salt file))))))
 
+;;;; Version and stale libraries
+
+(ert-deftest monk-test-version-and-stale ()
+  (should (string-match-p "\\`[0-9]+\\.[0-9]+\\.[0-9]+\\'" monk-version))
+  (should (string-match-p "\\`[0-9]\\{4\\}-[0-9][0-9]-[0-9][0-9]\\.[0-9]+\\'" monk-build))
+  (should (string-match-p (format "Monk %s build %s from " monk-version monk-build) (monk-version-string)))
+  (dolist (feature '(monk monk-file monk-ui monk-cell))
+    (should (alist-get feature monk--load-times)))
+  ;; nothing is stale right after loading
+  (should-not (monk-stale-libraries))
+  (should-not (string-match-p "STALE" (monk-version-string)))
+  ;; a source newer than its load time is reported
+  (let ((monk--load-times (copy-alist monk--load-times)))
+    (setf (alist-get 'monk-file monk--load-times) (time-subtract (current-time) (* 400 86400)))
+    (let ((stale (monk-stale-libraries)))
+      (should (= 1 (length stale)))
+      (should (eq 'monk-file (caar stale)))
+      (should (> (cdar stale) 0)))
+    (should (string-match-p "STALE: monk-file \\+[0-9]+s" (monk-version-string)))))
+
 (provide 'monk-test)
 ;;; monk-test.el ends here

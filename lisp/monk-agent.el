@@ -337,8 +337,8 @@ is already recorded."
     ;; leave a half-torn watch.
     (add-hook 'kill-emacs-hook #'monk-agent-stop)
     (monk-cli-print-line
-     (format "%s start on %s, ledger %s, full converge every %ss%s"
-             (monk-cli--color "1" "monk-agent") (oref m name)
+     (format "%s %s build %s start on %s, ledger %s, full converge every %ss%s"
+             (monk-cli--color "1" "monk-agent") monk-version monk-build (oref m name)
              (abbreviate-file-name (monk-agent-ledger-path)) monk-agent-full-interval
              (if monk-cli--tty "" "  (no terminal: progress off)")))
     (let ((delay (monk-agent-splay-seconds)))
@@ -659,5 +659,6 @@ With USER, ask the user instance."
   (monk-events-to-run
    (monk-agent-query m `((op . ,(if dry-run "plan" "run"))) user)))
 
+(monk-note-load 'monk-agent)
 (provide 'monk-agent)
 ;;; monk-agent.el ends here

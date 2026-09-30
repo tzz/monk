@@ -336,5 +336,6 @@ Machines are stand-ins named from the events; facts are empty."
      :passes (or (alist-get 'passes end) 1)
      :dry-run (eq t (alist-get 'dry_run (or end start))))))
 
+(monk-note-load 'monk-event)
 (provide 'monk-event)
 ;;; monk-event.el ends here

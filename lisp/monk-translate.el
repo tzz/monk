@@ -497,5 +497,6 @@ the resources go to the model as data."
      :purpose "monk-export")
     buffer))
 
+(monk-note-load 'monk-translate)
 (provide 'monk-translate)
 ;;; monk-translate.el ends here

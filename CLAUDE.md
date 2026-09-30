@@ -39,3 +39,7 @@ Before handing over: `make compile test check` clean with warnings as
 errors, `monk-tzz.el` compiles against the tree, and the scan for
 internal names in the public repo returns nothing. Git is read only
 for the assistant; hand over the commit message.
+
+## Version and build
+
+`monk-version` and `monk-build` live at the top of `lisp/monk.el`. Bump `monk-build` (`YYYY-MM-DD.N`, N counts hand-overs within a day) with every hand-over, and say the new build in the hand-over message. The drive and tour print it on their first line, and print `STALE:` with the libraries edited after they loaded, so an old Emacs is caught before a report is trusted. `monk-version` is semantic: bump the patch for small work (a fix, a tour step, a small option), bump the minor for a large ask (a new library, a review group, a new resource family). Never leave a hand-over without one of the two bumped alongside `monk-build`.

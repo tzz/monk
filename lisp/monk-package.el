@@ -347,5 +347,6 @@ so the policy still compiles everywhere.  Ansible's `package'."
   :classes (darwin)
   :name-form (format "%s:%s" domain key))
 
+(monk-note-load 'monk-package)
 (provide 'monk-package)
 ;;; monk-package.el ends here

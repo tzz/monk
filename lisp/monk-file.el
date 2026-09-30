@@ -541,5 +541,6 @@ one file can hold several line resources."
   ((path :type path :doc "File, link, or directory to remove."))
   ())
 
+(monk-note-load 'monk-file)
 (provide 'monk-file)
 ;;; monk-file.el ends here

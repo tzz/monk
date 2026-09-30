@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.2.0
+;; Version: 0.3.1
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -79,6 +79,65 @@
   "Configuration management in Emacs."
   :group 'tools
   :prefix "monk-")
+
+;;;; Version
+
+(defconst monk-version "0.3.1"
+  "Monk's version.  Patch for small work, minor for a large ask.
+When the drive report shows a number older than what you were told,
+the Emacs runs old code.")
+
+(defconst monk-build "2026-09-30.3"
+  "The build tag: the date of the last change and a counter.
+Finer than `monk-version' so a report can tell two edits on one day
+apart.  Bumped with every change that reaches a hand-over.")
+
+(defconst monk-libraries
+  '(monk monk-cell monk-file monk-system monk-package monk-sync monk-inventory
+    monk-event monk-history monk-ui monk-watch monk-agent monk-cli monk-bridge
+    monk-translate monk-etcd monk-reload monk-testdrive monk-tutorial)
+  "Every Monk library, for `monk-version'.")
+
+(defvar monk--load-times nil
+  "Alist of (FEATURE . TIME) recorded when each Monk library loaded.")
+
+(defun monk-note-load (feature)
+  "Record that FEATURE loaded now.  Each Monk library calls this at its end."
+  (setf (alist-get feature monk--load-times) (current-time)))
+
+(defun monk-stale-libraries ()
+  "Return the loaded Monk libraries whose source changed after they loaded.
+Each entry is (FEATURE . SECONDS-NEWER).  Compares the .el on disk with
+the time the library loaded, so an edit that a reload missed shows up
+here.  A library loaded from a .elc older than its .el counts too."
+  (let (out)
+    (dolist (feature monk-libraries)
+      (when (featurep feature)
+        (let* ((loaded (alist-get feature monk--load-times))
+               (path (or (locate-library (concat (symbol-name feature) ".el"))
+                         (locate-library (symbol-name feature))))
+               (source (and path (concat (file-name-sans-extension path) ".el")))
+               (mtime (and source (file-exists-p source)
+                           (file-attribute-modification-time (file-attributes source)))))
+          (when (and loaded mtime (time-less-p loaded mtime))
+            (push (cons feature (float-time (time-subtract mtime loaded))) out)))))
+    (nreverse out)))
+
+(defun monk-version-string ()
+  "Return one line: version, build, where monk.el loaded from, and stale libraries."
+  (let* ((stale (monk-stale-libraries))
+         (from (or (locate-library "monk") "?")))
+    (format "Monk %s build %s from %s%s"
+            monk-version monk-build (abbreviate-file-name (file-name-directory from))
+            (if stale
+                (format "  STALE: %s (edited after load; run monk-reload)"
+                        (mapconcat (lambda (c) (format "%s +%ds" (car c) (round (cdr c)))) stale ", "))
+              ""))))
+
+(defun monk-version ()
+  "Show Monk's version and build, and which libraries are older than their source."
+  (interactive)
+  (message "%s" (monk-version-string)))
 
 ;;;; Constants
 
@@ -3130,5 +3189,6 @@ any resource failed."
         (kill-emacs code)))
     run))
 
+(monk-note-load 'monk)
 (provide 'monk)
 ;;; monk.el ends here

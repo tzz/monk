@@ -73,6 +73,7 @@
 (require 'seq)
 (require 'subr-x)
 
+(declare-function monk-note-load "monk" (feature))
 (declare-function monk-machine-fact "monk" (m key &optional default))
 (declare-function monk-machine-var "monk" (m key &optional default))
 (declare-function monk-machine-local-p "monk" (m))
@@ -753,5 +754,6 @@ Parentheses appear only where CEL precedence needs them."
                (monk-cell--cel-child b (1+ self))))
       (_ (signal 'monk-guard-error (list (format "Cannot print %S as CEL" form)))))))
 
+(when (fboundp 'monk-note-load) (monk-note-load 'monk-cell))
 (provide 'monk-cell)
 ;;; monk-cell.el ends here

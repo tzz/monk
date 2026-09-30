@@ -537,5 +537,6 @@ lesson cannot rot.  The watch lesson runs with notifications stubbed."
       (delete-directory monk-tutorial--home t))
     (setq monk-tutorial--home nil)))
 
+(monk-note-load 'monk-tutorial)
 (provide 'monk-tutorial)
 ;;; monk-tutorial.el ends here

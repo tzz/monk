@@ -657,5 +657,6 @@ machines get filesystem notifications; remote ones are polled every
               (monk-watch-events w) monk-watch--unmanaged-count (monk-watch-runs w)
               (format-seconds "%hh%mm%ss" (float-time (time-since (monk-watch-started w))))))))
 
+(monk-note-load 'monk-watch)
 (provide 'monk-watch)
 ;;; monk-watch.el ends here
