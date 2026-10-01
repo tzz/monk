@@ -324,14 +324,22 @@ only for its own children, so a resize during a long run is missed."
      (setq monk-cli--current nil))))
 
 (defun monk-cli-summary-line (run)
-  "Return the one-line summary of RUN with colored counts."
-  (let ((parts nil))
+  "Return the one-line summary of RUN with colored counts.
+A partial run, one a watch or :only restricted, says how many
+resources it left out instead of counting them as skipped: those are
+not a verdict on anything."
+  (let* ((parts nil)
+         (unselected (monk-run-unselected-count run)))
     (dolist (status (list monk-status-repaired monk-status-would-repair monk-status-partial
                           monk-status-failed monk-status-unreachable monk-status-kept monk-status-skipped))
-      (let ((n (monk-run-count run status)))
+      (let ((n (- (monk-run-count run status) (if (eq status monk-status-skipped) unselected 0))))
         (when (> n 0)
           (push (format "%s %d %s" (monk-cli-glyph status) n status) parts))))
     (concat (string-join (nreverse parts) "  ")
+            (if (> unselected 0)
+                (monk-cli--color "90" (format "  partial: %d of %d" (- (length (monk-run-results run)) unselected)
+                                              (length (monk-run-results run))))
+              "")
             (monk-cli--color "90" (format "  %d pass%s" (monk-run-passes run)
                                           (if (= 1 (monk-run-passes run)) "" "es")))
             (if (monk-run-flapping-p run)

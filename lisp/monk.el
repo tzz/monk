@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.4.2
+;; Version: 0.4.3
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -82,12 +82,12 @@
 
 ;;;; Version
 
-(defconst monk-version "0.4.2"
+(defconst monk-version "0.4.3"
   "Monk's version.  Patch for small work, minor for a large ask.
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-10-01.3"
+(defconst monk-build "2026-10-01.4"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -1256,8 +1256,11 @@ Paths keep a leading `~'; the watcher expands them per machine.")
 
 (cl-defgeneric monk-resource-owns-subtree-p (resource)
   "Return non-nil when a change under a path of RESOURCE is drift for it.
-True for a directory: a file created inside it can change its mode
-or ownership expectations.  Nil for a file.")
+True for a resource whose content is the tree: a git checkout, an
+rsync source.  Nil for a file, and nil for a directory too: a
+`monk-directory' manages the directory's own mode and owner, which a
+file written inside it cannot change.  Treating it as a subtree made
+every scratch file under ~/.ssh a drift event (2026-10-01).")
 
 (cl-defmethod monk-resource-owns-subtree-p ((_r monk-resource))
   nil)
@@ -3033,17 +3036,30 @@ the report shows them elsewhere."
 
 ;;;; Text reporting
 
+(defun monk-run-unselected-count (run &optional machine)
+  "Return how many results of RUN, or of MACHINE, a partial run left out.
+Those carry `monk-skip-not-selected': a watch or :only did not select
+them, so their skip says nothing about the machine."
+  (seq-count (lambda (r) (and (eq (monk-result-status r) monk-status-skipped)
+                              (equal (monk-result-comment r) monk-skip-not-selected)
+                              (or (null machine) (equal (monk-result-machine r) machine))))
+             (monk-run-results run)))
+
 (defun monk-run-summary (run &optional machine)
-  "Return a one-line summary of RUN, or of MACHINE within it."
-  (let ((unreachable (monk-run-count run monk-status-unreachable machine)))
-    (format "%d kept, %d repaired, %d would repair, %d partial, %d failed, %d skipped%s, %d pass%s"
+  "Return a one-line summary of RUN, or of MACHINE within it.
+In a partial run the resources left out are not counted as skipped;
+they are named apart, as `N not selected'."
+  (let ((unreachable (monk-run-count run monk-status-unreachable machine))
+        (unselected (monk-run-unselected-count run machine)))
+    (format "%d kept, %d repaired, %d would repair, %d partial, %d failed, %d skipped%s%s, %d pass%s"
             (monk-run-count run monk-status-kept machine)
             (monk-run-count run monk-status-repaired machine)
             (monk-run-count run monk-status-would-repair machine)
             (monk-run-count run monk-status-partial machine)
             (monk-run-count run monk-status-failed machine)
-            (monk-run-count run monk-status-skipped machine)
+            (- (monk-run-count run monk-status-skipped machine) unselected)
             (if (> unreachable 0) (format ", %d unreachable" unreachable) "")
+            (if (> unselected 0) (format ", %d not selected" unselected) "")
             (monk-run-passes run)
             (if (= 1 (monk-run-passes run)) "" "es"))))
 

@@ -1282,7 +1282,9 @@ and the edit was silently unmanaged."
 
 (ert-deftest monk-test-watch-fswatch-paths-flat-and-trees ()
   "Owned files give their parent, flat; owned subtrees give themselves, walked.
-A parent inside a walked tree is dropped, and ~ itself is never walked."
+A directory resource is a file in this sense: its parent is watched
+flat, its contents are not.  An rsync source tree is walked.  A parent
+inside a walked tree is dropped, and ~ itself is never walked."
   (require 'monk-sync)
   (monk-test-with-tmpdir dir
     (make-directory (concat dir "home/.config/app") t)
@@ -1299,8 +1301,12 @@ A parent inside a walked tree is dropped, and ~ itself is never walked."
            (w (monk-watch-create :machines (list m) :policy #'ignore
                                  :path-index (monk-watch--build-index nodes))))
       (pcase-let ((`(,flat . ,trees) (monk-watch--fswatch-paths w)))
+        ;; ~ (for .zshrc), ~/.config/app (for conf), ~/src (parent of the
+        ;; plugins directory resource: a flat watch there sees the
+        ;; directory replaced or re-moded); the rsync walks plugins itself
         (should (equal (list (directory-file-name (concat dir "home"))
-                             (concat dir "home/.config/app"))
+                             (concat dir "home/.config/app")
+                             (concat dir "home/src"))
                        flat))
         (should (equal (list (concat dir "home/src/plugins")) trees))))))
 
@@ -1933,7 +1939,16 @@ change appears, and one resource fails."
       (should (eq 'skipped (monk-test-status run (concat dir "other"))))
       (should-not (file-exists-p (concat dir "other")))
       (should (equal (list (cons "testbox" (concat dir "conf")))
-                     (plist-get (monk-run-options run) :only))))))
+                     (plist-get (monk-run-options run) :only)))
+      ;; the summaries name what a partial run left out instead of
+      ;; counting it as skipped
+      (should (= 2 (monk-run-unselected-count run)))
+      (should (string-match-p "0 skipped, 2 not selected" (monk-run-summary run)))
+      (require 'monk-cli)
+      (let ((line (substring-no-properties (monk-cli-summary-line run))))
+        (should (string-match-p "1 repaired" line))
+        (should-not (string-match-p "skipped" line))
+        (should (string-match-p "partial: 1 of 3" line))))))
 
 ;;;; Watch
 
@@ -1979,12 +1994,17 @@ change appears, and one resource fails."
       (should (equal (list (concat dir "f"))
                      (mapcar (lambda (n) (oref (monk-node-resource n) name))
                              (monk-watch--nodes-for-file w (concat dir "f")))))
-      ;; A file inside a managed directory maps to the directory and, when
-      ;; managed itself, to its own resource.
-      (should (equal (list (concat dir "d") (concat dir "d/inner"))
-                     (sort (mapcar (lambda (n) (oref (monk-node-resource n) name))
-                                   (monk-watch--nodes-for-file w (concat dir "d/inner")))
-                           #'string<)))
+      ;; A file inside a managed directory maps to its own resource only:
+      ;; the directory manages its mode and owner, which a file written
+      ;; inside it cannot change, so scratch files under it are not drift.
+      (should (equal (list (concat dir "d/inner"))
+                     (mapcar (lambda (n) (oref (monk-node-resource n) name))
+                             (monk-watch--nodes-for-file w (concat dir "d/inner")))))
+      (should-not (monk-watch--nodes-for-file w (concat dir "d/scratch")))
+      ;; the directory itself still is
+      (should (equal (list (concat dir "d"))
+                     (mapcar (lambda (n) (oref (monk-node-resource n) name))
+                             (monk-watch--nodes-for-file w (concat dir "d")))))
       (should-not (monk-watch--nodes-for-file w (concat dir "stranger"))))))
 
 (ert-deftest monk-test-watch-assisted-plans-only-affected ()

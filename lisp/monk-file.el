@@ -186,9 +186,6 @@ temporary files."
 (cl-defmethod monk-resource-paths ((r monk-directory-resource))
   (list (oref r name)))
 
-(cl-defmethod monk-resource-owns-subtree-p ((_r monk-directory-resource))
-  t)
-
 (monk-define-resource monk-directory monk-directory-resource
   "Ensure directory PATH exists, with the given mode and ownership."
   ((path :type path :doc "The directory."))
