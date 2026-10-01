@@ -43,3 +43,7 @@ for the assistant; hand over the commit message.
 ## Version and build
 
 `monk-version` and `monk-build` live at the top of `lisp/monk.el`. Bump `monk-build` (`YYYY-MM-DD.N`, N counts hand-overs within a day) with every hand-over, and say the new build in the hand-over message. The drive and tour print it on their first line, and print `STALE:` with the libraries edited after they loaded, so an old Emacs is caught before a report is trusted. `monk-version` is semantic: bump the patch for small work (a fix, a tour step, a small option), bump the minor for a large ask (a new library, a review group, a new resource family). Never leave a hand-over without one of the two bumped alongside `monk-build`.
+
+## Drive and tour isolation
+
+The drive and the tour must not read or change anything of the user's: no init file, dotfiles, repositories, history database, inventory, or customized options. Make a throwaway fixture inside the drive's home instead, and bind options in the step (`monk-testdrive--with-defaults` resets every `monk-` option around a run). A step that needs an external checkout (Ansible, a kernel tree) takes an explicit environment variable or a sibling of this tree, never a guess at the user's disk, and SKIPs otherwise. The Isolation section asserts this and scans the drive's source; keep it green.

@@ -5031,5 +5031,16 @@ the run is not ok, and the exit code says 4."
                 (setq features (delq 'embark features)))))
         (fmakunbound 'monk-test--embark-policy)))))
 
+(ert-deftest monk-test-format-duration ()
+  "Fixed width, zero padded, so a redrawn line does not shift."
+  (should (equal "00h 00m 00s" (monk-format-duration 0)))
+  (should (equal "00h 00m 07s" (monk-format-duration 7.4)))
+  (should (equal "00h 31m 12s" (monk-format-duration (+ (* 31 60) 12))))
+  (should (equal "26h 00m 01s" (monk-format-duration (+ 86400 7200 1))))
+  (should (equal "0d 00h 00m 00s" (monk-format-duration 0 t)))
+  (should (equal "1d 02h 00m 01s" (monk-format-duration (+ 86400 7200 1) t)))
+  (should (equal "00h 00m 00s" (monk-format-duration -5)))
+  (should (= (length (monk-format-duration 59)) (length (monk-format-duration 3599)))))
+
 (provide 'monk-test)
 ;;; monk-test.el ends here

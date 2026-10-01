@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.4.3
+;; Version: 0.4.7
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -82,12 +82,12 @@
 
 ;;;; Version
 
-(defconst monk-version "0.4.3"
+(defconst monk-version "0.4.7"
   "Monk's version.  Patch for small work, minor for a large ask.
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-10-01.4"
+(defconst monk-build "2026-10-01.8"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -122,6 +122,19 @@ here.  A library loaded from a .elc older than its .el counts too."
           (when (and loaded mtime (time-less-p loaded mtime))
             (push (cons feature (float-time (time-subtract mtime loaded))) out)))))
     (nreverse out)))
+
+(defun monk-format-duration (seconds &optional days)
+  "Return SECONDS as a fixed-width `00h 00m 00s', or `0d 00h 00m 00s' with DAYS.
+Every field is zero-padded, so a line that is rewritten each tick
+does not shift as the numbers grow."
+  (let* ((total (max 0 (round seconds)))
+         (d (/ total 86400))
+         (h (/ (% total 86400) 3600))
+         (m (/ (% total 3600) 60))
+         (sec (% total 60)))
+    (if days
+        (format "%dd %02dh %02dm %02ds" d h m sec)
+      (format "%02dh %02dm %02ds" (+ h (* 24 d)) m sec))))
 
 (defun monk-version-string ()
   "Return one line: version, build, where monk.el loaded from, and stale libraries."

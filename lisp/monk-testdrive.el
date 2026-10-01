@@ -54,6 +54,8 @@
 (require 'monk-file)
 (require 'monk-system)
 (require 'monk-inventory)
+(defvar monk-history--db)
+(defvar monk-history--db-path)
 (require 'monk-ui)
 (require 'monk-watch)
 (require 'monk-event)
@@ -340,6 +342,56 @@ so `~' in the policy lands there."
     (monk-file "~/class-marker" :content "drive\n")))
 
 ;;;; Sections
+
+(defun monk-testdrive--section-isolation ()
+  "Prove the drive stands apart from this Emacs: no user state in, none out."
+  (monk-testdrive--out "\n## Isolation")
+  (monk-testdrive--step "isolation" "HOME and MONK_HOME point into the throwaway home"
+    (let ((home (directory-file-name monk-testdrive--home)))
+      (monk-testdrive--checks
+       (cons (equal (getenv "HOME") home) (format "HOME is %s" (getenv "HOME")))
+       (cons (string-prefix-p home (getenv monk-home-environment-variable))
+             (format "%s is %s" monk-home-environment-variable (getenv monk-home-environment-variable)))
+       (cons (string-prefix-p home (monk-home-directory)) (format "monk-home-directory %s" (monk-home-directory)))
+       ;; this one reads ~ on purpose: it proves the redirection  [isolation-probe]
+       (cons (string-prefix-p home (expand-file-name "~/x")) (format "~ expands to %s" (expand-file-name "~"))))))
+  (monk-testdrive--step "isolation" "the history database and fact cache are the drive's own"
+    (if (not (featurep 'monk-history))
+        (cons 'SKIP "monk-history not loaded")
+      (let ((path (monk-history-path)))
+        (monk-testdrive--checks
+         (cons (string-prefix-p (directory-file-name monk-testdrive--home) path) (format "history at %s" path))
+         (cons (null (monk-history-runs :limit 1)) "history is not empty at the start")))))
+  (monk-testdrive--step "isolation" "inventory, batch policy, and resource index start empty"
+    (monk-testdrive--checks
+     (cons (null monk-inventory) (format "inventory has %d machine(s)" (length monk-inventory)))
+     (cons (null monk-inventory-derived) "derived group rules present")
+     (cons (null monk-batch-policy) (format "batch policy is %S" monk-batch-policy))
+     (cons (= 0 (hash-table-count monk-resource-index)) (format "%d indexed names" (hash-table-count monk-resource-index)))))
+  (monk-testdrive--step "isolation" "every Monk user option is at its default"
+    (let ((off (delq nil (mapcar (lambda (sym)
+                                   (and (get sym 'standard-value)
+                                        (not (equal (symbol-value sym) (eval (car (get sym 'standard-value)) t)))
+                                        ;; the drive sets these two itself
+                                        (not (memq sym '(monk-log-level monk-ui-style)))
+                                        sym))
+                                 (monk-testdrive-option-symbols)))))
+      (monk-testdrive--check (null off) (format "customized: %S" off))))
+  (monk-testdrive--step "isolation" "no step names a path outside the throwaway home"
+    ;; Read the drive's own source: a literal home-relative path or a
+    ;; guess at the user's disk is a regression in the drive itself.
+    (let* ((file (or (locate-library "monk-testdrive.el") (locate-library "monk-testdrive")))
+           (source (and file (concat (file-name-sans-extension file) ".el")))
+           (bad nil))
+      (if (not (and source (file-readable-p source)))
+          (cons 'SKIP "cannot find the drive's source")
+        (with-temp-buffer
+          (insert-file-contents source)
+          (goto-char (point-min))
+          (while (re-search-forward "\\(?:expand-file-name\\|insert-file-contents\\|file-exists-p\\|find-file\\(?:-noselect\\)?\\) \"\\(~/[^\"]*\\|/Users/[^\"]*\\|/home/[^\"]*\\)\"" nil t)
+            (unless (save-excursion (forward-line -1) (looking-at-p ".*\\[isolation-probe\\]"))
+              (push (format "%d: %s" (line-number-at-pos) (match-string 1)) bad))))
+        (monk-testdrive--check (null bad) (format "user paths in the drive: %S" (nreverse bad)))))))
 
 (defun monk-testdrive--section-converge ()
   "Converge, converge again, and inspect the results."
@@ -920,6 +972,40 @@ so `~' in the policy lands there."
                  "type column not aligned")
            (cons (not monk-cli--tty) "drive stderr is a tty?")
            (cons (not (seq-some (lambda (l) (string-search "\e[2K" l)) lines)) "escape bytes off a tty")))))
+    (monk-testdrive--step "salt" "the watching line rolls in place and yields to a run"
+      ;; Drive stderr is not a tty, so the terminal is faked: the writes
+      ;; are collected and read back as frames.
+      (let ((out nil) (monk-log-level nil) (monk-cli-idle-interval 0.02)
+            ;; the timer fires with the caller's `default-directory', which
+            ;; may be ~-relative and so re-expand under the throwaway HOME
+            (default-directory temporary-file-directory))
+        (cl-letf (((symbol-function 'monk-cli--write) (lambda (text) (push text out)))
+                  ((symbol-function 'monk-cli-stderr-tty-p) (lambda () t))
+                  ((symbol-function 'monk-cli-utf8-p) (lambda () t)))
+          (unwind-protect
+              (progn
+                (monk-cli-enable)
+                (monk-cli-idle-start (lambda () "watching 2 dir(s)"))
+                (accept-process-output nil 0.15)
+                (monk-cli-print-line "permanent")
+                (accept-process-output nil 0.1)
+                (monk-converge m (lambda (_m) (monk-directory "~/idle-run")) :passes 1)
+                (accept-process-output nil 0.1))
+            (monk-cli-idle-stop)
+            (monk-cli-disable)))
+        (let* ((text (apply #'concat (reverse out)))
+               (frames (let (fs) (dolist (part (split-string text "\e\\[2K" t))
+                                   (when (string-match "\\`\\(?:\e\\[[0-9;]*m\\)?\\(.\\)\\(?:\e\\[0m\\)? watching" part)
+                                     (cl-pushnew (match-string 1 part) fs :test #'equal)))
+                         fs))
+               (after-run (let ((at (string-search "pass 1" text)))
+                            (and at (string-search " watching" text at)))))
+          (monk-testdrive--checks
+           (cons (>= (length frames) 4) (format "%d distinct frames: %S" (length frames) frames))
+           (cons (seq-every-p (lambda (f) (seq-position monk-cli-spinner-frames f)) frames) "not braille frames")
+           (cons (string-search "permanent\n" text) "permanent line missing")
+           (cons (string-search "pass 1" text) "run status line missing")
+           (cons after-run "watching line did not come back after the run")))))
     (monk-testdrive--step "salt" "compound matcher translates to CELL and selects machines"
       (let* ((kernel (monk-machine-fact m 'kernel))
              (form (monk-salt-matcher-to-cell (format "G@kernel:%s and not L@nobody" kernel))))
@@ -1050,10 +1136,11 @@ so `~' in the policy lands there."
              (cons (string-match-p "nope" (car (plist-get bad :unresolved))) "unresolved text"))))))
     (monk-testdrive--step "fleet" "an Ansible module runs directly from a payload zip"
       (let ((library (seq-find (lambda (d) (file-exists-p (expand-file-name "ansible/module_utils/basic.py" d)))
-                               (list (getenv "MONK_ANSIBLE_LIBRARY")
-                                     (expand-file-name "../ansible/lib" (or (and load-file-name (file-name-directory load-file-name)) default-directory))
-                                     (expand-file-name "~/ai_workspace/source/ansible/lib")
-                                     (expand-file-name "~/src/ansible/lib")))))
+                               ;; only an explicit path or a sibling checkout of
+                               ;; this Monk tree: no guesses about the user's disk
+                               (delq nil (list (getenv "MONK_ANSIBLE_LIBRARY")
+                                               (let ((here (or load-file-name (locate-library "monk-testdrive"))))
+                                                 (and here (expand-file-name "../../ansible/lib" (file-name-directory here)))))))))
         (if (not (and library (executable-find "zip") (executable-find "python3")))
             (cons 'SKIP "no ansible checkout, zip, or python3 (set MONK_ANSIBLE_LIBRARY)")
           (require 'monk-bridge)
@@ -1273,7 +1360,8 @@ so `~' in the policy lands there."
          (cons (memq 'os_linux (oref (monk-inventory-find 'a) groups)) "keyed group"))))))
 
 (defconst monk-testdrive--sections
-  '(("Converge" monk-testdrive--section-converge)
+  '(("Isolation" monk-testdrive--section-isolation)
+    ("Converge" monk-testdrive--section-converge)
     ("Plan and apply" monk-testdrive--section-plan)
     ("Requisites and convergence" monk-testdrive--section-graph)
     ("Guards and failures" monk-testdrive--section-guards)
@@ -1347,7 +1435,6 @@ so `~' in the policy lands there."
                     (monk-testdrive--focus-monk)
                     (monk-testdrive--ask "After W: the box is amber and reads AUTOPILOT?  Press w: does the *monk-watch* log open?"))
                 first)))
-        (setq monk-watch-mode 'assisted)
         (monk-watch-stop)))))
 
 (defun monk-testdrive--tour-text ()
@@ -1615,12 +1702,73 @@ so `~' in the policy lands there."
                       monk-ui-history-buffer-name))
     (when (get-buffer name) (kill-buffer name))))
 
+(defconst monk-testdrive-kept-options
+  '(monk-progress-functions monk-result-functions monk-history-mode monk-fact-cache-functions)
+  "User options the drive leaves alone.
+Hooks and modes are how the libraries wire themselves together, not
+preferences.  Resetting `monk-progress-functions' once silently
+turned history recording off.")
+
+(defun monk-testdrive-option-symbols ()
+  "Return every `monk-' user option the drive resets.
+See `monk-testdrive--with-defaults'."
+  (let (out)
+    (mapatoms (lambda (sym)
+                (when (and (string-prefix-p "monk-" (symbol-name sym))
+                           (custom-variable-p sym)
+                           (boundp sym)
+                           (not (memq sym monk-testdrive-kept-options))
+                           (not (string-suffix-p "-functions" (symbol-name sym)))
+                           (not (string-suffix-p "-hook" (symbol-name sym)))
+                           (not (string-suffix-p "-mode" (symbol-name sym))))
+                  (push sym out))))
+    out))
+
+(defmacro monk-testdrive--with-defaults (&rest body)
+  "Run BODY with every Monk user option at its standard value.
+The drive and the tour must not depend on what this Emacs has
+customized, and must not change it: a tour that set
+`monk-watch-mode' back to assisted at its end once overwrote the
+user's setting.  Options with no standard value keep theirs."
+  (declare (indent 0))
+  `(let* ((symbols (monk-testdrive-option-symbols))
+          (values (mapcar (lambda (sym)
+                            (if (get sym 'standard-value)
+                                (eval (car (get sym 'standard-value)) t)
+                              (symbol-value sym)))
+                          symbols)))
+     (cl-progv symbols values
+       ,@body)))
+
 (defun monk-testdrive--run (parts)
-  "Run PARTS, each (TITLE FUNCTION), inside the throwaway home; then wrap up."
-  (let ((process-environment (cons (concat "HOME=" (directory-file-name monk-testdrive--home))
-                                   process-environment))
-        (monk-log-level 'info)
-        (monk-ui-style (if (and (not noninteractive) (monk-ui-svg-p)) 'auto 'text)))
+  "Run PARTS, each (TITLE FUNCTION), inside the throwaway home; then wrap up.
+Nothing of this Emacs leaks in or out: HOME and MONK_HOME point at the
+throwaway home, so the history database and fact cache are fresh; the
+inventory, batch policy, and resource index are bound empty; every
+Monk user option is at its default."
+  (let ((process-environment (append (list (concat "HOME=" (directory-file-name monk-testdrive--home))
+                                           (concat monk-home-environment-variable "="
+                                                   (directory-file-name (monk-testdrive--path "monk-home"))))
+                                     process-environment))
+        (monk-inventory nil)
+        (monk-inventory-derived nil)
+        (monk-batch-policy nil)
+        (monk-resource-index (make-hash-table :test #'equal))
+        (monk-history--db nil)
+        (monk-history--db-path nil))
+    (make-directory (monk-testdrive--path "monk-home") t)
+    (monk-testdrive--run-with-defaults parts)))
+
+(defun monk-testdrive--run-with-defaults (parts)
+  "Run PARTS as `monk-testdrive--run' does, under default options."
+  (monk-testdrive--with-defaults
+    (let ((monk-log-level 'info)
+          (monk-ui-style (if (and (not noninteractive) (monk-ui-svg-p)) 'auto 'text)))
+      (monk-testdrive--run-parts parts))))
+
+(defun monk-testdrive--run-parts (parts)
+  "Run PARTS, each (TITLE FUNCTION), in order, then clean up and report."
+  (let ()
     (unwind-protect
         (condition-case nil
             (dolist (p parts)

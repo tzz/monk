@@ -62,7 +62,13 @@
   :type 'number)
 
 (defconst monk-cli-spinner-frames ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"]
-  "Spinner frames for a UTF-8 terminal.")
+  "Spinner frames for a UTF-8 terminal: the 2x3 braille roll.")
+
+(defcustom monk-cli-idle-interval 0.25
+  "Seconds between frames of the watching line, shown between runs.
+Slower than the run spinner: nothing is happening, it only says the
+agent is alive.  Nil turns the idle line off."
+  :type '(choice (const nil) number))
 
 (defconst monk-cli-ascii-spinner-frames ["|" "/" "-" "\\"]
   "Spinner frames for a terminal without UTF-8.")
@@ -210,6 +216,12 @@ only for its own children, so a resize during a long run is missed."
 (defvar monk-cli--timer nil
   "Timer that advances the spinner between progress events.")
 
+(defvar monk-cli--idle-timer nil
+  "Timer that animates the watching line between runs.")
+
+(defvar monk-cli--idle-text-function nil
+  "Function that returns the text after the spinner on the watching line.")
+
 (defvar monk-cli--status-shown nil
   "Non-nil when a status line is on the terminal and must be erased first.")
 
@@ -225,8 +237,7 @@ only for its own children, so a resize during a long run is missed."
 
 (defun monk-cli--status-text ()
   "Return the status line for the node in progress."
-  (let* ((frames (if monk-cli--utf8 monk-cli-spinner-frames monk-cli-ascii-spinner-frames))
-         (spinner (monk-cli--color "36" (aref frames (% monk-cli--frame (length frames)))))
+  (let* ((spinner (monk-cli-spinner-frame))
          (width (length (number-to-string monk-cli--total)))
          (counter (format (format "pass %%d  %%%dd/%%d" width)
                           monk-cli--pass monk-cli--done monk-cli--total))
@@ -253,6 +264,45 @@ only for its own children, so a resize during a long run is missed."
   (cl-incf monk-cli--frame)
   (monk-cli--draw-status))
 
+(defun monk-cli-spinner-frame ()
+  "Return the current spinner frame, colored, for the terminal in use."
+  (let ((frames (if monk-cli--utf8 monk-cli-spinner-frames monk-cli-ascii-spinner-frames)))
+    (monk-cli--color "36" (aref frames (% monk-cli--frame (length frames))))))
+
+;;;; The watching line
+;;
+;; Between runs the agent sits in `accept-process-output'.  On a tty
+;; the last line shows the same braille roll, slower, with what the
+;; watch is doing, rewritten in place like the run status line, so a
+;; glance at the terminal says the agent is alive and since when.
+;; Permanent lines go above it as before.
+
+(defun monk-cli--draw-idle ()
+  "Rewrite the watching line in place."
+  (when (and monk-cli--tty (not monk-cli--current))
+    (cl-incf monk-cli--frame)
+    (monk-cli--write (concat "\r\e[2K" (monk-cli-spinner-frame) " "
+                             (monk-cli--color "90" (or (and monk-cli--idle-text-function
+                                                            (funcall monk-cli--idle-text-function))
+                                                       "watching"))))
+    (setq monk-cli--status-shown t)))
+
+(defun monk-cli-idle-start (text-function)
+  "Show the watching line, with TEXT-FUNCTION giving its text, until a run starts.
+Does nothing off a tty or with `monk-cli-idle-interval' nil."
+  (monk-cli-idle-stop)
+  (setq monk-cli--idle-text-function text-function)
+  (when (and monk-cli--tty monk-cli-idle-interval)
+    (setq monk-cli--idle-timer
+          (run-at-time 0 monk-cli-idle-interval #'monk-cli--draw-idle))))
+
+(defun monk-cli-idle-stop ()
+  "Take the watching line down."
+  (when monk-cli--idle-timer
+    (cancel-timer monk-cli--idle-timer)
+    (setq monk-cli--idle-timer nil))
+  (monk-cli--erase-status))
+
 (defun monk-cli-print-result (result)
   "Print RESULT as one permanent line above the status line."
   (monk-cli--erase-status)
@@ -275,7 +325,8 @@ only for its own children, so a resize during a long run is missed."
   (if monk-cli--tty
       (monk-cli--write (concat text "\n"))
     (message "%s" text))
-  (when monk-cli--current (monk-cli--draw-status)))
+  (cond (monk-cli--current (monk-cli--draw-status))
+        (monk-cli--idle-timer (monk-cli--draw-idle))))
 
 ;;;; Progress hook
 
@@ -293,6 +344,10 @@ only for its own children, so a resize during a long run is missed."
   (pcase event
     ('run-start
      (let ((nodes (plist-get data :nodes)))
+       (when monk-cli--idle-timer
+         (cancel-timer monk-cli--idle-timer)
+         (setq monk-cli--idle-timer nil)
+         (monk-cli--erase-status))
        (monk-cli--size-columns nodes)
        (setq monk-cli--total (length nodes)
              monk-cli--done 0
@@ -321,7 +376,12 @@ only for its own children, so a resize during a long run is missed."
        (cancel-timer monk-cli--timer)
        (setq monk-cli--timer nil))
      (monk-cli--erase-status)
-     (setq monk-cli--current nil))))
+     (setq monk-cli--current nil)
+     ;; back to the watching line; the summary line the caller prints
+     ;; next goes above it, as `monk-cli-print-line' redraws it
+     (when (and monk-cli--idle-text-function monk-cli-idle-interval monk-cli--tty)
+       (setq monk-cli--idle-timer
+             (run-at-time monk-cli-idle-interval monk-cli-idle-interval #'monk-cli--draw-idle))))))
 
 (defun monk-cli-summary-line (run)
   "Return the one-line summary of RUN with colored counts.
@@ -362,6 +422,8 @@ Detects the terminal once.  Safe to call more than once."
 (defun monk-cli-disable ()
   "Turn terminal progress off."
   (remove-hook 'monk-progress-functions #'monk-cli--progress)
+  (monk-cli-idle-stop)
+  (setq monk-cli--idle-text-function nil)
   (when monk-cli--timer (cancel-timer monk-cli--timer))
   (setq monk-cli--timer nil monk-cli--tty nil
         monk-batch-print-function (lambda (line) (message "%s" line))))

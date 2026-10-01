@@ -68,6 +68,7 @@
 (require 'monk-watch)
 (require 'monk-event)
 (require 'monk-cli)
+(require 'timer)
 ;; Every agent run goes to the history database when this Emacs has
 ;; SQLite; the ledger is written in any case.
 (when (and (fboundp 'sqlite-available-p) (sqlite-available-p))
@@ -310,6 +311,19 @@ repo did not move, skip the converge."
       (let ((monk-watch--running t))
         (monk-run-report (monk-converge (or monk-agent--machine (monk-agent-machine)) policy))))))
 
+(defun monk-agent--idle-text ()
+  "Text of the watching line: paths, runs, uptime, next full converge."
+  (let ((w monk-watch--current)
+        (next (and monk-agent--full-timer
+                   (max 0 (round (float-time (time-subtract (timer--time monk-agent--full-timer)
+                                                             (current-time))))))))
+    (if (null w)
+        "watching"
+      (format "watching %d dir(s)  %d run(s)  up %s%s"
+              (length (monk-watch-watched w)) (monk-watch-runs w)
+              (monk-format-duration (float-time (time-since (monk-watch-started w))) t)
+              (if next (format "  full in %s" (monk-format-duration next)) "")))))
+
 (defun monk-agent-stop ()
   "Make the agent loop return after the current iteration."
   (setq monk-agent--running nil))
@@ -347,6 +361,7 @@ is already recorded."
         (sleep-for delay)))
     (monk-agent--full-converge policy)
     (monk-watch-start m policy)
+    (monk-cli-idle-start #'monk-agent--idle-text)
     (setq monk-agent--full-timer
           (run-at-time monk-agent-full-interval monk-agent-full-interval
                        #'monk-agent--full-converge policy t))
@@ -373,6 +388,7 @@ is already recorded."
       (setq monk-agent--full-timer nil
             monk-agent--etcd-timer nil)
       (monk-watch-stop)
+      (monk-cli-idle-stop)
       (monk-cli-disable)
       (monk-cli-print-line "monk-agent: stop"))))
 

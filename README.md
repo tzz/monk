@@ -296,6 +296,8 @@ An agent answers `{"op":"history-runs", ...}` and `{"op":"history-results", ...}
 
 `monk-cli.el` is what a batch Emacs shows on a terminal. When standard error is a terminal, one status line at the bottom is rewritten in place with a spinner, the pass, the count of nodes done, and the machine, type, and name of the resource in progress; every changed or failed result prints above it as a permanent line the moment it finishes, and the summary replaces the status line at the end. Columns are sized once per run from the longest machine and type names, so the line does not jump. Off a terminal (a pipe, a log file, launchd) nothing is rewritten and no escape bytes are written; the permanent lines and the summary still print. Color follows `TERM`, `NO_COLOR`, and `monk-cli-color`. The agent turns this on; `monk-cli-enable` does it for any batch entry point.
 
+
+Between runs, the agent's last line is the same roll, slower (`monk-cli-idle-interval`, 0.25s), rewritten in place: `⠸ watching 12 dir(s)  3 run(s)  up 0d 02h 14m 07s  full in 00h 31m 12s`. It says the agent is alive without scrolling anything. A run takes the line over and gives it back; permanent lines go above it. Watch log lines on a UTF-8 terminal start with one frame of the roll instead of `M`, so consecutive lines roll too.
 ## Execution modes
 
 Monk runs in three modes that share one engine and differ in who decides.
@@ -372,7 +374,7 @@ Facts are cached when `monk-history` is loaded. A gather stores them in the hist
 
 ## Version
 
-`M-x monk-version` prints `Monk 0.4.3 build 2026-10-01.4 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
+`M-x monk-version` prints `Monk 0.4.7 build 2026-10-01.8 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
 
 ## Test drive, tour, tutorial
 
@@ -380,6 +382,8 @@ Facts are cached when `monk-history` is loaded. A gather stores them in the hist
 
 `M-x monk-tutorial` opens ten lessons beside a sandbox home. `C-c C-c` runs the form at point against the sandbox and shows the result in `*monk*`. The lessons cover the same ground as the drive, one feature at a time, and end with writing a resource of your own. `docs/tutorial.md` is the same content as prose. The test suite evaluates every lesson form, so the lessons cannot rot.
 
+
+Both stand apart from the Emacs that runs them. `HOME` and `MONK_HOME` point into the throwaway home, so the history database and fact cache are fresh; the inventory, batch policy, and resource index are bound empty; every Monk user option is at its default for the duration and untouched after. The first drive section, Isolation, asserts all of that, and greps the drive's own source for a literal path outside the throwaway home, so a step that starts reading the user's files fails the drive.
 ## Development
 
 ```sh

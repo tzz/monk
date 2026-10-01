@@ -253,16 +253,31 @@ kqueue the file too, then writes the file and waits."
          (concat (monk-watch-glyph) " " format-string) args))
 
 (defconst monk-watch-glyph-prefix "M"
-  "Prefix of watch lines.
+  "Prefix of watch lines on a terminal without UTF-8.
 A letter: an eye emoji drew as a color glyph of its own size and
 looked out of place next to text.")
+
+(defconst monk-watch-glyph-frames ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"]
+  "Prefix of watch lines on UTF-8: one frame of the 2x3 braille roll.
+The same roll the terminal spins while watching, so a logged line
+reads as a moment of it.")
 
 (defconst monk-watch-glyph-drift "Δ"
   "Marks a drift line on a UTF-8 terminal.")
 
+(defvar monk-watch--glyph-index 0
+  "Which frame `monk-watch-glyph' gives next.")
+
 (defun monk-watch-glyph ()
-  "Return the watch prefix."
-  monk-watch-glyph-prefix)
+  "Return the watch prefix: a braille frame on UTF-8, else `M'.
+The frame advances with each call, so consecutive lines roll."
+  (if (monk-watch--utf8-p)
+      (let ((frame (aref monk-watch-glyph-frames
+                         (% monk-watch--glyph-index (length monk-watch-glyph-frames)))))
+        (cl-incf monk-watch--glyph-index)
+        frame)
+    monk-watch-glyph-prefix))
+
 
 (defun monk-watch--utf8-p ()
   "Return non-nil when the locale says UTF-8, or when not in batch."
@@ -655,7 +670,7 @@ machines get filesystem notifications; remote ones are polled every
               monk-watch-mode (or (monk-watch-backend w) "no local backend")
               (length (monk-watch-watched w))
               (monk-watch-events w) monk-watch--unmanaged-count (monk-watch-runs w)
-              (format-seconds "%hh%mm%ss" (float-time (time-since (monk-watch-started w))))))))
+              (monk-format-duration (float-time (time-since (monk-watch-started w))) t)))))
 
 (monk-note-load 'monk-watch)
 (provide 'monk-watch)
