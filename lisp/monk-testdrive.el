@@ -65,6 +65,7 @@
 (require 'monk-sync)
 (require 'monk-cli)
 (require 'monk-translate)
+(require 'monk-embark)
 
 ;; The drive checks history when monk-history is loaded; it needs an
 ;; Emacs with SQLite, so it is not required here.
@@ -1153,6 +1154,52 @@ so `~' in the policy lands there."
              (cons (equal before (monk-translate-policy-data m 'monk-translate--imported-policy))
                    (format "round trip differs: %S" (monk-translate-policy-data m 'monk-translate--imported-policy))))))))))
 
+(defun monk-testdrive--section-embark ()
+  "The resource index and the Embark actions, with no Embark needed."
+  (monk-testdrive--out "\n## Index and Embark actions")
+  (require 'monk-embark)
+  (let* ((m (monk-testdrive--machine))
+         (policy-file (monk-testdrive--path "embark-policy.el")))
+    (with-temp-file policy-file
+      (insert ";; -*- lexical-binding: t; -*-\n"
+              "(defun monk-testdrive--embark-policy (_m)\n"
+              "  (monk-directory \"~/ix\" :tags '(base))\n"
+              "  (monk-file \"~/ix/f\" :content \"x\\n\" :require '(\"~/ix\"))\n"
+              "  (monk-command \"ix-reload\" \"true\" :creates \"~/never\" :watch '(\"~/ix/f\"))\n"
+              "  (monk-directory \"~/ix-other\"))\n"))
+    (load policy-file nil t)
+    (unwind-protect
+        (let ((monk-batch-policy 'monk-testdrive--embark-policy))
+          (monk-testdrive--step "embark" "a bare name resolves to its definition through the index"
+            (clrhash monk-resource-index)
+            (let ((origin (monk-resource-origin-by-name "~/ix/f")))
+              (monk-testdrive--checks
+               (cons (equal policy-file (and origin (monk-origin-file origin))) (format "origin %S" origin))
+               (cons (equal '(("~/ix/f" . require)) (monk-resource-dependents-by-name "~/ix")) "dependents of ~/ix")
+               (cons (equal '(("ix-reload" . watch)) (monk-resource-dependents-by-name "~/ix/f")) "dependents of ~/ix/f")
+               (cons (equal '("ix-reload" "~/ix" "~/ix-other" "~/ix/f") (monk-resource-names)) (format "names %S" (monk-resource-names))))))
+          (monk-testdrive--step "embark" "the target finder sees a resource string in the policy file"
+            (with-current-buffer (find-file-noselect policy-file)
+              (goto-char (point-min))
+              (goto-char (- (search-forward "\"~/ix/f\" :content") 10))
+              (prog1 (pcase (monk-embark-resource-target)
+                       (`(monk-resource ,name . ,_) (monk-testdrive--check (equal "~/ix/f" name) name))
+                       (other (cons 'FAIL (format "target %S" other))))
+                (kill-buffer))))
+          (monk-testdrive--step "embark" "plan-only on a name runs it and its dependents, nothing else"
+            (let ((reported nil))
+              (cl-letf (((symbol-function 'monk-run-report) (lambda (run &rest _) (setq reported run) run))
+                        ((symbol-function 'monk-embark--machines-for) (lambda (_n) (list m)))
+                        ((symbol-function 'monk-embark--policy) (lambda () monk-batch-policy)))
+                (monk-embark-plan-resource "~/ix/f")
+                (monk-testdrive--checks
+                 (cons (monk-run-dry-run reported) "not a plan")
+                 (cons (eq monk-status-would-repair (monk-result-status (monk-run-result reported '("drive" . "~/ix/f")))) "f not planned")
+                 (cons (eq monk-status-skipped (monk-result-status (monk-run-result reported '("drive" . "~/ix-other")))) "other ran")
+                 ;; the watcher is a dependent, so it is in the plan
+                 (cons (not (eq monk-status-skipped (monk-result-status (monk-run-result reported '("drive" . "ix-reload"))))) "watcher skipped"))))))
+      (fmakunbound 'monk-testdrive--embark-policy))))
+
 (defun monk-testdrive--section-facts ()
   "Fact cache, facts.d, structured diffs, generic package and service."
   (monk-testdrive--out "\n## Facts and diffs")
@@ -1236,6 +1283,7 @@ so `~' in the policy lands there."
     ("Facts and diffs" monk-testdrive--section-facts)
     ("Fleet controls" monk-testdrive--section-fleet)
     ("Translate" monk-testdrive--section-translate)
+    ("Index and Embark" monk-testdrive--section-embark)
     ("Watch" monk-testdrive--section-watch)
     ("Agent and events" monk-testdrive--section-agent))
   "The drive's sections: (TITLE FUNCTION).")
@@ -1446,6 +1494,41 @@ so `~' in the policy lands there."
         (display-buffer monk-ui-check-buffer-name '(display-buffer-below-selected))
         (monk-testdrive--ask "Two buffers: *monk-import* with a (defun monk-translate--imported-policy (m) ...) that uses native constructors (monk-directory, monk-file, monk-line-in-file, monk-command with :watch), and *monk-check* under it saying CHECK OK with the same resource names?  The echo area named the repair rounds, if any?")))))
 
+(defun monk-testdrive--tour-embark ()
+  "Embark on a resource name in a policy file and on a *monk* row."
+  (monk-testdrive--step "tour" "embark-act on a resource string offers the Monk actions"
+    (if (not (featurep 'embark))
+        (cons 'SKIP "embark is not loaded")
+      (require 'monk-embark)
+      (monk-embark-setup)
+      (let ((policy-file (monk-testdrive--path "tour-policy.el")))
+        (with-temp-file policy-file
+          (insert ";; -*- lexical-binding: t; -*-\n"
+                  "(defun monk-testdrive--tour-embark-policy (_m)\n"
+                  "  (monk-directory \"~/tour-ix\")\n"
+                  "  (monk-file \"~/tour-ix/f\" :content \"x\\n\" :require '(\"~/tour-ix\")))\n"))
+        (load policy-file nil t)
+        (unwind-protect
+            (let ((monk-batch-policy 'monk-testdrive--tour-embark-policy))
+              (clrhash monk-resource-index)
+              (delete-other-windows)
+              (find-file policy-file)
+              (goto-char (point-min))
+              (goto-char (- (search-forward "'(\"~/tour-ix\")") 4))
+              (monk-testdrive--ask "Point is inside the string \"~/tour-ix\" in the :require.  Press your embark-act key: does the prompt say 'monk-resource' and offer . p a h w r?  Press .: does point move to the (monk-directory \"~/tour-ix\") line?  Then embark-act again and w: a *monk-dependents* buffer listing ~/tour-ix/f with 'require'?"))
+          (fmakunbound 'monk-testdrive--tour-embark-policy)
+          (when (get-buffer "*monk-dependents*") (kill-buffer "*monk-dependents*"))
+          (when (get-file-buffer policy-file) (kill-buffer (get-file-buffer policy-file)))))))
+  (monk-testdrive--step "tour" "embark-act on a *monk* row offers the machine actions"
+    (if (not (featurep 'embark))
+        (cons 'SKIP "embark is not loaded")
+      (let ((m (monk-testdrive--machine)))
+        (monk-ui-show (monk-plan m #'monk-testdrive--policy))
+        (monk-testdrive--focus-monk)
+        (goto-char (point-min))
+        (while (and (not (tabulated-list-get-id)) (not (eobp))) (forward-line 1))
+        (monk-testdrive--ask "Point is on the drive row.  Press embark-act: does it say 'monk-machine' and offer . p i /?  Press i: does the inspector for drive open (q closes)?")))))
+
 (defun monk-testdrive--tour-history ()
   "The history buffer."
   (monk-testdrive--step "tour" "h opens the history list; RET, c, r"
@@ -1465,6 +1548,7 @@ so `~' in the policy lands there."
     ("Facts and diffs" monk-testdrive--tour-facts)
     ("Fleet controls" monk-testdrive--tour-fleet)
     ("Translate" monk-testdrive--tour-translate)
+    ("Embark" monk-testdrive--tour-embark)
     ("Watch" monk-testdrive--tour-watch)
     ("Text fallback" monk-testdrive--tour-text))
   "The tour's stops: (TITLE FUNCTION).")

@@ -266,6 +266,12 @@ A compiled-in notification library does not guarantee delivery. Sandboxes and so
 
 Nothing the model returns runs. An import lands in `*monk-import*` as Lisp, is read as data, and is compiled with `monk-check-policy` against the machine, with no connection; `*monk-check*` shows the resources. When it does not compile, the errors and the previous answer go back to the model, up to `monk-translate-repair-rounds` (3) times, then the buffer is yours with the errors at the end. `C-c C-c` checks again after you edit, `C-c C-k` sends it back once more. An export lands in `*monk-export*` and is checked with `ansible-playbook --syntax-check` or `salt-call --local state.show_sls` when the tool is installed; `C-c C-c` checks again. For Salt with `salt-call` present, `monk-salt-insert-sls` below gives an exact import of the low state as `monk-salt` forms; the model then only has to make them native.
 
+## Embark
+
+`monk-embark.el` gives Embark two target types. A `monk-resource` is a resource name: the string at point in a policy file, the active region, or a path-like token at point in a comment or any other buffer (a path, or any name a compile has seen), or the result line at point in the report, detail, check, and query buffers. A `monk-machine` is a `*monk*` row, a machine heading, or an inventory host name in a Lisp buffer. `embark-act` on a resource offers `.` jump to the definition, `p` plan only it and its dependents, `a` apply the same, `h` its history, `w` what requires or watches it (a `*monk-dependents*` buffer where `.` jumps again), `r` rename it across the policy tree with `project-query-replace-regexp`. On a machine: `.` the inventory entry, `p` plan, `i` the inspector, `/` a guard query over it.
+
+Names resolve through `monk-resource-index`, filled as a side effect of every compile with each resource's origin, type, machines, requisite refs, and tags. When a name is unknown and `monk-batch-policy` is set, the local policy is compiled once with no connection to fill it, so the first action in a fresh Emacs works. `monk-resource-origin-by-name`, `monk-resource-names`, and `monk-resource-dependents-by-name` are the API. Call `(monk-embark-setup)` in your embark configuration; it also runs when Embark loads after Monk.
+
 ## Salt import and matchers
 
 `(monk-salt-import-sls MACHINE "demo" FILE-ROOT PILLAR-ROOT)` runs `state.show_low_sls` and returns one `(monk-salt ...)` form per low chunk, in Salt's order, with `require`, `watch`, `onchanges`, `onfail`, `prereq`, and `listen` carried over as Monk requisites on the id. `M-x monk-salt-insert-sls` inserts them at point. Paste them into a policy and edit.
@@ -366,7 +372,7 @@ Facts are cached when `monk-history` is loaded. A gather stores them in the hist
 
 ## Version
 
-`M-x monk-version` prints `Monk 0.3.1 build 2026-09-30.3 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
+`M-x monk-version` prints `Monk 0.4.2 build 2026-10-01.3 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
 
 ## Test drive, tour, tutorial
 

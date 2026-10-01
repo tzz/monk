@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.3.1
+;; Version: 0.4.2
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -82,12 +82,12 @@
 
 ;;;; Version
 
-(defconst monk-version "0.3.1"
+(defconst monk-version "0.4.2"
   "Monk's version.  Patch for small work, minor for a large ask.
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-09-30.3"
+(defconst monk-build "2026-10-01.3"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -95,7 +95,7 @@ apart.  Bumped with every change that reaches a hand-over.")
 (defconst monk-libraries
   '(monk monk-cell monk-file monk-system monk-package monk-sync monk-inventory
     monk-event monk-history monk-ui monk-watch monk-agent monk-cli monk-bridge
-    monk-translate monk-etcd monk-reload monk-testdrive monk-tutorial)
+    monk-translate monk-embark monk-etcd monk-reload monk-testdrive monk-tutorial)
   "Every Monk library, for `monk-version'.")
 
 (defvar monk--load-times nil
@@ -1430,6 +1430,66 @@ path, for example a symlink target.  With SUDO, `~' is the home of
 root."
   (monk-machine-expand (monk-current-machine) path sudo))
 
+(defvar monk-batch-policy nil
+  "The policy function a batch entry point runs.  Set by the policy file.
+Also what `monk-resource-origin-by-name' compiles when a name is unknown.")
+
+;;;; Resource index
+;;
+;; Every compile records what it saw, so a bare name can be resolved
+;; later: from an Embark action on a string in a policy file, from a
+;; completion prompt, from a "who depends on this" question.  The index
+;; is a side effect of compiling, never a source of truth: a plan or a
+;; `monk-check-policy' refreshes it.
+
+(defvar monk-resource-index (make-hash-table :test #'equal)
+  "Resource name -> plist (:origin :type :machines :refs :seen).
+:refs is an alist of (KIND . NAMES) this resource points at.")
+
+(defun monk-index-resource (resource machine)
+  "Record RESOURCE compiled for MACHINE in `monk-resource-index'."
+  (let* ((name (oref resource name))
+         (entry (gethash name monk-resource-index))
+         (refs (delq nil (mapcar (lambda (kind)
+                                   (let ((specs (slot-value resource kind)))
+                                     (and specs (cons kind (mapcar (lambda (r) (monk-ref-name (monk-parse-ref r)))
+                                                                   specs)))))
+                                 '(require watch onchanges onfail prereq listen)))))
+    (puthash name
+             (list :origin (oref resource origin)
+                   :type (monk-resource-type resource)
+                   :machines (cl-adjoin (oref machine name) (plist-get entry :machines) :test #'equal)
+                   :refs refs
+                   :tags (oref resource tags)
+                   :seen (current-time))
+             monk-resource-index)))
+
+(defun monk-resource-origin-by-name (name)
+  "Return the (FILE . NAME) origin of the resource called NAME, or nil.
+Answers from `monk-resource-index'.  When the index does not know
+NAME and `monk-batch-policy' is set, the local policy is compiled once
+with no connection to fill it, then the index is asked again."
+  (or (plist-get (gethash name monk-resource-index) :origin)
+      (and monk-batch-policy
+           (progn (ignore-errors (monk-check-policy (monk-local-machine) monk-batch-policy))
+                  (plist-get (gethash name monk-resource-index) :origin)))))
+
+(defun monk-resource-names ()
+  "Return every resource name the index knows, sorted."
+  (let (names)
+    (maphash (lambda (k _v) (push k names)) monk-resource-index)
+    (sort names #'string<)))
+
+(defun monk-resource-dependents-by-name (name)
+  "Return an alist of (RESOURCE-NAME . KIND) for resources that point at NAME."
+  (let (out)
+    (maphash (lambda (other plist)
+               (dolist (cell (plist-get plist :refs))
+                 (when (member name (cdr cell))
+                   (push (cons other (car cell)) out))))
+             monk-resource-index)
+    (sort out (lambda (a b) (string< (car a) (car b))))))
+
 (defun monk-add-resource (resource)
   "Add RESOURCE to the current compile.  Return RESOURCE."
   (unless monk--compile-machine
@@ -1445,6 +1505,7 @@ root."
                             (monk-resource-type resource))))))
   (unless (oref resource origin)
     (oset resource origin (cons monk--compile-file (oref resource name))))
+  (monk-index-resource resource monk--compile-machine)
   (unless (memq (oref resource order) '(nil first last))
     (signal 'monk-policy-error
             (list (format "Resource %S: :order must be first or last, not %S"
@@ -3154,8 +3215,6 @@ also report :selected, the keys tag selection would run.  Ansible's
 
 ;;;; Batch entry point
 
-(defvar monk-batch-policy nil
-  "The policy function a batch entry point runs.  Set by the policy file.")
 
 (defun monk-batch-check (policy-file &rest machine-args)
   "Load POLICY-FILE and compile it for the local machine, with no run.

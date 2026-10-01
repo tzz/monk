@@ -4841,5 +4841,175 @@ the run is not ok, and the exit code says 4."
       (should (> (cdar stale) 0)))
     (should (string-match-p "STALE: monk-file \\+[0-9]+s" (monk-version-string)))))
 
+;;;; Resource index and Embark
+
+(require 'monk-embark)
+
+(ert-deftest monk-test-resource-index ()
+  "Compiling fills the index; names resolve to origins, machines, and dependents."
+  (monk-test-with-tmpdir dir
+    (let* ((monk-resource-index (make-hash-table :test #'equal))
+           (m (monk-test-machine))
+           (monk-log-level nil)
+           (policy-file (concat dir "p.el")))
+      (with-temp-file policy-file
+        (insert ";; -*- lexical-binding: t; -*-\n"
+                "(defun monk-test--indexed-policy (_m)\n"
+                "  (monk-directory \"~/ix\" :tags '(base))\n"
+                "  (monk-file \"~/ix/f\" :content \"x\" :require '(\"~/ix\"))\n"
+                "  (monk-command \"ix-reload\" \"true\" :watch '(\"~/ix/f\") :creates \"~/never\"))\n"))
+      (load policy-file nil t)
+      (unwind-protect
+          (progn
+            (should (= 0 (hash-table-count monk-resource-index)))
+            (should-not (monk-resource-origin-by-name "~/ix"))
+            ;; the batch policy fills it on demand
+            (let ((monk-batch-policy 'monk-test--indexed-policy))
+              (should (equal policy-file (monk-origin-file (monk-resource-origin-by-name "~/ix")))))
+            (should (equal '("ix-reload" "~/ix" "~/ix/f") (monk-resource-names)))
+            ;; the on-demand compile used the local host; index it for testbox too
+            (should (= 1 (length (plist-get (gethash "~/ix" monk-resource-index) :machines))))
+            (monk-check-policy m 'monk-test--indexed-policy)
+            (should (member "testbox" (plist-get (gethash "~/ix" monk-resource-index) :machines)))
+            (should (equal '(base) (plist-get (gethash "~/ix" monk-resource-index) :tags)))
+            (should (equal '(("~/ix/f" . require)) (monk-resource-dependents-by-name "~/ix")))
+            (should (equal '(("ix-reload" . watch)) (monk-resource-dependents-by-name "~/ix/f")))
+            (should-not (monk-resource-dependents-by-name "ix-reload"))
+            ;; a second machine adds to :machines, not a new entry
+            (monk-check-policy (car (monk-test-machines "other")) 'monk-test--indexed-policy)
+            (should (= 3 (length (plist-get (gethash "~/ix" monk-resource-index) :machines))))
+            (should (member "other" (plist-get (gethash "~/ix" monk-resource-index) :machines))))
+        (fmakunbound 'monk-test--indexed-policy)))))
+
+(ert-deftest monk-test-embark-targets ()
+  "The finders see a resource string in Lisp, a result line in a report, a machine row."
+  (let ((monk-resource-index (make-hash-table :test #'equal))
+        (monk-log-level nil))
+    (puthash "ix-reload" (list :type "command") monk-resource-index)
+    (with-temp-buffer
+      (emacs-lisp-mode)
+      (insert "(monk-file \"~/ix/f\" :require '(\"ix-reload\" \"plain-word\"))")
+      ;; a path-like string
+      (goto-char 15)
+      (pcase (monk-embark-resource-target)
+        (`(monk-resource ,name . (,start . ,end))
+         (should (equal "~/ix/f" name))
+         (should (equal "~/ix/f" (buffer-substring start end))))
+        (other (ert-fail (format "no target on the path: %S" other))))
+      ;; an indexed name
+      (goto-char (point-min))
+      (goto-char (- (search-forward "ix-reload") 3))
+      (should (equal "ix-reload" (cadr (monk-embark-resource-target))))
+      ;; an unknown plain string is not a resource
+      (goto-char (point-min))
+      (goto-char (- (search-forward "plain-word") 3))
+      (should-not (monk-embark-resource-target))
+      ;; outside any string: nothing
+      (goto-char 2)
+      (should-not (monk-embark-resource-target))
+      ;; a path in a comment, and a line-in-file name with a # part
+      (goto-char (point-max))
+      (insert "\n;; see ~/.zshrc and ~/etc/motd#welcome here\n")
+      (goto-char (- (search-backward "~/.zshrc") -3))
+      (should (equal "~/.zshrc" (cadr (monk-embark-resource-target))))
+      (goto-char (- (search-forward "#welcome") 2))
+      (should (equal "~/etc/motd#welcome" (cadr (monk-embark-resource-target))))
+      ;; a plain word in a comment is not one
+      (goto-char (- (search-forward "here") 2))
+      (should-not (monk-embark-resource-target))
+      ;; the active region wins when it names a resource
+      (goto-char (point-min))
+      (search-forward "plain-word")
+      (set-mark (match-beginning 0))
+      (activate-mark)
+      (let ((transient-mark-mode t))
+        (should-not (monk-embark-resource-target))
+        (puthash "plain-word" (list :type "x") monk-resource-index)
+        (should (equal "plain-word" (cadr (monk-embark-resource-target)))))
+      (deactivate-mark))
+    ;; a result line in a report buffer
+    (monk-test-with-tmpdir dir
+      (let ((run (monk-test-converge (lambda (_m) (monk-directory (concat dir "t"))))))
+        (with-current-buffer (monk-ui-detail-buffer* run "testbox")
+          (goto-char (point-min))
+          (search-forward (concat dir "t"))
+          (pcase (monk-embark-resource-target)
+            (`(monk-resource ,name . ,_)
+             (should (equal (concat dir "t") name))
+             (should (monk-result-p (get-text-property 0 'monk-result name))))
+            (other (ert-fail (format "no result target: %S" other)))))
+        (with-current-buffer (monk-ui-show run)
+          (goto-char (point-min))
+          ;; the first row with an id: the header line is not an entry
+          (while (and (not (tabulated-list-get-id)) (not (eobp))) (forward-line 1))
+          (pcase (monk-embark-machine-target)
+            (`(monk-machine ,name . ,_) (should (equal "testbox" name)))
+            (other (ert-fail (format "no machine target: %S" other)))))))))
+
+(defun monk-ui-detail-buffer* (run name)
+  "Return the detail buffer of machine NAME for RUN, built from a report buffer."
+  (with-current-buffer (monk-ui-show run)
+    (monk-ui-detail-buffer name)))
+
+(ert-deftest monk-test-embark-actions ()
+  "Find, plan-only, dependents, and setup with a fake Embark."
+  (monk-test-with-tmpdir dir
+    (let* ((monk-resource-index (make-hash-table :test #'equal))
+           (monk-log-level nil)
+           (policy-file (concat dir "p.el"))
+           (monk-batch-policy 'monk-test--embark-policy))
+      (with-temp-file policy-file
+        (insert ";; -*- lexical-binding: t; -*-\n"
+                (format "(defun monk-test--embark-policy (_m)\n  (monk-directory %S)\n  (monk-directory %S :require '(%S))\n  (monk-directory %S))\n"
+                        (concat dir "a") (concat dir "b") (concat dir "a") (concat dir "c"))))
+      (load policy-file nil t)
+      (unwind-protect
+          (progn
+            ;; find: opens the policy file at the literal
+            (save-window-excursion
+              (monk-embark-find-resource (concat dir "b"))
+              (should (equal policy-file buffer-file-name))
+              (should (looking-at-p (format ".*%S" (concat dir "b"))))
+              (kill-buffer))
+            ;; plan only b and its dependents: a is not selected (b requires a, not the reverse)
+            (let ((reported nil) (tb (monk-test-machine)))
+              (cl-letf (((symbol-function 'monk-run-report) (lambda (run &rest _) (setq reported run) run))
+                        ((symbol-function 'monk-embark--machines-for) (lambda (_name) (list tb))))
+                (monk-embark-plan-resource (concat dir "b"))
+                (should (monk-run-dry-run reported))
+                (should (eq monk-status-would-repair (monk-result-status (monk-run-result reported (cons "testbox" (concat dir "b"))))))
+                (should (eq monk-status-skipped (monk-result-status (monk-run-result reported (cons "testbox" (concat dir "c"))))))
+                (should-not (file-directory-p (concat dir "b")))
+                (monk-embark-apply-resource (concat dir "b"))
+                (should-not (monk-run-dry-run reported))
+                (should (file-directory-p (concat dir "b")))
+                (should-not (file-directory-p (concat dir "c")))))
+            ;; dependents buffer
+            (cl-letf (((symbol-function 'pop-to-buffer) #'set-buffer))
+              (monk-embark-resource-dependents (concat dir "a"))
+              (with-current-buffer "*monk-dependents*"
+                (should (string-match-p (regexp-quote (concat dir "b")) (buffer-string)))
+                (should (string-match-p "require" (buffer-string)))
+                (kill-buffer)))
+            ;; setup registers with Embark when it is there
+            (progn
+              (defvar embark-target-finders nil) (defvar embark-keymap-alist nil)
+              (defvar embark-general-map (make-sparse-keymap))
+              (setq embark-target-finders nil embark-keymap-alist nil)
+              (provide 'embark)
+              (unwind-protect
+                  (progn
+                    (setq embark-target-finders '(some-other-finder))
+                    (should (monk-embark-setup))
+                    (should (eq 'monk-embark-resource-target (car embark-target-finders)))
+                    (should (equal '(monk-embark-resource-target monk-embark-machine-target some-other-finder)
+                                   embark-target-finders))
+                    (should (eq 'monk-embark-resource-map (alist-get 'monk-resource embark-keymap-alist)))
+                    (should (eq #'monk-embark-find-resource (lookup-key monk-embark-resource-map (kbd "."))))
+                    (monk-embark-setup)
+                    (should (= 3 (length embark-target-finders))))
+                (setq features (delq 'embark features)))))
+        (fmakunbound 'monk-test--embark-policy)))))
+
 (provide 'monk-test)
 ;;; monk-test.el ends here
