@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.4.7
+;; Version: 0.5.4
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -82,12 +82,12 @@
 
 ;;;; Version
 
-(defconst monk-version "0.4.7"
+(defconst monk-version "0.5.4"
   "Monk's version.  Patch for small work, minor for a large ask.
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-10-01.8"
+(defconst monk-build "2026-10-06.1"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -95,7 +95,7 @@ apart.  Bumped with every change that reaches a hand-over.")
 (defconst monk-libraries
   '(monk monk-cell monk-file monk-system monk-package monk-sync monk-inventory
     monk-event monk-history monk-ui monk-watch monk-agent monk-cli monk-bridge
-    monk-translate monk-embark monk-etcd monk-reload monk-testdrive monk-tutorial)
+    monk-translate monk-embark monk-detach monk-etcd monk-reload monk-testdrive monk-tutorial)
   "Every Monk library, for `monk-version'.")
 
 (defvar monk--load-times nil
@@ -3030,6 +3030,8 @@ the report shows them elsewhere."
           (:retarget (push (format "%s → %s" (car value) (cadr value)) parts))
           (:replace (push (format "replace %s with link → %s" (car value) (cadr value)) parts))
           (:remove (push (format "remove %s" value) parts))
+          (:rebuild (push (format "rebuild %s" (mapconcat (lambda (c) (format "%s: %s" (car c) (cdr c))) value ", "))
+                          parts))
           (:install (push (format "install %d: %s" (length value)
                                   (truncate-string-to-width (string-join value " ") 60 nil nil "…"))
                           parts))

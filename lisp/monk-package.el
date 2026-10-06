@@ -50,22 +50,56 @@
              :documentation "Formula names.")
    (cask :initarg :cask
          :initform nil
-         :documentation "Treat the names as casks."))
+         :documentation "Treat the names as casks.")
+   (rebuild :initarg :rebuild
+            :initform nil
+            :documentation "When to build an installed formula again: nil never, t always,
+or a function of the machine and the formula name that returns nil or
+a reason string.  For formulae built from a moving branch, where
+brew's version never changes but the source does."))
   "A set of Homebrew formulae or casks that must be installed.")
+
+(defun monk--brew-rebuild-reason (r m name)
+  "Return why R must rebuild installed NAME on M, or nil."
+  (let ((rebuild (oref r rebuild)))
+    (cond ((null rebuild) nil)
+          ((eq rebuild t) "rebuild requested")
+          ((functionp rebuild) (funcall rebuild m name))
+          (t (format "%s" rebuild)))))
 
 (cl-defmethod monk-resource-available-p ((_r monk-brew-resource) (m monk-machine))
   (monk-program-available-p m monk-brew-program))
 
+(defun monk--brew-failure-summary (exec)
+  "Return the telling lines of a failed brew EXEC.
+The Error:, Warning:, fatal:, ssh: and curl: lines, else the last
+line.  Brew prints a lot; the reason is in those.  Capped at four."
+  (let* ((lines (split-string (monk-exec-output exec) "\n" t))
+         (telling (seq-filter (lambda (l) (string-match-p "\\`\\(Error\\|Warning\\|fatal\\|error\\|ssh\\|curl\\):" (string-trim l)))
+                              lines))
+         (picked (or telling (last lines))))
+    (format "exit %d: %s" (monk-exec-exit-code exec)
+            (mapconcat #'string-trim (seq-take picked 4) " | "))))
+
 (cl-defmethod monk-resource-class-init ((_r monk-brew-resource) (m monk-machine))
-  "Update Homebrew on M once per run, so no install call does it noisily."
-  (if (monk-exec-ok-p (monk-exec m monk-brew-program "update" "--quiet"))
-      "brew update"
-    (monk-log 'warn "%s: brew update failed; installs go on with stale taps" (oref m name))
-    nil))
+  "Update Homebrew on M once per run, so no install call does it noisily.
+A failed update is logged with brew's own error lines, and installs
+go on against the taps as they are."
+  (let ((exec (monk-exec m monk-brew-program "update" "--quiet")))
+    (if (monk-exec-ok-p exec)
+        "brew update"
+      (monk-log 'warn "%s: brew update failed (%s); installs go on with stale taps"
+                (oref m name) (monk--brew-failure-summary exec))
+      nil)))
 
 (cl-defmethod monk-resource-aggregate ((r monk-brew-resource) others (_m monk-machine))
-  "Merge R and OTHERS, brew resources of one kind (formula or cask), into one."
-  (when (cl-every (lambda (o) (eq (null (oref o cask)) (null (oref r cask)))) others)
+  "Merge R and OTHERS, brew resources of one kind (formula or cask), into one.
+A resource with a rebuild rule stays on its own: its install is a
+build, not a download, and must not hold up the batch."
+  (when (and (null (oref r rebuild))
+             (cl-every (lambda (o) (and (null (oref o rebuild))
+                                        (eq (null (oref o cask)) (null (oref r cask)))))
+                       others))
     (monk-brew-resource
      :name (format "%s (+%d)" (oref r name) (length others))
      :packages (delete-dups (apply #'append (oref r packages)
@@ -124,10 +158,18 @@ fall back to `brew list', which knows no aliases."
                          ;; A tapped name such as user/tap/formula is
                          ;; installed under its short name.
                          (member (file-name-nondirectory name) installed)))
-                   (oref r packages))))
-    (when missing
-      (list :install missing
-            :degree (monk-set-degree (length (oref r packages)) (length missing))))))
+                   (oref r packages)))
+         (rebuild (and (oref r rebuild)
+                       (delq nil (mapcar (lambda (name)
+                                           (unless (member name missing)
+                                             (let ((why (monk--brew-rebuild-reason r m name)))
+                                               (and why (cons name why)))))
+                                         (oref r packages))))))
+    (when (or missing rebuild)
+      (append (and missing (list :install missing))
+              (and rebuild (list :rebuild rebuild))
+              (list :degree (monk-set-degree (length (oref r packages))
+                                             (+ (length missing) (length rebuild))))))))
 
 (defconst monk-brew-untrusted-tap-regexp
   "untrusted tap \\([^ .\n]+\\)"
@@ -145,33 +187,172 @@ this returns nil, and the caller proceeds as before."
                 (string-trim (monk-exec-output exec)))
       nil)))
 
+(defun monk--brew-install-call (m arguments)
+  "Run brew with ARGUMENTS on M, trusting a refused tap once.
+Return the tap trusted, or nil.  Homebrew refuses formulae from a tap
+nobody ran `brew trust' on.  Trust it and retry; a second refusal
+propagates."
+  (condition-case err
+      (progn (apply #'monk-exec-string m monk-brew-program arguments) nil)
+    (monk-exec-error
+     (let ((output (format "%s" (car (last err)))))
+       (unless (and (string-match monk-brew-untrusted-tap-regexp output)
+                    (monk--brew-trust m (match-string 1 output)))
+         (signal (car err) (cdr err)))
+       (apply #'monk-exec-string m monk-brew-program arguments)
+       (match-string 1 output)))))
+
+(defun monk--brew-rebuild-call (m name)
+  "Build installed formula NAME on M again.
+`brew reinstall' keeps the old keg aside and restores it when the
+build fails.  When reinstall itself refuses, as it does for a keg
+brew no longer recognizes, `brew install --overwrite' is the way
+through; that is what the old Makefile spelled by hand."
+  (condition-case err
+      (monk-exec-string m monk-brew-program "reinstall" name)
+    (monk-exec-error
+     (monk-log 'warn "%s: brew reinstall %s failed (%s); trying install --overwrite"
+               (oref m name) name (car (last err)))
+     (monk-exec-string m monk-brew-program "install" "--overwrite" name))))
+
 (cl-defmethod monk-repair ((r monk-brew-resource) (m monk-machine) changes)
   (let ((process-environment (cons "HOMEBREW_NO_AUTO_UPDATE=1" process-environment))
-        (arguments (append (list "install")
-                           (and (oref r cask) '("--cask"))
-                           (plist-get changes :install)))
+        (install (plist-get changes :install))
+        (rebuild (plist-get changes :rebuild))
         (trusted nil))
-    (condition-case err
-        (apply #'monk-exec-string m monk-brew-program arguments)
-      (monk-exec-error
-       ;; Homebrew refuses formulae from a tap nobody ran `brew trust'
-       ;; on.  Trust it once and retry; a second refusal propagates.
-       (let ((output (format "%s" (car (last err)))))
-         (unless (and (string-match monk-brew-untrusted-tap-regexp output)
-                      (monk--brew-trust m (match-string 1 output)))
-           (signal (car err) (cdr err)))
-         (setq trusted (match-string 1 output))
-         (apply #'monk-exec-string m monk-brew-program arguments))))
+    (when install
+      (setq trusted (monk--brew-install-call m (append (list "install")
+                                                       (and (oref r cask) '("--cask"))
+                                                       install))))
+    (dolist (cell rebuild)
+      (monk--brew-rebuild-call m (car cell)))
     (monk-run-context-clear (list 'brew-installed (oref m name)))
-    (format "installed %s%s" (string-join (plist-get changes :install) " ")
-            (if trusted (format " (after brew trust %s)" trusted) ""))))
+    (string-join
+     (delq nil (list (and install (format "installed %s%s" (string-join install " ")
+                                          (if trusted (format " (after brew trust %s)" trusted) "")))
+                     (and rebuild (format "rebuilt %s" (mapconcat (lambda (c) (format "%s (%s)" (car c) (cdr c)))
+                                                                   rebuild ", ")))))
+     "; ")))
 
 (monk-define-resource monk-brew monk-brew-resource
   "Ensure Homebrew PACKAGES are installed, in one call.
 Independent brew resources on a machine aggregate into one install."
   ((name :type string :doc "Identifies the set.")
    (packages :type list :doc "Formula or cask names; aliases and taps count."))
-  ((cask :type boolean :doc "Treat the names as casks."))
+  ((cask :type boolean :doc "Treat the names as casks.")
+   (rebuild :type any :doc "nil, t, or a function of (MACHINE NAME) returning nil or a reason: build an installed formula again."))
+  :classes (darwin))
+
+;;;; brew: versioned formulae and the running binary
+
+(defun monk-brew-versioned-formulae (m stem &optional tap)
+  "Return the versions of formula STEM that brew on M offers, newest first.
+STEM is the name before `@', for example `emacs-plus'; TAP narrows
+the search to one tap.  Each element is an integer, or a string for
+a dotted version such as python's 3.12.  `brew search' is one call;
+the result is cached for the run.  Nil when brew is absent or knows
+no such formula."
+  (monk-with-run-cache (list 'brew-versions (oref m name) stem tap)
+    (let ((exec (monk-exec m monk-brew-program "search" "--formula"
+                           (format "%s%s@" (if tap (concat tap "/") "") stem))))
+      (when (monk-exec-ok-p exec)
+        (let (versions)
+          (dolist (line (split-string (monk-exec-output exec) "\n" t))
+            (when (string-match (format "\\`\\(?:[^ /]+/[^ /]+/\\)?%s@\\([0-9][0-9.]*\\)\\'"
+                                        (regexp-quote stem))
+                                (string-trim line))
+              (let ((v (match-string 1 line)))
+                (cl-pushnew (if (string-match-p "\\." v) v (string-to-number v)) versions :test #'equal))))
+          (sort versions (lambda (a b) (version< (format "%s" b) (format "%s" a)))))))))
+
+(defun monk-brew-latest-formula (m stem &optional tap at-least)
+  "Return the newest `STEM@N' brew on M offers, or nil.
+With AT-LEAST, a version, return nil when the newest is older.  See
+`monk-brew-versioned-formulae'."
+  (let ((newest (car (monk-brew-versioned-formulae m stem tap))))
+    (and newest
+         (or (null at-least) (not (version< (format "%s" newest) (format "%s" at-least))))
+         (format "%s@%s" stem newest))))
+
+(defun monk-brew-opt-prefix (m formula)
+  "Return brew's stable `opt' directory for FORMULA on M, or nil.
+`$(brew --prefix FORMULA)' points at the installed keg through the
+opt link, so a path built on it survives upgrades."
+  (let ((exec (monk-exec m monk-brew-program "--prefix" formula)))
+    (and (monk-exec-ok-p exec)
+         (let ((dir (string-trim (monk-exec-output exec))))
+           (and (not (string-empty-p dir)) (file-name-as-directory dir))))))
+
+(defun monk-brew-outdated-p (m formula)
+  "Return non-nil when FORMULA on M is installed and brew calls it outdated."
+  (let ((exec (monk-exec m monk-brew-program "outdated" "--quiet" formula)))
+    (and (monk-exec-ok-p exec)
+         (member formula (split-string (monk-exec-output exec) "\n" t)))))
+
+;;;; app-link: a formula's .app in /Applications
+
+(defclass monk-app-link-resource (monk-resource)
+  ((source :initarg :source :type string
+           :documentation "The .app bundle to link, a path or FORMULA:App.app.")
+   (applications :initarg :applications :initform "/Applications"
+                 :documentation "Where the link goes."))
+  "A symbolic link in /Applications to an application bundle a formula ships.
+Homebrew formulae do not install apps into /Applications.  A link
+through the formula's `opt' path follows upgrades; a copy would not.
+The resource name is the link, for example `/Applications/Emacs.app'.")
+
+(defun monk-app-link--source (r m)
+  "Return the resolved source bundle path of R on M.
+`FORMULA:Name.app' becomes `$(brew --prefix FORMULA)/Name.app'; a
+path is expanded on M.  Signal `monk-resource-error' when brew does
+not know the formula."
+  (let ((source (oref r source)))
+    (if (string-match "\\`\\([^/:]+\\):\\(.+\\)\\'" source)
+        (let* ((formula (match-string 1 source))
+               (app (match-string 2 source))
+               (prefix (monk-brew-opt-prefix m formula)))
+          (unless prefix
+            (signal 'monk-resource-error (list (format "brew does not know %s; install it first" formula))))
+          (concat prefix app))
+      (monk-expand source))))
+
+(cl-defmethod monk-resource-available-p ((_r monk-app-link-resource) (m monk-machine))
+  (monk-program-available-p m monk-brew-program))
+
+(cl-defmethod monk-check ((r monk-app-link-resource) (m monk-machine))
+  (let* ((link (monk-machine-path m (oref r name) (oref r sudo)))
+         (target (monk-app-link--source r m))
+         (current (file-symlink-p link)))
+    (cond
+     ((not (file-directory-p (monk-machine-path m target (oref r sudo))))
+      (signal 'monk-resource-error (list (format "%s does not exist; the formula may not have built it" target))))
+     ((equal current target) nil)
+     (current (list :retarget (list current target)))
+     ((file-exists-p link)
+      ;; a real bundle in the way, a copy from before: replace it, it
+      ;; is what the link would show anyway
+      (list :replace (list 'directory target)))
+     (t (list :create target)))))
+
+(cl-defmethod monk-repair ((r monk-app-link-resource) (m monk-machine) changes)
+  (let ((link (monk-machine-path m (oref r name) (oref r sudo)))
+        (target (monk-app-link--source r m)))
+    (cond
+     ((plist-get changes :replace) (delete-directory link t))
+     ((plist-get changes :retarget) (delete-file link)))
+    (make-symbolic-link target link t)
+    (format "%s -> %s" (oref r name) target)))
+
+(cl-defmethod monk-resource-paths ((r monk-app-link-resource))
+  (list (oref r name)))
+
+(monk-define-resource monk-app-link monk-app-link-resource
+  "Ensure the .app at SOURCE is linked into /Applications as NAME.
+SOURCE is `FORMULA:Name.app', resolved through `brew --prefix', or a
+path.  NAME is the link, usually /Applications/Name.app."
+  ((name :type path :doc "The link, for example /Applications/Emacs.app.")
+   (source :type string :doc "FORMULA:Name.app or a path to the bundle."))
+  ()
   :classes (darwin))
 
 ;;;; brew-tap

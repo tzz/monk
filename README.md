@@ -193,7 +193,7 @@ Package and macOS resources in `monk-package.el`:
 
 | Constructor | Purpose |
 |---|---|
-| `(monk-brew NAME PACKAGES &key cask)` | Missing Homebrew formulae installed in one call. When brew refuses a formula from an untrusted tap, Monk runs `brew trust TAP` once and retries. Class `darwin`. |
+| `(monk-brew NAME PACKAGES &key cask rebuild)` | Missing Homebrew formulae installed in one call. When brew refuses a formula from an untrusted tap, Monk runs `brew trust TAP` once and retries. `:rebuild` is nil, t, or a function of the machine and the formula name that returns nil or a reason: an installed formula with a reason is built again with `brew reinstall`, falling back to `brew install --overwrite` when reinstall refuses; for formulae built from a moving branch, where brew's version never changes but the source does. A rebuild resource does not aggregate with others. Class `darwin`. |
 | `(monk-brew-tap NAME)` | Homebrew tap present and trusted, where brew has `trust`. Class `darwin`. |
 | `(monk-apt NAME PACKAGES)` | Missing Debian packages installed in one call. Class `debian`. |
 | `(monk-osx-default DOMAIN KEY VALUE &key type)` | macOS user default. Types `string`, `int`, `float`, `bool`, `array`. Class `darwin`. |
@@ -271,6 +271,12 @@ Nothing the model returns runs. An import lands in `*monk-import*` as Lisp, is r
 `monk-embark.el` gives Embark two target types. A `monk-resource` is a resource name: the string at point in a policy file, the active region, or a path-like token at point in a comment or any other buffer (a path, or any name a compile has seen), or the result line at point in the report, detail, check, and query buffers. A `monk-machine` is a `*monk*` row, a machine heading, or an inventory host name in a Lisp buffer. `embark-act` on a resource offers `.` jump to the definition, `p` plan only it and its dependents, `a` apply the same, `h` its history, `w` what requires or watches it (a `*monk-dependents*` buffer where `.` jumps again), `r` rename it across the policy tree with `project-query-replace-regexp`. On a machine: `.` the inventory entry, `p` plan, `i` the inspector, `/` a guard query over it.
 
 Names resolve through `monk-resource-index`, filled as a side effect of every compile with each resource's origin, type, machines, requisite refs, and tags. When a name is unknown and `monk-batch-policy` is set, the local policy is compiled once with no connection to fill it, so the first action in a fresh Emacs works. `monk-resource-origin-by-name`, `monk-resource-names`, and `monk-resource-dependents-by-name` are the API. Call `(monk-embark-setup)` in your embark configuration; it also runs when Embark loads after Monk.
+
+## Detached jobs
+
+Some policies take too long for the session that asks, or replace its binary: a Homebrew rebuild of Emacs itself. A running process keeps its mapped binary when the file is replaced, so the session survives; it must not block on the build. `monk-detach.el` writes a one-shot shell script under the Monk state directory that optionally waits for the asking Emacs to exit, runs a batch Emacs with the same load path and policy file, logs to `detach-NAME.log`, and sends a desktop notification at the end (`osascript` or `notify-send`). `(monk-detach NAME POLICY-FILE FUNCTION t)` writes and starts it; the function on the batch side calls `monk-detach-run`, which converges with terminal progress and exits with the run's code. `monk-detach-running-emacsen` lists the other Emacs processes on the host from `list-system-processes`, so a caller can say which instances, the agent included, keep running the old build until restarted. The script stays on disk, so the same job can be run from a shell.
+
+`monk-app-link` links a formula's `.app` into `/Applications` through `brew --prefix FORMULA`, so the link follows upgrades; a stale link or a copy in the way is replaced, and a missing bundle is an error, not a dangling link. `monk-brew-versioned-formulae` and `monk-brew-latest-formula` read `brew search` for `STEM@N` versions, so a policy can follow the newest `emacs-plus@N` with a floor. `monk-brew-outdated-p` and `monk-brew-opt-prefix` are the other two brew questions a policy like that asks.
 
 ## Salt import and matchers
 
@@ -374,7 +380,7 @@ Facts are cached when `monk-history` is loaded. A gather stores them in the hist
 
 ## Version
 
-`M-x monk-version` prints `Monk 0.4.7 build 2026-10-01.8 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
+`M-x monk-version` prints `Monk 0.5.4 build 2026-10-06.1 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
 
 ## Test drive, tour, tutorial
 

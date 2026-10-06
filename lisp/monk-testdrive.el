@@ -68,6 +68,7 @@
 (require 'monk-cli)
 (require 'monk-translate)
 (require 'monk-embark)
+(require 'monk-detach)
 
 ;; The drive checks history when monk-history is loaded; it needs an
 ;; Emacs with SQLite, so it is not required here.
@@ -1287,6 +1288,81 @@ so `~' in the policy lands there."
                  (cons (not (eq monk-status-skipped (monk-result-status (monk-run-result reported '("drive" . "ix-reload"))))) "watcher skipped"))))))
       (fmakunbound 'monk-testdrive--embark-policy))))
 
+(defun monk-testdrive--section-detach ()
+  "A policy that must outlive this Emacs: the detached job, end to end."
+  (monk-testdrive--out "\n## Detached jobs")
+  (require 'monk-detach)
+  (let ((m (monk-testdrive--machine)))
+    (monk-testdrive--step "detach" "the app link follows brew's opt path and replaces a stale copy"
+      (let* ((opt (monk-testdrive--path "opt/thing@3/"))
+             (apps (monk-testdrive--path "Applications/")))
+        (make-directory (concat opt "Thing.app/Contents") t)
+        (make-directory (concat apps "Thing.app/Contents") t)
+        ;; brew is faked: the opt path answers from here, and the
+        ;; availability check, which asks for the program, says yes
+        (cl-letf (((symbol-function 'monk-brew-opt-prefix) (lambda (_m f) (and (equal f "thing@3") opt)))
+                  ((symbol-function 'monk-program-available-p) (lambda (_m _p) nil)))
+          (let ((run (monk-converge m (lambda (_m)
+                                        (monk-app-link (concat apps "Thing.app") "thing@3:Thing.app" :classes nil))
+                                   :passes 1)))
+            (monk-testdrive--checks
+             (cons (eq monk-status-repaired (monk-result-status (car (monk-run-results run)))) "not repaired")
+             (cons (equal (concat opt "Thing.app") (file-symlink-p (concat apps "Thing.app"))) "not a link to the keg")
+             (cons (eq monk-status-kept (monk-result-status
+                                         (car (monk-run-results
+                                               (monk-converge m (lambda (_m) (monk-app-link (concat apps "Thing.app") "thing@3:Thing.app" :classes nil)) :passes 1)))))
+                   "not kept on the second run"))))))
+    (monk-testdrive--step "detach" "a detached job waits for the asking process, runs the policy, logs, exits by the run"
+      (if (not (executable-find "sh"))
+          (cons 'SKIP "no sh")
+        ;; The "Emacs" the job waits for is a sleep; the batch Emacs is
+        ;; this binary with a policy file written here.
+        (let* ((default-directory temporary-file-directory)
+               (policy-file (monk-testdrive--path "detached-policy.el"))
+               (marker (monk-testdrive--path "detached-made"))
+               (sleeper (start-process "drive-sleeper" nil "sleep" "60"))
+               (monk-detach-emacs (expand-file-name invocation-name invocation-directory))
+               (monk-detach-wait-seconds 20))
+          (with-temp-file policy-file
+            (insert ";; -*- lexical-binding: t; -*-\n"
+                    "(require 'monk-file)\n(require 'monk-detach)\n"
+                    (format "(defun drive-detached-policy (_m) (monk-directory %S))\n" marker)
+                    "(defun drive-detached-main () (monk-detach-run (monk-local-machine :name \"detached\") #'drive-detached-policy \"drive-job\"))\n"))
+          (unwind-protect
+              (let* ((script (monk-detach-write "drive-job" policy-file 'drive-detached-main (process-id sleeper)))
+                     (t0 (float-time)))
+                (monk-detach-start script)
+                ;; `setsid' returns at once; the job lives in its own
+                ;; session, so the proof that it waits is the marker
+                ;; not appearing while the sleeper lives
+                (accept-process-output nil 1.0)
+                (let ((still-waiting (not (file-directory-p marker))))
+                  (delete-process sleeper)
+                  (let ((deadline (+ (float-time) 30)))
+                    (while (and (not (file-exists-p (monk-detach-log-path "drive-job")))
+                                (< (float-time) deadline))
+                      (accept-process-output nil 0.2))
+                    (while (and (< (float-time) deadline)
+                                (not (with-temp-buffer
+                                       (ignore-errors (insert-file-contents (monk-detach-log-path "drive-job")))
+                                       (string-match-p "end rc=" (buffer-string)))))
+                      (accept-process-output nil 0.2)))
+                  (let ((log (with-temp-buffer (ignore-errors (insert-file-contents (monk-detach-log-path "drive-job"))) (buffer-string))))
+                    (monk-testdrive--checks
+                     (cons still-waiting "the job did not wait for the sleeper")
+                     (cons (file-directory-p marker) (format "policy did not run; log:\n%s" log))
+                     (cons (string-match-p "end rc=0" log) (format "log has no clean end:\n%s" log))
+                     (cons (string-match-p "drive-job .* build " log) "log lacks the version line")
+                     (cons (string-match-p "repaired" log) "log lacks the summary")
+                     (cons (< (- (float-time) t0) 30) "took too long")))))
+            (ignore-errors (delete-process sleeper))))))
+    (monk-testdrive--step "detach" "other Emacs processes are listed, this one is not"
+      (let ((found (monk-detach-running-emacsen)))
+        ;; whatever else runs on this host, the drive's own Emacs is excluded
+        (monk-testdrive--checks
+         (cons (not (assq (emacs-pid) found)) "this Emacs listed")
+         (cons (listp found) "not a list"))))))
+
 (defun monk-testdrive--section-facts ()
   "Fact cache, facts.d, structured diffs, generic package and service."
   (monk-testdrive--out "\n## Facts and diffs")
@@ -1372,6 +1448,7 @@ so `~' in the policy lands there."
     ("Fleet controls" monk-testdrive--section-fleet)
     ("Translate" monk-testdrive--section-translate)
     ("Index and Embark" monk-testdrive--section-embark)
+    ("Detached jobs" monk-testdrive--section-detach)
     ("Watch" monk-testdrive--section-watch)
     ("Agent and events" monk-testdrive--section-agent))
   "The drive's sections: (TITLE FUNCTION).")
