@@ -54,6 +54,7 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
+(require 'parse-time)
 (require 'monk)
 (require 'monk-event)
 

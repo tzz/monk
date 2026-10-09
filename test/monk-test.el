@@ -5299,5 +5299,29 @@ the run is not ok, and the exit code says 4."
           (should (string-match-p "reload FAILED" (monk-agent--reload-if-stale)))
           (should (string-match-p "STALE CODE: monk-ui" (substring-no-properties (monk-agent--stale-note)))))))))
 
+(ert-deftest monk-test-libraries-load-alone-in-batch ()
+  "Each library loads in a bare Emacs with only its own requires.
+The agent found `parse-iso8601-time-string' undefined (2026-10-09):
+the test Emacs had parse-time from somewhere else.  So each library
+is loaded in a fresh subprocess and asked for one function."
+  (skip-unless (executable-find (expand-file-name invocation-name invocation-directory)))
+  (dolist (case '(("monk-history" . "(monk-history-load-facts (monk-local-machine :name \"x\"))")
+                  ("monk-event" . "(monk-run-id-time \"r20261009T142254.000\")")
+                  ("monk-agent" . "monk-agent-main")
+                  ("monk-sync" . "monk-rsync")
+                  ("monk-detach" . "monk-detach")
+                  ("monk-embark" . "monk-embark-setup")
+                  ("monk-translate" . "monk-translate-catalog")
+                  ("monk-cli" . "monk-cli-enable")))
+    (with-temp-buffer
+      (let ((code (call-process (expand-file-name invocation-name invocation-directory) nil t nil
+                                "-Q" "--batch" "-L" (file-name-directory (locate-library "monk"))
+                                "-l" (car case)
+                                "--eval" (format "(let ((monk-log-level nil) (process-environment (cons \"MONK_HOME=%s\" process-environment))) (condition-case e (progn %s (princ \"ok\")) (void-function (princ (format \"VOID %%S\" e))) (error (princ \"ok-other\"))))"
+                                                 (make-temp-file "monk-alone" t)
+                                                 (if (string-prefix-p "(" (cdr case)) (cdr case) (format "(fboundp '%s)" (cdr case)))))))
+        (should (= 0 code))
+        (should-not (string-match-p "VOID" (buffer-string)))))))
+
 (provide 'monk-test)
 ;;; monk-test.el ends here

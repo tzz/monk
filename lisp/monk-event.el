@@ -35,6 +35,7 @@
 
 (require 'monk)
 (require 'json)
+(require 'parse-time)
 
 (defconst monk-event-version 2
   "Value of the rgi field.  Bump when a field changes meaning.")
