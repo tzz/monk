@@ -57,6 +57,8 @@
 (declare-function monk-stale-libraries "monk")
 (defvar monk-version)
 (defvar monk-build)
+(defvar monk-report-function)
+(defvar monk-progress-functions)
 (require 'seq)
 
 ;; The reloader must load without the rest of Monk, so it names what it
@@ -71,6 +73,9 @@
 (declare-function monk-watch-start "monk-watch")
 (declare-function monk-watch-machines "monk-watch")
 (declare-function monk-watch-policy "monk-watch")
+(declare-function monk-watch-events "monk-watch")
+(declare-function monk-watch-runs "monk-watch")
+(declare-function monk-watch-started "monk-watch")
 (declare-function monk-watch-options "monk-watch")
 (declare-function monk-ui--spinner-stop "monk-ui")
 (declare-function monk-ui-refresh "monk-ui")
@@ -139,15 +144,27 @@ Bodies from earlier loads would run again with stale closures."
       (prog1 (list :machines (monk-watch-machines w)
                    :policy (monk-watch-policy w)
                    :options (monk-watch-options w)
-                   :mode monk-watch-mode)
+                   :mode monk-watch-mode
+                   ;; the counters and the start time carry over: a
+                   ;; reload is not a new watch to the person reading
+                   ;; the status line
+                   :events (monk-watch-events w)
+                   :runs (monk-watch-runs w)
+                   :started (monk-watch-started w))
         (monk-watch-stop)))))
 
 (defun monk-reload--restore-watch (snapshot)
   "Start a watch again from SNAPSHOT, a plist from `monk-reload--snapshot-watch'."
   (when (and snapshot (fboundp 'monk-watch-start))
     (setq monk-watch-mode (plist-get snapshot :mode))
-    (apply #'monk-watch-start (plist-get snapshot :machines) (plist-get snapshot :policy)
-           (plist-get snapshot :options))))
+    (let ((w (apply #'monk-watch-start (plist-get snapshot :machines) (plist-get snapshot :policy)
+                    (plist-get snapshot :options))))
+      (when (and w (plist-get snapshot :started))
+        ;; struct setters by name: this file loads before monk-watch and
+        ;; must not depend on its accessors at compile time
+        (funcall (intern "monk-watch--carry-over") w (plist-get snapshot :events)
+                 (plist-get snapshot :runs) (plist-get snapshot :started)))
+      w)))
 
 (defun monk-reload--refresh-buffers ()
   "Install the rebuilt keymaps in live monk buffers.  Return the count."
@@ -207,6 +224,11 @@ With VERBOSE, list each file as it loads."
         (failed nil)
         (start (float-time))
         (before (and (boundp 'monk-build) (format "%s %s" monk-version monk-build)))
+        ;; what the caller had wired: a batch agent's report function and
+        ;; its terminal progress; both must come back as they were
+        (report-function (and (boundp 'monk-report-function) monk-report-function))
+        (cli-on (and (fboundp 'monk-cli--progress)
+                     (memq 'monk-cli--progress (bound-and-true-p monk-progress-functions))))
         (watch (monk-reload--snapshot-watch))
         (stored (monk-reload--stored-runs-p)))
     (when (and (boundp 'monk-ui--spinner-timer) monk-ui--spinner-timer)
@@ -226,6 +248,10 @@ With VERBOSE, list each file as it loads."
              (push (cons feature (error-message-string err)) failed))))))
     (when (boundp 'monk-watch--delivery)
       (setq monk-watch--delivery nil))
+    (when report-function
+      (setq monk-report-function report-function))
+    (when (and cli-on (fboundp 'monk-cli-enable))
+      (funcall 'monk-cli-enable))
     (let ((buffers (monk-reload--refresh-buffers))
           (caches (monk-reload--clear-caches)))
       (condition-case err

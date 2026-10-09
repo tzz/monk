@@ -1895,7 +1895,11 @@ watch, not from a command."
                  (monk-run-count run monk-status-would-repair)))))))
 
 (add-hook 'monk-progress-functions #'monk-ui--progress)
-(setq monk-report-function #'monk-ui-report)
+;; Take over the report only from the text default.  A batch agent
+;; binds its own report function; a reload that re-runs this file
+;; must not swap it out from under it (2026-10-09).
+(when (eq monk-report-function #'monk-run-report-text)
+  (setq monk-report-function #'monk-ui-report))
 
 (monk-note-load 'monk-ui)
 (provide 'monk-ui)

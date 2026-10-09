@@ -662,6 +662,13 @@ machines get filesystem notifications; remote ones are polled every
   (monk-watch--log "mode %s" monk-watch-mode)
   (message "Monk watch: %s" monk-watch-mode))
 
+(defun monk-watch--carry-over (watch events runs started)
+  "Give WATCH the EVENTS and RUNS counts and the STARTED time of an earlier watch.
+A reload stops and starts the watch; the status line must not forget."
+  (setf (monk-watch-events watch) events
+        (monk-watch-runs watch) runs
+        (monk-watch-started watch) started))
+
 (defun monk-watch-status ()
   "Return a one-line description of the active watch, or nil."
   (when monk-watch--current

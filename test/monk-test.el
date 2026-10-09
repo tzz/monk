@@ -5323,5 +5323,36 @@ is loaded in a fresh subprocess and asked for one function."
         (should (= 0 code))
         (should-not (string-match-p "VOID" (buffer-string)))))))
 
+(ert-deftest monk-test-reload-keeps-agent-wiring ()
+  "A reload keeps a batch caller's report function, its terminal progress, and the watch counters."
+  (require 'monk-reload) (require 'monk-cli)
+  (monk-test-with-watch dir
+      (lambda (_m) (monk-file (concat dir "f") :content "y"))
+    (let ((w monk-watch--current))
+      (setf (monk-watch-runs w) 7 (monk-watch-events w) 11)
+      (setf (monk-watch-started w) (time-subtract (current-time) 3600))
+      (let ((monk-report-function #'ignore)
+            (monk-log-level nil))
+        (add-hook 'monk-progress-functions #'monk-cli--progress)
+        (unwind-protect
+            (progn
+              (monk-reload)
+              (should (eq monk-report-function #'ignore))
+              (should (memq #'monk-cli--progress monk-progress-functions))
+              (should (not (eq w monk-watch--current)))
+              (should (= 7 (monk-watch-runs monk-watch--current)))
+              (should (= 11 (monk-watch-events monk-watch--current)))
+              (should (> (float-time (time-since (monk-watch-started monk-watch--current))) 3000)))
+          (remove-hook 'monk-progress-functions #'monk-cli--progress))))))
+
+(ert-deftest monk-test-ui-load-does-not-steal-report-function ()
+  "Loading monk-ui again leaves a non-default report function alone."
+  (let ((monk-report-function #'ignore))
+    (load (locate-library "monk-ui") nil t)
+    (should (eq monk-report-function #'ignore)))
+  (let ((monk-report-function #'monk-run-report-text))
+    (load (locate-library "monk-ui") nil t)
+    (should (eq monk-report-function #'monk-ui-report))))
+
 (provide 'monk-test)
 ;;; monk-test.el ends here
