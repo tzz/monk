@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.5.4
+;; Version: 0.5.5
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -82,12 +82,12 @@
 
 ;;;; Version
 
-(defconst monk-version "0.5.4"
+(defconst monk-version "0.5.5"
   "Monk's version.  Patch for small work, minor for a large ask.
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-10-06.1"
+(defconst monk-build "2026-10-09.1"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -1229,6 +1229,18 @@ Ansible's no_log.")
   :abstract t
   :documentation "Base class.  Subclasses implement `monk-check' and `monk-repair'.")
 
+(defvar monk--check-evidence nil
+  "What the check in progress saw, kept with its result even when nothing changed.
+A `monk-check' method sets it with `monk-check-note'.  `monk--run-node-once'
+moves it into the result's changes under :evidence, so a `kept' that
+was wrong can be read back from the history instead of guessed at.")
+
+(defun monk-check-note (&rest plist)
+  "Record PLIST, keyword-value pairs, as evidence for the check in progress.
+Later calls add keys.  Keep values small: they go into every history row."
+  (while plist
+    (setq monk--check-evidence (plist-put monk--check-evidence (pop plist) (pop plist)))))
+
 (cl-defgeneric monk-check (resource machine)
   "Inspect MACHINE.  Return nil when RESOURCE is in the desired state.
 Otherwise return a plist of changes that `monk-repair' must make.
@@ -2361,20 +2373,32 @@ pass through."
                     (format " [retry up to %d]" attempts))))
     result))
 
+(defun monk--changes-without-evidence (changes)
+  "Return CHANGES without the :evidence pair.
+An all-evidence plist then reads as no change."
+  (let ((rest (copy-sequence changes)))
+    (cl-remf rest :evidence)
+    rest))
+
 (defun monk--run-node-once (resource machine result verdict detail dry-run)
   "One check-and-repair of RESOURCE on MACHINE into RESULT.
 VERDICT and DETAIL come from `monk--requisite-verdict'.  With DRY-RUN,
 report only.  After a repair, `monk-resource-verify' can still fail it."
   (condition-case err
-      (let* ((changes (monk-check resource machine))
+      (let* ((monk--check-evidence nil)
+             (changes (monk-check resource machine))
+             (evidence monk--check-evidence)
              (degree (or (plist-get changes :degree) 0.0)))
+        (when evidence
+          (setq changes (plist-put (copy-sequence changes) :evidence evidence)))
         (cond
-         ((and (null changes) (eq verdict 'watch))
+         ((and (null (monk--changes-without-evidence changes)) (eq verdict 'watch))
           (monk--perform-watch resource machine result detail dry-run))
-         ((null changes)
+         ((null (monk--changes-without-evidence changes))
           (setf (monk-result-status result) monk-status-kept
                 (monk-result-degree result) monk-degree-satisfied
-                (monk-result-comment result) nil))
+                (monk-result-comment result) nil
+                (monk-result-changes result) (and evidence (list :evidence evidence))))
          (dry-run
           (setf (monk-result-status result) monk-status-would-repair
                 (monk-result-degree result) degree
@@ -3018,7 +3042,7 @@ the report shows them elsewhere."
     (while rest
       (let ((key (pop rest)) (value (pop rest)))
         (pcase key
-          ((or :degree :diff) nil)
+          ((or :degree :diff :evidence) nil)
           (:create (push (if (stringp value) (format "create → %s" value) "create") parts))
           (:content (push "content differs" parts))
           (:mode (push (if (and (consp value) (integerp (car value)))

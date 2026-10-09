@@ -242,9 +242,57 @@ Changed and failed results were printed as they finished by
       (dolist (r (monk-run-results run))
         (when (or (monk-result-changed-p r) (monk-result-failed-p r))
           (monk-cli-print-result r)))))
-  (monk-cli-print-line (format "%s %s  %s" (monk-cli--color "1" "monk-agent")
+  (monk-cli-print-line (format "%s %s  %s%s" (monk-cli--color "1" "monk-agent")
                                (format-time-string "%T")
-                               (monk-cli-summary-line run))))
+                               (monk-cli-summary-line run)
+                               (monk-agent--stale-note))))
+
+(defun monk-agent--stale-note ()
+  "Return a note when this agent still runs code older than its source.
+After `monk-agent--reload-if-stale' that is only the case when the
+reload failed; the line then says so on every run until it works."
+  (let ((stale (monk-stale-libraries)))
+    (if (null stale)
+        ""
+      (monk-cli--color "33" (format "  STALE CODE: %s (reload failed; see the log)"
+                                    (mapconcat (lambda (c) (symbol-name (car c))) stale ", "))))))
+
+(defvar monk-agent--policy-file-mtime nil
+  "Modification time of `monk-agent-policy-file' when it was last loaded.")
+
+(declare-function monk-reload "monk-reload" (&optional verbose))
+
+(defun monk-agent--reload-if-stale ()
+  "Reload Monk and the policy file when their source changed since they loaded.
+The agent is a long-lived Emacs and must follow its own source: an
+edit to a library or to the policy applies at the next timed
+converge, with no restart.  `monk-reload' restarts the watch on the
+new code and clears the caches.  Return a short note for the run
+line, or nil when nothing was stale."
+  (let* ((stale (monk-stale-libraries))
+         (policy monk-agent-policy-file)
+         (policy-mtime (and policy (file-exists-p policy)
+                            (file-attribute-modification-time (file-attributes policy))))
+         (policy-stale (and policy-mtime
+                            (or (null monk-agent--policy-file-mtime)
+                                (time-less-p monk-agent--policy-file-mtime policy-mtime))))
+         (notes nil))
+    (when stale
+      (require 'monk-reload)
+      (condition-case err
+          (let ((inhibit-message t))
+            (monk-reload)
+            (push (format "reloaded %s" (mapconcat (lambda (c) (symbol-name (car c))) stale ", ")) notes))
+        (error (monk-log 'warn "agent: reload failed: %s" (error-message-string err))
+               (push "reload FAILED" notes))))
+    (when policy-stale
+      (condition-case err
+          (progn (load policy nil t)
+                 (setq monk-agent--policy-file-mtime policy-mtime)
+                 (push (format "reloaded policy %s" (file-name-nondirectory policy)) notes))
+        (error (monk-log 'warn "agent: policy reload failed: %s" (error-message-string err))
+               (push "policy reload FAILED" notes))))
+    (and notes (string-join (nreverse notes) ", "))))
 
 ;;;; Loop
 
@@ -300,7 +348,13 @@ repo did not move, skip the converge."
     (let ((delay (monk-agent-splay-seconds)))
       (when (> delay 0)
         (monk-log 'info "splay: %ds" delay)
-        (sleep-for delay))))
+        (sleep-for delay)))
+    ;; Follow the source: an edited library or policy is picked up
+    ;; here, in place.  The watch comes back on the new code.
+    (let ((note (monk-agent--reload-if-stale)))
+      (when note
+        (monk-cli-print-line (format "%s %s build %s: %s" (monk-cli--color "1" "monk-agent")
+                                     monk-version monk-build note)))))
   (let ((update (monk-agent-update-policy-repo)))
     (when (eq update 'changed)
       (monk-cli-print-line (format "policy repo moved to %s" (substring monk-agent--policy-revision 0 12)))
@@ -343,8 +397,17 @@ is already recorded."
         (monk-log-level monk-agent-log-level)
         (monk-watch-mode 'autopilot)
         (m (monk-agent-machine)))
+    ;; The policy file is what defined the policy, unless told otherwise;
+    ;; the agent reloads it when it changes.
+    (unless monk-agent-policy-file
+      (let ((file (monk-definition-file policy)))
+        (when file
+          (setq monk-agent-policy-file (concat (file-name-sans-extension file) ".el")))))
     (setq monk-agent--running t
-          monk-agent--machine m)
+          monk-agent--machine m
+          monk-agent--policy-file-mtime
+          (and monk-agent-policy-file (file-exists-p monk-agent-policy-file)
+               (file-attribute-modification-time (file-attributes monk-agent-policy-file))))
     (monk-cli-enable)
     ;; In batch, SIGINT (C-c) raises `quit' out of `accept-process-output',
     ;; and SIGTERM runs `kill-emacs-hook'.  Both must end the loop, not

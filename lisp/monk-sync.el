@@ -244,6 +244,14 @@ The real run itemizes too, so the repair comment can name the items."
                     (string-trim (monk-exec-output exec)))))
      (t
       (pcase-let ((`(,changed . ,total) (monk-rsync-parse-itemize (monk-exec-output exec))))
+        ;; What rsync said, kept with the result either way: a `kept'
+        ;; that turns out wrong (2026-10-09, .zshrc) can then be read
+        ;; back from the history instead of guessed at.
+        (monk-check-note :rsync (string-join (cdr (monk-exec-command exec)) " ")
+                         :exit (monk-exec-exit-code exec)
+                         :files total
+                         :itemized (length changed)
+                         :lines (length (split-string (monk-exec-output exec) "\n" t)))
         (when changed
           (list :sync changed
                 :degree (if (and total (> total 0))

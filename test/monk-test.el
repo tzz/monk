@@ -5238,5 +5238,66 @@ the run is not ok, and the exit code says 4."
         (should-not (monk-resource-aggregate reb (list plain) m))
         (should (monk-resource-aggregate plain (list (monk-brew-resource :name "c" :packages '("z"))) m))))))
 
+(ert-deftest monk-test-check-evidence-kept ()
+  "A check's notes ride along with a kept result, into the history and events."
+  (monk-test-with-tmpdir dir
+    (let ((monk-log-level nil))
+      (cl-letf (((symbol-function 'monk-rsync-parse-itemize) (lambda (_o) (cons nil 12)))
+                ((symbol-function 'monk--rsync-run)
+                 (lambda (_r _m _d) (monk-exec-create :command '("rsync" "--dry-run" "a" "b") :exit-code 0 :output "x\ny\n"))))
+        (let* ((run (monk-test-converge (lambda (_m) (monk-rsync "s" (list (concat dir "a")) (concat dir "b/")))
+                                        :passes 1))
+               (r (monk-test-result run "s"))
+               (evidence (plist-get (monk-result-changes r) :evidence)))
+          (should (eq 'kept (monk-result-status r)))
+          (should evidence)
+          (should (= 0 (plist-get evidence :exit)))
+          (should (= 12 (plist-get evidence :files)))
+          (should (= 0 (plist-get evidence :itemized)))
+          (should (= 2 (plist-get evidence :lines)))
+          (should (string-match-p "--dry-run" (plist-get evidence :rsync)))
+          ;; evidence alone is not a change
+          (should-not (monk-result-changed-p r))
+          (should (equal "" (monk-describe-changes (monk-result-changes r))))
+          ;; and it reaches the event record
+          (should (alist-get 'evidence (alist-get 'changes (monk-event-result r run)))))))))
+
+(ert-deftest monk-test-agent-reloads-stale-source-in-place ()
+  "A timed converge reloads edited libraries and the policy file; nothing restarts."
+  (require 'monk-agent)
+  (monk-test-with-tmpdir dir
+    (let* ((policy-file (concat dir "policy.el"))
+           (monk-agent-policy-file policy-file)
+           (monk-agent--policy-file-mtime nil)
+           (reloaded nil) (loaded nil)
+           (monk-log-level nil))
+      (with-temp-file policy-file (insert ";; -*- lexical-binding: t; -*-\n(defun monk-test--agent-pol (_m) nil)\n"))
+      (cl-letf (((symbol-function 'monk-stale-libraries) (lambda () '((monk-sync . 120))))
+                ((symbol-function 'monk-reload) (lambda (&rest _) (setq reloaded t)))
+                ((symbol-function 'load) (lambda (file &rest _) (push file loaded) t)))
+        ;; first timed converge: library stale, policy never loaded by the agent -> both
+        (let ((note (monk-agent--reload-if-stale)))
+          (should reloaded)
+          (should (equal (list policy-file) loaded))
+          (should (string-match-p "reloaded monk-sync, reloaded policy policy.el" note)))
+        ;; nothing changed since: no reload
+        (setq reloaded nil loaded nil)
+        (cl-letf (((symbol-function 'monk-stale-libraries) (lambda () nil)))
+          (should-not (monk-agent--reload-if-stale))
+          (should-not reloaded)
+          (should-not loaded)
+          ;; the policy file is edited: only it reloads
+          (sleep-for 0.05)
+          (set-file-times policy-file (time-add (current-time) 2))
+          (let ((note (monk-agent--reload-if-stale)))
+            (should (equal (list policy-file) loaded))
+            (should-not reloaded)
+            (should (equal "reloaded policy policy.el" note))))
+        ;; a failing reload is a note, not an error, and the line keeps saying so
+        (cl-letf (((symbol-function 'monk-stale-libraries) (lambda () '((monk-ui . 5))))
+                  ((symbol-function 'monk-reload) (lambda (&rest _) (error "boom"))))
+          (should (string-match-p "reload FAILED" (monk-agent--reload-if-stale)))
+          (should (string-match-p "STALE CODE: monk-ui" (substring-no-properties (monk-agent--stale-note)))))))))
+
 (provide 'monk-test)
 ;;; monk-test.el ends here

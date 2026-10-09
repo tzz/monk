@@ -314,6 +314,8 @@ Monk runs in three modes that share one engine and differ in who decides.
 | Supervised | the central Emacs, over TRAMP | a human, through the plan buffer and `a` | `*monk*` |
 | Autopilot | the central Emacs, over TRAMP, driven by `monk-watch` | nobody | `*monk*` and the watch log |
 
+The agent follows its own source. Before each timed full converge it compares every loaded Monk library and the policy file with their files on disk; an edit since they loaded is reloaded in place with `monk-reload` (the watch restarts on the new code) and the policy file is loaded again, and the run line says `reloaded monk-sync, reloaded policy monk-tzz-sync.el`. A reload that fails is logged and the summary line carries `STALE CODE: …` until it succeeds. Nothing restarts; this is Emacs.
+
 Two `ansible-pull` habits are options of the agent. `monk-agent-splay` (seconds, default 0) delays the first converge and each timed one by a random amount up to that, so a fleet does not hit a shared server at the same second. `monk-agent-policy-repo` names the git checkout the policy is loaded from; before each timed converge the agent fast-forwards it through VC and, when HEAD moved, reloads `monk-agent-policy-file`. With `monk-agent-only-if-changed` set, a timed converge runs only after the checkout moved; the converge on start and the drift watch always run. A failed fetch is logged and the converge uses the policy on disk.
 
 Supervised and autopilot are `monk-watch-mode`. Standalone is `monk-agent.el`. The agent converges the local policy on start, watches owned paths in autopilot, and converges in full every `monk-agent-full-interval` seconds (3600). It appends every event to `monk-agent-ledger-file` as JSON Lines and mirrors them to journald through `systemd-cat` when present. `(monk-agent-observe MACHINE)` on the central Monk runs `tail -F` on that ledger through TRAMP and dispatches each parsed event to `monk-agent-observe-functions`; there is no port and no daemon beyond SSH. The agent and a controller applying the same policy do not fight: both apply the same policy, and the settle window drops the events the other side produced.
@@ -358,6 +360,8 @@ Bars and the spinner are SVG on a graphical display with SVG support, and block 
 
 Progress events go through `monk-progress-functions`. Add your own function there to drive another display.
 
+A check can leave evidence with its result even when nothing changed: `(monk-check-note :key value ...)` inside `monk-check` puts the pairs under `:evidence` in the result's changes, where the history and the events keep them. The rsync check records the command, exit code, file count, itemized count, and output line count, so a `kept` that was wrong can be read back from the history instead of guessed at. Evidence alone is not a change.
+
 ## Writing a resource
 
 Subclass `monk-resource`. Implement `monk-check`, which inspects the machine and returns nil or a plist of changes, and `monk-repair`, which applies the plist and returns a comment. Optionally implement `monk-diff` for a unified diff and `monk-action` for notifications. `monk-check` must not change the machine. Add a constructor function that calls `monk-add-resource`.
@@ -380,7 +384,7 @@ Facts are cached when `monk-history` is loaded. A gather stores them in the hist
 
 ## Version
 
-`M-x monk-version` prints `Monk 0.5.4 build 2026-10-06.1 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
+`M-x monk-version` prints `Monk 0.5.5 build 2026-10-09.1 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
 
 ## Test drive, tour, tutorial
 
