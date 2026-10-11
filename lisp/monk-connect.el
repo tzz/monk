@@ -92,7 +92,10 @@ Reads the agent's pid file; a stale file means no agent."
 (defun monk-connect (&optional socket)
   "Connect this session to the running agent; its runs show in `*monk*'.
 SOCKET defaults to the agent of this user on this host, found through
-its pid file.  Signal `user-error' when no agent runs."
+its pid file.  `*monk*' opens on the agent's last run, or empty with
+the AGENT badge, and is selected: g plans on the agent, a applies, W
+flips its watch mode, w shows its log, D disconnects.  Signal
+`user-error' when no agent runs."
   (interactive)
   (when (monk-connect-active-p)
     (user-error "Already connected to the agent (%s); M-x monk-disconnect first"
@@ -242,12 +245,20 @@ A request waiting for this run gets it."
       (funcall callback value))))
 
 (defun monk-connect--show-last-run ()
-  "Put the agent's last run into `*monk*' from its history, when available."
-  (when (and (featurep 'monk-history) (not noninteractive))
-    (let ((row (car (monk-history-runs :host (alist-get 'host monk-connect--status) :limit 1))))
-      (when row
-        (let ((run (monk-history-run (alist-get 'id row))))
-          (when run (monk-ui-show run))))))
+  "Open `*monk*' on the agent: its last run from the history, else an empty report.
+The buffer is selected, so the agent keys work at once."
+  (unless noninteractive
+    (let* ((host (alist-get 'host monk-connect--status))
+           (run (and (featurep 'monk-history) host
+                     (let ((row (car (monk-history-runs :host host :limit 1))))
+                       (and row (monk-history-run (alist-get 'id row))))))
+           (buffer (monk-ui-show
+                    (or run
+                        (monk-run-create :machines (list (monk-machine :name (or host (system-name))))
+                                         :passes 0 :dry-run t)))))
+      (pop-to-buffer buffer)
+      (when (monk-ui-select-window-p (with-current-buffer buffer monk-ui--run))
+        (select-window (get-buffer-window buffer)))))
   (monk-connect--refresh-header))
 
 (defun monk-connect--refresh-header ()

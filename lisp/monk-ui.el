@@ -789,10 +789,13 @@ a plan gains a Plan column."
   (setq-local header-line-format '(:eval (monk-ui--header-line))))
 
 (defun monk-ui-help ()
-  "Show the keys of the report buffer."
+  "Show the keys of the report buffer; when connected, what they do on the agent."
   (interactive)
-  (message "%s" (substitute-command-keys
-                 "\\[monk-ui-show-machine] detail  \\[monk-ui-inspect-machine] facts  \\[monk-ui-find-definition] source  \\[monk-ui-query] query  \\[monk-ui-history] history  \\[monk-ui-apply] apply plan  \\[monk-ui-show-plan] show plan  \\[monk-ui-show-watch-log] watch log  \\[monk-ui-toggle-watch-mode] watch mode  \\[monk-ui-toggle-style] svg/text  \\[monk-ui-rerun] rerun (C-u: redraw only)  \\[monk-ui-import] import ansible/salt  \\[monk-ui-export] export  \\[monk-ui-quit] quit")))
+  (if (monk-ui--connected-p)
+      (message "%s" (substitute-command-keys
+                     "AGENT: \\[monk-ui-rerun] plan on the agent  \\[monk-ui-apply] apply on the agent  \\[monk-ui-toggle-watch-mode] its watch mode  \\[monk-ui-show-watch-log] its watch log  \\[monk-ui-disconnect] disconnect  |  \\[monk-ui-show-machine] detail  \\[monk-ui-inspect-machine] facts  \\[monk-ui-find-definition] source  \\[monk-ui-query] query  \\[monk-ui-history] history  \\[monk-ui-toggle-style] svg/text  \\[monk-ui-quit] quit"))
+    (message "%s" (substitute-command-keys
+                 "\\[monk-ui-show-machine] detail  \\[monk-ui-inspect-machine] facts  \\[monk-ui-find-definition] source  \\[monk-ui-query] query  \\[monk-ui-history] history  \\[monk-ui-apply] apply plan  \\[monk-ui-show-plan] show plan  \\[monk-ui-show-watch-log] watch log  \\[monk-ui-toggle-watch-mode] watch mode  \\[monk-ui-toggle-style] svg/text  \\[monk-ui-rerun] rerun (C-u: redraw only)  \\[monk-ui-import] import ansible/salt  \\[monk-ui-export] export  \\[monk-ui-quit] quit"))))
 
 (declare-function monk-watch-status "monk-watch")
 (declare-function monk-watch-toggle-mode "monk-watch")
@@ -1614,7 +1617,9 @@ Reads the run of the current buffer, so call it from `*monk*'."
   (interactive)
   (let ((plan (and monk-ui--run (monk-run-plan monk-ui--run))))
     (unless plan
-      (user-error "This run has no plan"))
+      (user-error (if (and monk-ui--run (monk-run-dry-run monk-ui--run))
+                      "This is a plan; p shows the plan an apply came from"
+                    "This run has no plan")))
     (let ((buffer (get-buffer-create (format monk-ui-detail-buffer-format "plan"))))
       (with-current-buffer buffer
         (monk-ui-mode)

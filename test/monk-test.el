@@ -5464,6 +5464,9 @@ is loaded in a fresh subprocess and asked for one function."
                     (accept-process-output nil 0.05)))
                 (should got)
                 (should (monk-run-dry-run got))
+                ;; one result per resource: no doubling through request + broadcast
+                (should (= 1 (length (monk-run-results got))))
+                (should (= 1 (seq-count (lambda (e) (equal (alist-get 'event e) "run-end")) monk-connect--run-events)))
                 (should (eq 'would-repair (monk-result-status (car (monk-run-results got)))))
                 (should (equal (concat dir "agent-made") (monk-result-name (car (monk-run-results got)))))
                 (should-not (file-directory-p (concat dir "agent-made")))
@@ -5539,6 +5542,74 @@ is loaded in a fresh subprocess and asked for one function."
               ;; a second pass changes nothing
               (should-not (monk-agent--reload-if-stale))))
         (monk-agent-stop-local)))))
+
+(ert-deftest monk-test-agent-source-watch-and-sigusr1 ()
+  "An edit under a source directory reloads and converges after the debounce; so does SIGUSR1."
+  (require 'monk-agent)
+  (monk-test-with-tmpdir dir
+    (let* ((converges nil)
+           (monk-agent-source-debounce 0.05)
+           (monk-agent-policy-file (concat dir "policy.el"))
+           (monk-agent--policy #'ignore)
+           (monk-agent--source-descriptors nil)
+           (monk-agent--source-timer nil)
+           (monk-agent--converging nil) (monk-agent--converge-again nil)
+           (monk-log-level nil))
+      (with-temp-file monk-agent-policy-file (insert ";; -*- lexical-binding: t; -*-\n"))
+      (cl-letf (((symbol-function 'monk-agent--full-converge-1)
+                 (lambda (_policy timed) (push timed converges)))
+                ((symbol-function 'monk-cli-print-line) #'ignore)
+                ((symbol-function 'locate-library) (lambda (&rest _) (concat dir "lisp/monk.el"))))
+        (make-directory (concat dir "lisp") t)
+        (should (equal (list (concat dir "lisp/") (concat dir ""))
+                       (monk-agent-source-directories)))
+        ;; events are injected: delivery itself is the kernel's business
+        (monk-agent--source-event (list 'd 'changed (concat dir "lisp/monk-sync.el")))
+        (monk-agent--source-event (list 'd 'changed (concat dir "lisp/monk-ui.el")))
+        (should monk-agent--source-timer)
+        (should-not converges)
+        (let ((deadline (+ (float-time) 2)))
+          (while (and (null converges) (< (float-time) deadline)) (sit-for 0.02)))
+        ;; two edits, one converge, timed
+        (should (equal '(t) converges))
+        ;; a non-.el file does nothing
+        (monk-agent--source-event (list 'd 'changed (concat dir "lisp/notes.txt")))
+        (should-not monk-agent--source-timer)
+        ;; SIGUSR1 handler
+        (monk-agent--on-sigusr1)
+        (should (equal '(t t) converges))
+        ;; a request during a converge runs once after it, not nested
+        (setq converges nil)
+        (cl-letf (((symbol-function 'monk-agent--full-converge-1)
+                   (lambda (_policy timed)
+                     (push timed converges)
+                     (when (= 1 (length converges))
+                       (monk-agent--full-converge #'ignore t)
+                       (should (= 1 (length converges)))))))
+          (monk-agent--full-converge #'ignore t)
+          (should (= 2 (length converges))))))))
+
+(ert-deftest monk-test-agent-poke-finds-process ()
+  "`monk-agent-poke' signals the pid file's agent, else a Monk agent process, else errors."
+  (require 'monk-agent)
+  (let ((sent nil))
+    (cl-letf (((symbol-function 'signal-process) (lambda (pid sig) (push (cons pid sig) sent) 0))
+              ((symbol-function 'monk-agent-read-pid-file) (lambda () '((pid . 4242)))))
+      (should (= 4242 (monk-agent-poke)))
+      (should (equal '((4242 . sigusr1)) sent)))
+    (setq sent nil)
+    (cl-letf (((symbol-function 'signal-process) (lambda (pid sig) (push (cons pid sig) sent) 0))
+              ((symbol-function 'monk-agent-read-pid-file) (lambda () nil))
+              ((symbol-function 'list-system-processes) (lambda () '(7 8 9)))
+              ((symbol-function 'process-attributes)
+               (lambda (p) (pcase p
+                             (8 '((args . "emacs --batch -l monk-tzz-sync -f monk-tzz-agent")))
+                             (_ '((args . "bash")))))))
+      (should (= 8 (monk-agent-poke)))
+      (should (equal '((8 . sigusr1)) sent)))
+    (cl-letf (((symbol-function 'monk-agent-read-pid-file) (lambda () nil))
+              ((symbol-function 'list-system-processes) (lambda () nil)))
+      (should-error (monk-agent-poke) :type 'user-error))))
 
 (provide 'monk-test)
 ;;; monk-test.el ends here

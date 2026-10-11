@@ -68,6 +68,7 @@
 (require 'monk-watch)
 (require 'monk-event)
 (require 'monk-cli)
+(defvar monk-reload-last-failures)
 (require 'timer)
 ;; Every agent run goes to the history database when this Emacs has
 ;; SQLite; the ledger is written in any case.
@@ -267,6 +268,110 @@ reload failed; the line then says so on every run until it works."
       (monk-cli--color "33" (format "  STALE CODE: %s (reload failed; see the log)"
                                     (mapconcat (lambda (c) (symbol-name (car c))) stale ", "))))))
 
+;;;; Following the source
+;;
+;; Two ways to make the agent pick up a change before the hourly
+;; converge.  (a) A source watch: filenotify on the Monk lisp directory
+;; and on the policy file's directory; an edit there, debounced,
+;; runs the same reload-and-converge as the timer.  (b) SIGUSR1: the
+;; same, on demand, from a shell (`kill -USR1 PID') or from a session
+;; (`monk-agent-poke').  Both are the timed path, so the run line says
+;; what was reloaded.
+
+(defcustom monk-agent-source-watch t
+  "When non-nil, the agent watches its own source and reloads on edits.
+The Monk Lisp directory and the policy file's directory are watched;
+a change there runs the timed converge after `monk-agent-source-debounce'."
+  :type 'boolean)
+
+(defcustom monk-agent-source-debounce 2.0
+  "Seconds of quiet after a source edit before the agent reloads.
+An editor saves several files in a burst; one reload covers them."
+  :type 'number)
+
+(defvar monk-agent--source-descriptors nil
+  "Filenotify descriptors of the source watch.")
+
+(defvar monk-agent--source-timer nil
+  "The debounce timer of the source watch, while pending.")
+
+(defvar monk-agent--policy nil
+  "The policy the agent runs.
+For a converge started by a signal or a source edit.")
+
+(defun monk-agent-source-directories ()
+  "Return the directories the source watch covers.
+Monk's Lisp directory and the policy file's directory."
+  (delete-dups
+   (delq nil (list (let ((f (locate-library "monk"))) (and f (file-name-directory f)))
+                   (and monk-agent-policy-file (file-name-directory monk-agent-policy-file))))))
+
+(defun monk-agent--source-event (event)
+  "Handle filenotify EVENT under a source directory.
+A changed .el file schedules a reload after the debounce."
+  (let ((file (nth 2 event)))
+    (when (and (stringp file) (string-suffix-p ".el" file)
+               (memq (nth 1 event) '(changed created renamed attribute-changed)))
+      (when monk-agent--source-timer (cancel-timer monk-agent--source-timer))
+      (setq monk-agent--source-timer
+            (run-at-time monk-agent-source-debounce nil #'monk-agent--source-fire file)))))
+
+(defun monk-agent--source-fire (file)
+  "The debounce ended after an edit to FILE: reload and converge.
+The same path as the hourly timer."
+  (setq monk-agent--source-timer nil)
+  (monk-log 'info "source edit: %s" (abbreviate-file-name file))
+  (monk-cli-print-line (format "%s source edit %s" (monk-cli--color "1" "monk-agent")
+                               (abbreviate-file-name file)))
+  (monk-agent--full-converge monk-agent--policy t))
+
+(defun monk-agent-source-watch-start ()
+  "Watch the source directories.
+Return the descriptors, nil when none could be watched."
+  (require 'filenotify)
+  (monk-agent-source-watch-stop)
+  (dolist (dir (monk-agent-source-directories))
+    (condition-case err
+        (push (file-notify-add-watch dir '(change attribute-change) #'monk-agent--source-event)
+              monk-agent--source-descriptors)
+      (file-notify-error (monk-log 'warn "source watch on %s: %s" dir (error-message-string err)))))
+  (when monk-agent--source-descriptors
+    (monk-log 'info "source watch on %s" (mapconcat #'abbreviate-file-name (monk-agent-source-directories) ", ")))
+  monk-agent--source-descriptors)
+
+(defun monk-agent-source-watch-stop ()
+  "Stop the source watch."
+  (dolist (desc monk-agent--source-descriptors)
+    (ignore-errors (file-notify-rm-watch desc)))
+  (setq monk-agent--source-descriptors nil)
+  (when monk-agent--source-timer
+    (cancel-timer monk-agent--source-timer)
+    (setq monk-agent--source-timer nil)))
+
+(defun monk-agent--on-sigusr1 ()
+  "SIGUSR1: reload what changed and converge now, as the timer would."
+  (interactive)
+  (monk-cli-print-line (format "%s SIGUSR1: converging now" (monk-cli--color "1" "monk-agent")))
+  (monk-agent--full-converge monk-agent--policy t))
+
+(defun monk-agent-poke (&optional pid)
+  "Make the agent of this user converge now, with a reload first.
+PID defaults to the one in the pid file; without a pid file, the
+Emacs processes running `monk-agent-main' on this host are tried.
+Works before the agent serves its socket, which is the point."
+  (interactive)
+  (let ((pid (or pid
+                 (alist-get 'pid (monk-agent-read-pid-file))
+                 (car (delq nil (mapcar (lambda (p)
+                                          (and (string-match-p "monk-agent-main\\|monk-tzz-agent\\|monk-tzz-sync-agent"
+                                                               (or (alist-get 'args (process-attributes p)) ""))
+                                               p))
+                                        (list-system-processes))))
+                 (user-error "No Monk agent process found for %s on this host" (user-login-name)))))
+    (signal-process pid 'sigusr1)
+    (message "Sent SIGUSR1 to the agent (pid %d); it reloads and converges now" pid)
+    pid))
+
 (defvar monk-agent--policy-file-mtime nil
   "Modification time of `monk-agent-policy-file' when it was last loaded.")
 
@@ -284,7 +389,8 @@ know it; this does.  Return the features loaded."
                  (locate-library (symbol-name feature)))
         (condition-case err
             (progn (require feature) (push feature loaded))
-          (error (monk-log 'warn "agent: loading %s failed: %s" feature (error-message-string err))))))
+          (error (monk-cli-print-line (format "%s loading %s failed: %s" (monk-cli--color "31" "monk-agent")
+                                              feature (error-message-string err)))))))
     (nreverse loaded)))
 
 (defun monk-agent--reload-if-stale ()
@@ -305,11 +411,30 @@ line, or nil when nothing was stale."
     (when stale
       (require 'monk-reload)
       (condition-case err
-          (let ((inhibit-message t))
-            (monk-reload)
-            (push (format "reloaded %s" (mapconcat (lambda (c) (symbol-name (car c))) stale ", ")) notes))
-        (error (monk-log 'warn "agent: reload failed: %s" (error-message-string err))
-               (push "reload FAILED" notes))))
+          (progn
+            ;; `monk-reload' messages its own summary; the agent prints
+            ;; its own line instead.  Errors must stay visible, so the
+            ;; message is caught, not inhibited (an `inhibit-message'
+            ;; here swallowed the reason for a failed reload, 2026-10-11).
+            (cl-letf* ((real (symbol-function 'message))
+                       ((symbol-function 'message)
+                        (lambda (fmt &rest args)
+                          (if (and fmt (string-prefix-p "monk: " fmt)) nil (apply real fmt args)))))
+              (monk-reload))
+            (if monk-reload-last-failures
+                (progn
+                  (monk-cli-print-line
+                   (format "%s reload: %s" (monk-cli--color "31" "monk-agent")
+                           (mapconcat (lambda (f) (format "%s: %s" (car f) (cdr f)))
+                                      monk-reload-last-failures "; ")))
+                  (push (format "reload FAILED for %s" (mapconcat (lambda (f) (symbol-name (car f)))
+                                                                  monk-reload-last-failures ", "))
+                        notes))
+              (push (format "reloaded %s" (mapconcat (lambda (c) (symbol-name (car c))) stale ", ")) notes)))
+        (error
+         (monk-cli-print-line (format "%s reload failed: %s" (monk-cli--color "31" "monk-agent")
+                                      (error-message-string err)))
+         (push "reload FAILED" notes))))
     (let ((new (monk-agent--load-new-libraries)))
       (when new
         (push (format "loaded new %s" (mapconcat #'symbol-name new ", ")) notes)))
@@ -323,7 +448,8 @@ line, or nil when nothing was stale."
           (progn (load policy nil t)
                  (setq monk-agent--policy-file-mtime policy-mtime)
                  (push (format "reloaded policy %s" (file-name-nondirectory policy)) notes))
-        (error (monk-log 'warn "agent: policy reload failed: %s" (error-message-string err))
+        (error (monk-cli-print-line (format "%s policy reload failed: %s" (monk-cli--color "31" "monk-agent")
+                                            (error-message-string err)))
                (push "policy reload FAILED" notes))))
     (and notes (string-join (nreverse notes) ", "))))
 
@@ -372,11 +498,29 @@ logged; the converge then runs with the policy already on disk."
               (if (equal before after) 'same 'changed)))
         (error (monk-log 'warn "policy repo update: %s" (error-message-string err)) nil)))))
 
+(defvar monk-agent--converging nil
+  "Non-nil while a full converge runs.
+A signal or edit meanwhile is queued, not nested.")
+
+(defvar monk-agent--converge-again nil
+  "Non-nil when a converge was asked for during one; it runs after.")
+
 (defun monk-agent--full-converge (policy &optional timed)
   "Converge the whole local POLICY and record it.
 With TIMED, this is a scheduled converge: wait a splay first, update
 the policy repo, and when `monk-agent-only-if-changed' is set and the
-repo did not move, skip the converge."
+repo did not move, skip the converge.  A second request while one
+runs is remembered and served right after."
+  (if monk-agent--converging
+      (setq monk-agent--converge-again t)
+    (let ((monk-agent--converging t))
+      (monk-agent--full-converge-1 policy timed))
+    (when monk-agent--converge-again
+      (setq monk-agent--converge-again nil)
+      (monk-agent--full-converge policy timed))))
+
+(defun monk-agent--full-converge-1 (policy &optional timed)
+  "The body of `monk-agent--full-converge'; POLICY and TIMED as there."
   (when timed
     (let ((delay (monk-agent-splay-seconds)))
       (when (> delay 0)
@@ -457,9 +601,12 @@ is already recorded."
       (when (> delay 0)
         (monk-cli-print-line (format "splay: first converge in %ds" delay))
         (sleep-for delay)))
+    (setq monk-agent--policy policy)
+    (define-key special-event-map [sigusr1] #'monk-agent--on-sigusr1)
     (monk-agent-serve-local)
     (monk-agent--full-converge policy)
     (monk-watch-start m policy)
+    (when monk-agent-source-watch (monk-agent-source-watch-start))
     (monk-cli-idle-start #'monk-agent--idle-text)
     (setq monk-agent--full-timer
           (run-at-time monk-agent-full-interval monk-agent-full-interval
@@ -487,6 +634,8 @@ is already recorded."
       (setq monk-agent--full-timer nil
             monk-agent--etcd-timer nil)
       (monk-watch-stop)
+      (monk-agent-source-watch-stop)
+      (define-key special-event-map [sigusr1] #'ignore)
       (monk-agent-stop-local)
       (monk-cli-idle-stop)
       (monk-cli-disable)
@@ -655,6 +804,8 @@ Host, owner, build, watch state, sudo state, last run."
       (next_full . ,(and monk-agent--full-timer
                          (monk-event--time (timer--time monk-agent--full-timer))))
       (sudo . ,(monk-agent--sudo-state))
+      (stale . ,(vconcat (mapcar (lambda (c) (symbol-name (car c))) (monk-stale-libraries))))
+      (load_path . ,(let ((f (locate-library "monk"))) (and f (file-name-directory f))))
       (ledger . ,(monk-agent-ledger-path))
       (last_run . ,(monk-agent--last-run-end)))))
 
@@ -839,21 +990,31 @@ an earlier agent is replaced."
          (monk-agent--respond `((op . "watch-log") (ok . t)
                                 (lines . ,(vconcat (last lines (or (alist-get 'n request) monk-agent-tail-default))))))))
       ((or "plan" "run")
+       ;; A subscriber already receives every event through the
+       ;; broadcast; streaming them again on the request would double
+       ;; each result (108 for a 55-resource policy, 2026-10-11).  Only
+       ;; a one-shot connection, the systemd endpoint or a script, gets
+       ;; the stream on the request itself.
        (let* ((policy (or monk-batch-policy
                           (signal 'monk-policy-error (list "monk-batch-policy is not set"))))
+              (subscribed (and monk-agent--respond-to
+                               (memq monk-agent--respond-to monk-agent--subscribers)))
               (monk-report-function #'monk-agent--report)
               (live nil)
               (monk-progress-functions
-               (cons (lambda (event data)
-                       (pcase event
-                         ('run-start (setq live (plist-get data :run)))
-                         ('node-end
-                          (monk-agent--respond
-                           (monk-event-result (plist-get data :result) live nil)))))
-                     monk-progress-functions))
+               (if subscribed
+                   monk-progress-functions
+                 (cons (lambda (event data)
+                         (pcase event
+                           ('run-start (setq live (plist-get data :run)))
+                           ('node-end
+                            (monk-agent--respond
+                             (monk-event-result (plist-get data :result) live nil)))))
+                       monk-progress-functions)))
               (run (monk-converge (monk-agent-machine) policy :dry-run (equal op "plan"))))
          (monk-run-report run)
-         (monk-agent--respond (monk-event-run 'run-end run))))
+         (unless subscribed
+           (monk-agent--respond (monk-event-run 'run-end run)))))
       (_
        (monk-agent--respond `((op . ,(or op "")) (ok . :false)
                               (error . ,(format "unknown op; expected one of %s"
