@@ -304,6 +304,18 @@ An agent answers `{"op":"history-runs", ...}` and `{"op":"history-results", ...}
 
 
 Between runs, the agent's last line is the same roll, slower (`monk-cli-idle-interval`, 0.25s), rewritten in place: `⠸ watching 12 dir(s)  3 run(s)  up 0d 02h 14m 07s  full in 00h 31m 12s`. It says the agent is alive without scrolling anything. A run takes the line over and gives it back; permanent lines go above it. Watch log lines on a UTF-8 terminal start with one frame of the roll instead of `M`, so consecutive lines roll too.
+## Scopes and owners
+
+A resource runs in one of three scopes, and the scope is derived, never declared per resource. `user`: as the invoking user, in their home; dotfiles, user crontab, brew. `sudo`: `:sudo t`, as the user escalated per resource through the TRAMP sudo hop; the identity is still the user, sudo logs and gates it, `~` is the user's home; system files, system packages and units. `root`: the process itself is uid 0, an agent under launchd or systemd with `MONK_HOME=/etc/monk`; nobody asked, so a policy must say it expects this with `(monk-policy-scope 'my-policy 'root)`. A run has an owner, `(LOGIN . ROOT-P)`. Mismatches are compile errors: a policy declared `root` cannot compile in a user process, and a resource without `:sudo` cannot compile in a root process unless its policy is declared `root` (it would act in root's home). Every result event and history row carries `scope`, every run its `owner`, and `monk-history-results :scope 'sudo` or `monk-history-runs :owner "tzz"` answer "what did sudo change this week".
+
+The scope rule has one practical edge: a user connects to their own agent only. The agent's socket is a file under the owner's Monk state directory, mode 0600; root's agent lives under `/etc/monk`.
+
+## Connecting to an agent
+
+The watch belongs with the files, in the one long-lived agent; a session that also watched would react to the same edits twice. So a session connects instead. The agent serves a Unix socket under its state directory (`agent.sock`, plus `agent.pid` with pid, socket, owner, and build) from inside its own loop, in the same Emacs as fswatch and the timers. `M-x monk-connect` finds it through the pid file, subscribes, and from then on the agent's runs show in `*monk*` as they happen: a live row while it runs, the finished run after, drift lines in the echo area. The header carries an `AGENT` badge whose tooltip is the agent's host, owner, build, watch mode and uptime, next full converge, and sudo state (`cached`, `password`, `root`, from `sudo -n true`). While connected the keys steer the agent: `g` asks it to plan, `a` to apply (after confirmation naming the sudo state), `W` flips its watch mode, `w` shows its watch log, `D` disconnects. `monk-watch-start` refuses in a connected session and says why. Sudo resources run in the agent as its user through the hop: with NOPASSWD they work, without it they fail, and whoever pressed `a` asked for that.
+
+The agent's other operations stay: `status`, `tail`, `history-runs`, `history-results`, plus `subscribe`, `watch-mode`, and `watch-log`, one JSON object per line in both directions, so a script can talk to the socket too. The systemd socket-activated endpoint for remote agents is unchanged.
+
 ## Execution modes
 
 Monk runs in three modes that share one engine and differ in who decides.
@@ -384,7 +396,7 @@ Facts are cached when `monk-history` is loaded. A gather stores them in the hist
 
 ## Version
 
-`M-x monk-version` prints `Monk 0.5.7 build 2026-10-09.3 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
+`M-x monk-version` prints `Monk 0.6.1 build 2026-10-11.2 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
 
 ## Test drive, tour, tutorial
 

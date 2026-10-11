@@ -69,6 +69,7 @@
 (require 'monk-translate)
 (require 'monk-embark)
 (require 'monk-detach)
+(require 'monk-connect)
 
 ;; The drive checks history when monk-history is loaded; it needs an
 ;; Emacs with SQLite, so it is not required here.
@@ -1363,6 +1364,75 @@ so `~' in the policy lands there."
          (cons (not (assq (emacs-pid) found)) "this Emacs listed")
          (cons (listp found) "not a list"))))))
 
+(defun monk-testdrive--section-connect ()
+  "Scopes on results, and a session connected to an agent's socket."
+  (monk-testdrive--out "\n## Scopes and agent connect")
+  (require 'monk-connect)
+  (let ((m (monk-testdrive--machine)))
+    (monk-testdrive--step "connect" "every result carries its scope and the run its owner"
+      (let* ((run (monk-converge m (lambda (_m)
+                                     (monk-directory "~/scope-user")
+                                     (monk-command "scope-sudo" "true" :creates "~/scope-user" :sudo t))
+                                :passes 1))
+             (u (monk-run-result run '("drive" . "~/scope-user")))
+             (su (monk-run-result run '("drive" . "scope-sudo"))))
+        (monk-testdrive--checks
+         (cons (eq (if (monk-root-p) 'root 'user) (monk-result-scope u)) (format "user scope %S" (monk-result-scope u)))
+         (cons (eq (if (monk-root-p) 'root 'sudo) (monk-result-scope su)) (format "sudo scope %S" (monk-result-scope su)))
+         (cons (equal (user-login-name) (car (monk-run-owner run))) "owner")
+         (cons (equal (if (monk-root-p) "root" "sudo") (alist-get 'scope (monk-event-result su run))) "scope in event"))))
+    (monk-testdrive--step "connect" "a root policy is refused in a user process, and the other way round"
+      (let ((monk-policy-scopes nil))
+        (defun monk-testdrive--rootish (_m) (monk-directory "~/rootish"))
+        (unwind-protect
+            (progn
+              (monk-policy-scope 'monk-testdrive--rootish 'root)
+              (monk-testdrive--checks
+               (cons (condition-case e (progn (monk-compile m 'monk-testdrive--rootish) nil)
+                       (monk-policy-error (string-match-p "expects to run as root" (cadr e))))
+                     "root policy compiled in a user process")
+               (cons (cl-letf (((symbol-function 'monk-root-p) (lambda () t)))
+                       (condition-case e (progn (monk-compile m (lambda (_m) (monk-directory "~/x"))) nil)
+                         (monk-policy-error (string-match-p "root's home" (cadr e)))))
+                     "user resource compiled in a root process")))
+          (fmakunbound 'monk-testdrive--rootish))))
+    (monk-testdrive--step "connect" "the agent serves a socket; a session subscribes, steers a plan, sees its events"
+      (if (not (featurep 'make-network-process))
+          (cons 'SKIP "no local sockets in this Emacs")
+        (let ((monk-batch-policy (lambda (_m) (monk-directory "~/agent-made")))
+              (monk-agent--server nil) (monk-agent--subscribers nil)
+              (monk-connect--process nil) (monk-connect--status nil)
+              (monk-connect--waiting nil) (monk-connect--run-events nil)
+              (monk-connect--live-run nil) (monk-connect--live-results nil)
+              (got nil))
+          (cl-letf (((symbol-function 'monk-agent-machine) (lambda () m))
+                    ((symbol-function 'monk-agent-record) #'ignore)
+                    ((symbol-function 'monk-agent--announce) #'ignore))
+            (unwind-protect
+                (progn
+                  (monk-agent-serve-local)
+                  (monk-connect)
+                  (let ((deadline (+ (float-time) 3)))
+                    (while (and (null monk-connect--status) (< (float-time) deadline))
+                      (accept-process-output nil 0.05)))
+                  (monk-connect-request "plan" nil (lambda (run) (setq got run)))
+                  (let ((deadline (+ (float-time) 5)))
+                    (while (and (null got) (< (float-time) deadline))
+                      (accept-process-output nil 0.05)))
+                  (monk-testdrive--checks
+                   (cons (and monk-connect--status (equal monk-build (alist-get 'build monk-connect--status)))
+                         (format "status %S" monk-connect--status))
+                   (cons (= #o600 (file-modes (monk-agent-local-socket-path))) "socket not 0600")
+                   (cons (and got (monk-run-dry-run got)) "no plan came back")
+                   (cons (and got (eq 'would-repair (monk-result-status (monk-run-result got '("drive" . "~/agent-made")))))
+                         (format "plan results %S" (and got (mapcar #'monk-result-status (monk-run-results got)))))
+                   (cons (not (file-directory-p (monk-testdrive--path "agent-made"))) "plan made changes")
+                   (cons (condition-case nil (progn (monk-watch-start m #'ignore) nil) (user-error t))
+                         "a local watch started while connected")
+                   (cons (string-match-p "AGENT" (substring-no-properties (monk-connect-status-line))) "status line")))
+              (ignore-errors (monk-disconnect))
+              (monk-agent-stop-local))))))))
+
 (defun monk-testdrive--section-facts ()
   "Fact cache, facts.d, structured diffs, generic package and service."
   (monk-testdrive--out "\n## Facts and diffs")
@@ -1449,6 +1519,7 @@ so `~' in the policy lands there."
     ("Translate" monk-testdrive--section-translate)
     ("Index and Embark" monk-testdrive--section-embark)
     ("Detached jobs" monk-testdrive--section-detach)
+    ("Scopes and agent connect" monk-testdrive--section-connect)
     ("Watch" monk-testdrive--section-watch)
     ("Agent and events" monk-testdrive--section-agent))
   "The drive's sections: (TITLE FUNCTION).")
@@ -1693,6 +1764,43 @@ so `~' in the policy lands there."
         (while (and (not (tabulated-list-get-id)) (not (eobp))) (forward-line 1))
         (monk-testdrive--ask "Point is on the drive row.  Press embark-act: does it say 'monk-machine' and offer . p i /?  Press i: does the inspector for drive open (q closes)?")))))
 
+(defun monk-testdrive--tour-connect ()
+  "The AGENT badge and a run arriving from the agent."
+  (monk-testdrive--step "tour" "connected to an agent: AGENT badge, then its plan arrives live in *monk*"
+    (if (not (featurep 'make-network-process))
+        (cons 'SKIP "no local sockets in this Emacs")
+      (let* ((m (monk-testdrive--machine))
+             (monk-batch-policy (lambda (_m) (monk-directory "~/tour-agent-made") (monk-file "~/tour-agent-made/f" :content "x\n")))
+             (monk-agent--server nil) (monk-agent--subscribers nil)
+             (monk-connect--process nil) (monk-connect--status nil)
+             (monk-connect--waiting nil) (monk-connect--run-events nil)
+             (monk-connect--live-run nil) (monk-connect--live-results nil))
+        (cl-letf (((symbol-function 'monk-agent-machine) (lambda () m))
+                  ((symbol-function 'monk-agent-record) #'ignore)
+                  ((symbol-function 'monk-agent--announce) #'ignore))
+          (unwind-protect
+              (progn
+                (monk-agent-serve-local)
+                (monk-connect)
+                (let ((deadline (+ (float-time) 3)))
+                  (while (and (null monk-connect--status) (< (float-time) deadline))
+                    (accept-process-output nil 0.05)))
+                (monk-ui-show (monk-run-create :machines (list m) :passes 0 :dry-run t))
+                (monk-testdrive--focus-monk)
+                (let ((first (monk-testdrive--ask "The header starts with a green AGENT box before PLAN?  Hover it: does the tooltip say the host, owner, build, watch state, sudo state, and the keys g a W w D?")))
+                  (if (not (eq first 'PASS))
+                      first
+                    (let ((done nil))
+                      (monk-connect-request "plan" nil (lambda (_r) (setq done t)))
+                      (let ((deadline (+ (float-time) 10)))
+                        (while (and (not done) (< (float-time) deadline))
+                          (accept-process-output nil 0.05)
+                          (redisplay))))
+                    (monk-testdrive--focus-monk)
+                    (monk-testdrive--ask "After g was sent to the agent: the drive row filled in from the agent's events, the header says PLAN with 2 would-repair, and the echo area said 'Agent plan ready; a applies it on the agent'?"))))
+            (ignore-errors (monk-disconnect))
+            (monk-agent-stop-local)))))))
+
 (defun monk-testdrive--tour-history ()
   "The history buffer."
   (monk-testdrive--step "tour" "h opens the history list; RET, c, r"
@@ -1713,6 +1821,7 @@ so `~' in the policy lands there."
     ("Fleet controls" monk-testdrive--tour-fleet)
     ("Translate" monk-testdrive--tour-translate)
     ("Embark" monk-testdrive--tour-embark)
+    ("Agent connect" monk-testdrive--tour-connect)
     ("Watch" monk-testdrive--tour-watch)
     ("Text fallback" monk-testdrive--tour-text))
   "The tour's stops: (TITLE FUNCTION).")

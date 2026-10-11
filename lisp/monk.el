@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.5.7
+;; Version: 0.6.1
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -82,12 +82,12 @@
 
 ;;;; Version
 
-(defconst monk-version "0.5.7"
+(defconst monk-version "0.6.1"
   "Monk's version.  Patch for small work, minor for a large ask.
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-10-09.3"
+(defconst monk-build "2026-10-11.2"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -95,7 +95,7 @@ apart.  Bumped with every change that reaches a hand-over.")
 (defconst monk-libraries
   '(monk monk-cell monk-file monk-system monk-package monk-sync monk-inventory
     monk-event monk-history monk-ui monk-watch monk-agent monk-cli monk-bridge
-    monk-translate monk-embark monk-detach monk-etcd monk-reload monk-testdrive monk-tutorial)
+    monk-translate monk-embark monk-detach monk-connect monk-etcd monk-reload monk-testdrive monk-tutorial)
   "Every Monk library, for `monk-version'.")
 
 (defvar monk--load-times nil
@@ -293,6 +293,61 @@ Each is called with two arguments: EVENT, one of `run-start',
 (define-error 'monk-command-unchanged "Monk command ran without change" 'monk-error)
 (define-error 'monk-cel-error "Monk CEL error" 'monk-guard-error)
 
+;;;; Scopes and owners
+;;
+;; Three scopes, and a resource runs in exactly one:
+;;
+;;   user  as the invoking user, in their home.  Dotfiles, user
+;;         crontab, brew.  No privilege.
+;;   sudo  as the user, escalated per resource through the sudo hop
+;;         (`:sudo t').  The identity is still the user: sudo logs it
+;;         and gates it, `~' is the user's home.  System files, system
+;;         packages and units.
+;;   root  the process itself is uid 0: an agent under launchd or
+;;         systemd.  No prompt is possible and nobody asked, so a
+;;         policy must say it expects this (`monk-policy-scope').
+;;
+;; The scope of a resource is derived, never declared: `:sudo t' makes
+;; it sudo, else user; a root process makes every resource root.  The
+;; owner of a run is the login name and whether the process is root.
+;; Mismatches are compile errors: a user resource in a root process
+;; writes into the wrong home, a root policy in a user process has
+;; nothing to be root with.  Scope and owner go into every event and
+;; history row, so "what did sudo change this week" is a query.
+
+(defconst monk-scope-user 'user)
+(defconst monk-scope-sudo 'sudo)
+(defconst monk-scope-root 'root)
+(defconst monk-scopes (list monk-scope-user monk-scope-sudo monk-scope-root))
+
+(defun monk-root-p ()
+  "Return non-nil when this Emacs runs as root."
+  (zerop (user-uid)))
+
+(defun monk-owner ()
+  "Return (LOGIN . ROOT-P) for the process: who runs policies here."
+  (cons (user-login-name) (monk-root-p)))
+
+(defun monk-owner-string (owner)
+  "Return OWNER, from `monk-owner', as text: `tzz' or `root (tzz)'."
+  (if (cdr owner)
+      (if (equal (car owner) "root") "root" (format "root (%s)" (car owner)))
+    (car owner)))
+
+(defvar monk-policy-scopes nil
+  "Alist of (POLICY-SYMBOL . SCOPE) declared with `monk-policy-scope'.")
+
+(defun monk-policy-scope (policy &optional scope)
+  "Declare that POLICY expects SCOPE; without SCOPE, return the declaration.
+POLICY is a symbol.  SCOPE is `root' for a policy that runs in a root
+process (an agent under launchd or systemd), else nil: the default,
+user and sudo resources in a user process."
+  (if scope
+      (progn (unless (memq scope monk-scopes)
+               (signal 'monk-policy-error (list "Unknown scope" scope)))
+             (setf (alist-get policy monk-policy-scopes) scope))
+    (alist-get policy monk-policy-scopes)))
+
 ;; monk-cell.el evaluates :when guards.  It declares the machine
 ;; accessors it needs instead of requiring monk, so the load order is
 ;; monk-cell first, then the rest of this file.
@@ -343,7 +398,8 @@ Each is called with two arguments: EVENT, one of `run-start',
   diff
   (duration 0.0)
   origin                ; (FILE . NAME): where the resource was defined
-  censored)             ; non-nil when :no-log removed changes, diff, and comment
+  censored              ; non-nil when :no-log removed changes, diff, and comment
+  scope)                ; `user', `sudo', or `root': see `monk-resource-scope'
 
 (cl-defstruct (monk-diff-entry (:constructor monk-diff-entry-create)
                                (:copier nil))
@@ -438,6 +494,7 @@ whose rendering is that string."
   (mock nil)            ; compile and order only; nothing is checked
   (rescued nil)         ; keys whose failure an :onfail handler with :handled t covered
   (unreachable nil)     ; alist of (MACHINE-NAME . REASON) for machines that did not answer
+  (owner (monk-owner))  ; who runs this: see `monk-owner'
   (batches nil)         ; lists of machine names when :serial split the run
   (stopped-at-batch nil) ; index of the batch whose failures stopped the rest
   (last-pass-repaired 0)
@@ -1356,6 +1413,32 @@ needs none; the next pass re-checks it.  The default returns nil.")
 (defconst monk-resource-class-suffix "-resource"
   "Suffix that resource class names carry.")
 
+(cl-defgeneric monk-resource-scope (resource)
+  "Return the scope RESOURCE runs in on this process.
+One of `user', `sudo', or `root'.")
+
+(defun monk-check-scope (resource policy)
+  "Signal `monk-policy-error' when RESOURCE and POLICY do not fit this process.
+In a user process a policy declared `root' cannot run.  In a root
+process a resource without `:sudo' acts in root's home, which is a
+mistake unless the policy declared `root'."
+  (let ((declared (and (symbolp policy) (monk-policy-scope policy))))
+    (cond
+     ((and (eq declared monk-scope-root) (not (monk-root-p)))
+      (signal 'monk-policy-error
+              (list (format "%s expects to run as root; this process is %s"
+                            policy (monk-owner-string (monk-owner))))))
+     ((and (monk-root-p) (not (eq declared monk-scope-root)) (not (oref resource sudo)))
+      (signal 'monk-policy-error
+              (list (format "%s: a user resource in a root process acts in root's home; declare (monk-policy-scope '%s 'root) if that is meant"
+                            (oref resource name) (or policy "the policy"))))))))
+
+(cl-defmethod monk-resource-scope ((r monk-resource))
+  "Return `sudo' when R escalates, `root' when the process is root, else `user'."
+  (cond ((monk-root-p) monk-scope-root)
+        ((oref r sudo) monk-scope-sudo)
+        (t monk-scope-user)))
+
 (cl-defmethod monk-resource-type ((r monk-resource))
   "Return the short type name of R: the class name without prefix and suffix."
   (string-remove-suffix monk-resource-class-suffix
@@ -1420,6 +1503,9 @@ It never runs; its check reports skipped with the reason.")
 
 (defvar monk--compile-machine nil
   "Machine for the current compile.")
+
+(defvar monk--compile-policy nil
+  "The policy function being compiled, for `monk-check-scope'.")
 
 (defvar monk--compile-file nil
   "File that defines the policy of the current compile, or nil.")
@@ -1534,6 +1620,7 @@ with no connection to fill it, then the index is asked again."
   (unless (oref resource origin)
     (oset resource origin (cons monk--compile-file (oref resource name))))
   (monk-index-resource resource monk--compile-machine)
+  (monk-check-scope resource monk--compile-policy)
   (unless (memq (oref resource order) '(nil first last))
     (signal 'monk-policy-error
             (list (format "Resource %S: :order must be first or last, not %S"
@@ -1554,6 +1641,7 @@ with no connection to fill it, then the index is asked again."
   "Run POLICY for M.  Return the list of resources in policy order."
   (let ((monk--compile-resources nil)
         (monk--compile-machine m)
+        (monk--compile-policy policy)
         (monk--compile-file (monk-definition-file policy)))
     (funcall policy m)
     (nreverse monk--compile-resources)))
@@ -2246,6 +2334,7 @@ execution model."
          (result (monk-result-create :machine (oref machine name)
                                      :name (oref resource name)
                                      :type (monk-resource-type resource)
+                                     :scope (monk-resource-scope resource)
                                      :origin (oref resource origin))))
     (monk-progress 'node-start :node node)
     (pcase-let ((`(,verdict . ,detail)
@@ -2543,7 +2632,8 @@ With DRY-RUN, report only."
            (all-changes nil)
            (aggregate-result (monk-result-create :machine (oref m name)
                                                  :name (oref aggregate name)
-                                                 :type (monk-resource-type aggregate))))
+                                                 :type (monk-resource-type aggregate)
+                                                 :scope (monk-resource-scope aggregate))))
       (cond
        ((seq-every-p #'identity skips) nil)
        (mock (setf (monk-result-status aggregate-result) monk-status-kept
@@ -2558,6 +2648,7 @@ With DRY-RUN, report only."
                 (mine (and all-changes (monk-resource-disaggregate aggregate r all-changes)))
                 (result (monk-result-create :machine (oref m name) :name (oref r name)
                                             :type (monk-resource-type r)
+                                            :scope (monk-resource-scope r)
                                             :origin (oref r origin)
                                             :duration (- (float-time) start))))
            (cond
@@ -2618,6 +2709,7 @@ are left as they are."
                                     (monk-result-create :machine (oref m name)
                                                         :name (oref r name)
                                                         :type (monk-resource-type r)
+                                                        :scope (monk-resource-scope r)
                                                         :origin (oref r origin)
                                                         :status monk-status-skipped
                                                         :comment monk-skip-fatal))))
@@ -2666,6 +2758,7 @@ what would fire.  Return the number that fired."
               (let ((result (monk-result-create :machine (oref machine name)
                                                 :name (oref resource name)
                                                 :type (monk-resource-type resource)
+                                                :scope (monk-resource-scope resource)
                                                 :origin (oref resource origin))))
                 (condition-case err
                     (monk--perform-watch resource machine result
@@ -2788,6 +2881,7 @@ The comparison is strictly greater, as in Ansible."
         (setf (monk-node-result node)
               (monk-result-create :machine (oref m name) :name (oref r name)
                                   :type (monk-resource-type r) :origin (oref r origin)
+                                  :scope (monk-resource-scope r)
                                   :status monk-status-skipped :comment monk-skip-batch))))))
 
 ;;;; Runs

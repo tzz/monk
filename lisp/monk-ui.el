@@ -716,6 +716,7 @@ made for this one.  The buffer stays, so the next report reuses it."
     (define-key map (kbd "p") #'monk-ui-show-plan)
     (define-key map (kbd "w") #'monk-ui-show-watch-log)
     (define-key map (kbd "W") #'monk-ui-toggle-watch-mode)
+    (define-key map (kbd "D") #'monk-ui-disconnect)
     (define-key map (kbd "i") #'monk-ui-inspect-machine)
     (define-key map (kbd "/") #'monk-ui-query)
     (define-key map (kbd "h") #'monk-ui-history)
@@ -811,20 +812,42 @@ a plan gains a Plan column."
        " ")
     ""))
 
+(declare-function monk-connect-active-p "monk-connect")
+(declare-function monk-connect-watch-log "monk-connect")
+(declare-function monk-connect-toggle-watch-mode "monk-connect")
+(declare-function monk-connect-plan "monk-connect")
+(declare-function monk-connect-run "monk-connect")
+(declare-function monk-disconnect "monk-connect")
+
+(defun monk-ui--connected-p ()
+  "Return non-nil when this session is connected to an agent."
+  (and (fboundp 'monk-connect-active-p) (monk-connect-active-p)))
+
 (defun monk-ui-show-watch-log ()
-  "Show the watch event log."
+  "Show the watch event log: the agent's when connected, else the local one."
   (interactive)
-  (unless (featurep 'monk-watch)
-    (user-error "Load monk-watch first"))
-  (pop-to-buffer (get-buffer-create monk-watch-log-buffer-name)))
+  (if (monk-ui--connected-p)
+      (monk-connect-watch-log)
+    (unless (featurep 'monk-watch)
+      (user-error "Load monk-watch first"))
+    (pop-to-buffer (get-buffer-create monk-watch-log-buffer-name))))
 
 (defun monk-ui-toggle-watch-mode ()
-  "Switch the watch between assisted and autopilot."
+  "Switch the watch between assisted and autopilot: the agent's when connected."
   (interactive)
-  (unless (featurep 'monk-watch)
-    (user-error "Load monk-watch first"))
-  (monk-watch-toggle-mode)
-  (force-mode-line-update t))
+  (if (monk-ui--connected-p)
+      (monk-connect-toggle-watch-mode)
+    (unless (featurep 'monk-watch)
+      (user-error "Load monk-watch first"))
+    (monk-watch-toggle-mode)
+    (force-mode-line-update t)))
+
+(defun monk-ui-disconnect ()
+  "Disconnect from the agent."
+  (interactive)
+  (if (monk-ui--connected-p)
+      (monk-disconnect)
+    (user-error "Not connected to an agent")))
 
 (defun monk-ui--machine-names ()
   "Return the machine names of the live or finished run."
@@ -940,6 +963,7 @@ because an earlier one failed past the threshold is marked."
            (header-face (if plan 'monk-ui-plan-header 'monk-ui-header)))
       (concat
        (propertize " " 'face header-face)
+       (if (fboundp 'monk-connect--ui-badge) (monk-connect--ui-badge) "")
        (monk-ui--watch-indicator)
        (if monk-ui--live-run
            (concat (monk-ui-spinner) " ")
@@ -1014,6 +1038,9 @@ only redraw the buffer from the stored run."
   (interactive "P")
   (cond
    (redraw-only (monk-ui-refresh))
+   ((monk-ui--connected-p)
+    ;; the policy lives in the agent; ask it
+    (monk-connect-plan))
    ((or (null monk-ui--run) (null (monk-run-policy monk-ui--run)))
     (user-error "No run to repeat here; redrawing")
     (monk-ui-refresh))
@@ -1595,11 +1622,14 @@ Reads the run of the current buffer, so call it from `*monk*'."
         (monk-ui-refresh))
       (pop-to-buffer buffer))))
 
-(defun monk-ui-apply ()
+(cl-defun monk-ui-apply ()
   "Apply the plan shown in this buffer after confirmation.
 The confirmation names the machines and the count of changes.  The
 apply report replaces the plan in this buffer and compares against it."
   (interactive)
+  (when (monk-ui--connected-p)
+    (monk-connect-run)
+    (cl-return-from monk-ui-apply nil))
   (let ((plan monk-ui--run))
     (unless (and plan (monk-run-dry-run plan))
       (user-error "This buffer does not show a plan"))

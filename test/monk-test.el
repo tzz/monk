@@ -5354,5 +5354,191 @@ is loaded in a fresh subprocess and asked for one function."
     (load (locate-library "monk-ui") nil t)
     (should (eq monk-report-function #'monk-ui-report))))
 
+;;;; Scopes and owners
+
+(ert-deftest monk-test-scopes-and-owner ()
+  "Scope is derived per resource; owner is on the run; both reach events and history."
+  (monk-test-with-tmpdir dir
+    (let ((monk-log-level nil))
+      (should (equal (user-login-name) (car (monk-owner))))
+      (should (equal (user-login-name) (monk-owner-string (cons (user-login-name) nil))))
+      (should (equal "root" (monk-owner-string '("root" . t))))
+      (should (equal "root (tzz)" (monk-owner-string '("tzz" . t))))
+      (let* ((run (monk-test-converge (lambda (_m)
+                                        (monk-directory (concat dir "u"))
+                                        (monk-command "s" "true" :creates (concat dir "u") :sudo t))
+                                      :passes 1))
+             (u (monk-test-result run (concat dir "u")))
+             (s (monk-test-result run "s")))
+        (skip-unless (not (monk-root-p)))
+        (should (eq 'user (monk-result-scope u)))
+        (should (eq 'sudo (monk-result-scope s)))
+        (should (equal (user-login-name) (car (monk-run-owner run))))
+        (let ((event (monk-event-result s run)))
+          (should (equal "sudo" (alist-get 'scope event)))
+          (should (equal (user-login-name) (alist-get 'owner event))))
+        (should (equal (user-login-name) (alist-get 'owner (monk-event-run 'run-end run))))
+        (monk-test-with-history
+          (monk-history-record run)
+          (let ((rows (monk-history-results :run (monk-run-id run) :scope 'sudo)))
+            (should (= 1 (length rows)))
+            (should (equal "s" (alist-get 'name (car rows)))))
+          (should (= 1 (length (monk-history-runs :owner (user-login-name)))))
+          (should-not (monk-history-runs :owner "nobody-else"))
+          (should (eq 'sudo (monk-result-scope
+                             (monk-history-result-to-result
+                              (car (monk-history-results :run (monk-run-id run) :scope 'sudo)))))))))))
+
+(ert-deftest monk-test-policy-scope-checks ()
+  "A root policy refuses a user process; a user resource refuses a root process."
+  (let ((monk-policy-scopes nil) (monk-log-level nil) (m (monk-test-machine)))
+    (defun monk-test--root-policy (_m) (monk-directory "/tmp/x"))
+    (defun monk-test--user-policy (_m) (monk-directory "~/x"))
+    (unwind-protect
+        (progn
+          (should-error (monk-policy-scope 'monk-test--root-policy 'galactic) :type 'monk-policy-error)
+          (monk-policy-scope 'monk-test--root-policy 'root)
+          (should (eq 'root (monk-policy-scope 'monk-test--root-policy)))
+          (should-not (monk-policy-scope 'monk-test--user-policy))
+          (if (monk-root-p)
+              (progn
+                (should-error (monk-compile m 'monk-test--user-policy) :type 'monk-policy-error)
+                (should (monk-compile m 'monk-test--root-policy)))
+            (should-error (monk-compile m 'monk-test--root-policy) :type 'monk-policy-error)
+            (should (monk-compile m 'monk-test--user-policy))
+            ;; pretend to be root: a plain resource is refused, a sudo one and a root policy pass
+            (cl-letf (((symbol-function 'monk-root-p) (lambda () t)))
+              (should-error (monk-compile m 'monk-test--user-policy) :type 'monk-policy-error)
+              (should (monk-compile m 'monk-test--root-policy))
+              (should (monk-compile m (lambda (_m) (monk-directory "/etc/x" :sudo t))))
+              (should (eq 'root (monk-resource-scope (car (monk-compile m 'monk-test--root-policy))))))))
+      (fmakunbound 'monk-test--root-policy)
+      (fmakunbound 'monk-test--user-policy))))
+
+;;;; Agent socket and connect
+
+(ert-deftest monk-test-agent-local-socket-and-connect ()
+  "An agent serves its socket; a client subscribes, steers a plan, gets the events."
+  (require 'monk-connect)
+  (skip-unless (featurep 'make-network-process))
+  (monk-test-with-tmpdir dir
+    (let* ((home (concat dir "home"))
+           (process-environment (cons (concat monk-home-environment-variable "=" home) process-environment))
+           (monk-log-level nil)
+           (monk-batch-policy (lambda (_m) (monk-directory (concat dir "agent-made"))))
+           (monk-agent--server nil) (monk-agent--subscribers nil)
+           (monk-connect--process nil) (monk-connect--status nil)
+           (monk-connect--waiting nil) (monk-connect--run-events nil)
+           (monk-connect--live-run nil) (monk-connect--live-results nil))
+      (cl-letf (((symbol-function 'monk-agent-machine) (lambda () (monk-test-machine)))
+                ((symbol-function 'monk-agent-record) #'ignore)
+                ((symbol-function 'monk-agent--announce) #'ignore)
+                ((symbol-function 'monk-agent--sudo-state) (lambda () "cached")))
+        (unwind-protect
+            (progn
+              (should (monk-agent-serve-local))
+              (should (file-exists-p (monk-agent-local-socket-path)))
+              (should (= #o600 (file-modes (monk-agent-local-socket-path))))
+              (let ((info (monk-agent-read-pid-file)))
+                (should (= (emacs-pid) (alist-get 'pid info)))
+                (should (equal (monk-agent-local-socket-path) (alist-get 'socket info))))
+              (should (equal (monk-agent-local-socket-path) (monk-connect-socket)))
+              ;; connect, within this process: the server and client share the loop
+              (monk-connect)
+              (let ((deadline (+ (float-time) 3)))
+                (while (and (null monk-connect--status) (< (float-time) deadline))
+                  (accept-process-output nil 0.05)))
+              (should monk-connect--status)
+              (should (equal "cached" (alist-get 'sudo monk-connect--status)))
+              (should (equal monk-build (alist-get 'build monk-connect--status)))
+              (should (= 1 (length monk-agent--subscribers)))
+              (should (monk-connect-active-p))
+              (should (string-match-p "AGENT" (substring-no-properties (monk-connect-status-line))))
+              ;; a local watch is refused while connected
+              (should-error (monk-watch-start (monk-test-machine) #'ignore) :type 'user-error)
+              ;; steer a plan; the reply is the run rebuilt from events
+              (let ((got nil))
+                (monk-connect-request "plan" nil (lambda (run) (setq got run)))
+                (let ((deadline (+ (float-time) 5)))
+                  (while (and (null got) (< (float-time) deadline))
+                    (accept-process-output nil 0.05)))
+                (should got)
+                (should (monk-run-dry-run got))
+                (should (eq 'would-repair (monk-result-status (car (monk-run-results got)))))
+                (should (equal (concat dir "agent-made") (monk-result-name (car (monk-run-results got)))))
+                (should-not (file-directory-p (concat dir "agent-made")))
+                (should-not monk-connect--waiting))
+              ;; status op answers
+              (let ((status nil))
+                (monk-connect-status (lambda (s) (setq status s)))
+                (should (equal (system-name) (alist-get 'host status))))
+              ;; disconnect drops the subscriber on the agent side
+              (monk-disconnect)
+              (accept-process-output nil 0.2)
+              (should-not (monk-connect-active-p))
+              (should-not monk-agent--subscribers))
+          (ignore-errors (monk-disconnect))
+          (monk-agent-stop-local)
+          (should-not (file-exists-p (monk-agent-local-socket-path)))
+          (should-not (file-exists-p (monk-agent-pid-file))))))))
+
+(ert-deftest monk-test-history-migrates-under-open-connection ()
+  "A schema version raised by a reload is applied to the connection already open."
+  (monk-test-with-history
+    (let ((db (monk-history-db)))
+      ;; pretend the connection was migrated by older code: drop a column's worth of knowledge
+      (setq monk-history--db-schema (1- monk-history-schema-version))
+      (sqlite-execute db "CREATE TABLE IF NOT EXISTS probe (x INTEGER)")
+      (let ((monk-history-schema (append monk-history-schema
+                                         '("CREATE TABLE IF NOT EXISTS probe2 (y INTEGER)"))))
+        ;; same version as before: nothing re-applied
+        (setq monk-history--db-schema monk-history-schema-version)
+        (monk-history-db)
+        (should-not (sqlite-select db "SELECT name FROM sqlite_master WHERE name = 'probe2'"))
+        ;; version moved on: the schema runs again on the open connection
+        (let ((monk-history-schema-version (1+ monk-history-schema-version)))
+          (monk-history-db)
+          (should (sqlite-select db "SELECT name FROM sqlite_master WHERE name = 'probe2'"))
+          (should (eql monk-history--db-schema monk-history-schema-version)))))
+    ;; the real migration adds owner and scope to an old database
+    (let ((db (monk-history-db)))
+      (sqlite-execute db "ALTER TABLE runs RENAME TO runs_old")
+      (sqlite-execute db "CREATE TABLE runs (id TEXT PRIMARY KEY, started TEXT NOT NULL, ended TEXT, dry_run INTEGER NOT NULL, hosts TEXT NOT NULL, policy TEXT, passes INTEGER, plan_id TEXT, ok INTEGER, kept INTEGER, repaired INTEGER, would_repair INTEGER, partial INTEGER, failed INTEGER, skipped INTEGER, unreachable INTEGER, flapping TEXT, reasons TEXT)")
+      (setq monk-history--db-schema nil)
+      (monk-history-db)
+      (should (member "owner" (mapcar #'cadr (sqlite-select db "PRAGMA table_info(runs)"))))
+      (should (member "scope" (mapcar #'cadr (sqlite-select db "PRAGMA table_info(results)")))))))
+
+(ert-deftest monk-test-agent-reload-loads-new-libraries-and-starts-socket ()
+  "A timed converge loads a library that did not exist at start, and serves the socket."
+  (require 'monk-agent)
+  (skip-unless (featurep 'make-network-process))
+  (monk-test-with-tmpdir dir
+    (let* ((process-environment (cons (concat monk-home-environment-variable "=" dir "home") process-environment))
+           (monk-agent-policy-file nil)
+           (monk-agent--server nil) (monk-agent--subscribers nil)
+           (monk-log-level nil)
+           (required nil)
+           (hidden t))
+      (unwind-protect
+          (cl-letf (((symbol-function 'monk-stale-libraries) (lambda () nil))
+                    ;; monk-connect looks absent until it is "loaded" once
+                    ((symbol-function 'featurep)
+                     (let ((real (symbol-function 'featurep)))
+                       (lambda (f &rest r) (and (not (and hidden (eq f 'monk-connect))) (apply real f r)))))
+                    ((symbol-function 'require)
+                     (let ((real (symbol-function 'require)))
+                       (lambda (f &rest r) (push f required) (when (eq f 'monk-connect) (setq hidden nil))
+                         (apply real f r)))))
+            (let ((note (monk-agent--reload-if-stale)))
+              (should (memq 'monk-connect required))
+              (should (string-match-p "loaded new monk-connect" note))
+              (should (string-match-p "socket started" note))
+              (should monk-agent--server)
+              (should (file-exists-p (monk-agent-local-socket-path)))
+              ;; a second pass changes nothing
+              (should-not (monk-agent--reload-if-stale))))
+        (monk-agent-stop-local)))))
+
 (provide 'monk-test)
 ;;; monk-test.el ends here

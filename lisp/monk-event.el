@@ -154,6 +154,8 @@ goes in the tag.  Nil SEQ looks the result up in the run."
     (duration_ms . ,(* 1000.0 (monk-result-duration result)))
       (dry_run . ,(if (monk-run-dry-run run) t :false))
       (censored . ,(if (monk-result-censored result) t :false))
+      (scope . ,(and (monk-result-scope result) (symbol-name (monk-result-scope result))))
+      (owner . ,(monk-owner-string (monk-run-owner run)))
       (native . ((tool . "monk")
                  (source . ,(car (monk-result-origin result))))))))
 
@@ -219,6 +221,7 @@ A plain string, from an older event, becomes one rendered entry."
   "Return the event alist for the start or end of RUN.  KIND is a symbol."
   `((rgi . ,monk-event-version)
     (event . ,(symbol-name kind))
+    (owner . ,(monk-owner-string (monk-run-owner run)))
     (tag . ,(monk-event-tag "run" (monk-run-id run) (if (eq kind 'run-start) "new" "end")))
     (ts . ,(monk-event--time))
     (run . ,(monk-run-id run))

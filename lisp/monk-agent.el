@@ -145,8 +145,15 @@ The first converge on start always runs.  See `monk-agent-policy-repo'."
 (defconst monk-agent-socket-name "monk-agent.socket")
 (defconst monk-agent-template-name "monk-agent@.service")
 
-(defconst monk-agent-ops '("status" "tail" "plan" "run" "history-runs" "history-results")
+(defconst monk-agent-ops '("status" "tail" "plan" "run" "history-runs" "history-results"
+                           "subscribe" "watch-mode" "watch-log")
   "Operations the query endpoint accepts.")
+
+(defconst monk-agent-local-socket-name "agent.sock"
+  "Socket file under the Monk state directory for a local, same-user agent.")
+
+(defconst monk-agent-pid-file-name "agent.pid"
+  "File under the Monk state directory with the agent's pid and socket path.")
 
 (defconst monk-agent-tail-default 50
   "Lines a tail request returns when it gives no count.")
@@ -178,6 +185,9 @@ failed etcd call is logged and does not fail the run."
 
 (defvar monk-agent--etcd-timer nil
   "Timer that refreshes the presence lease.")
+
+(defvar monk-agent--server nil
+  "The local socket server process, while the agent runs.")
 
 (defvar monk-agent--running t
   "Nil makes `monk-agent-main' return.")
@@ -262,6 +272,21 @@ reload failed; the line then says so on every run until it works."
 
 (declare-function monk-reload "monk-reload" (&optional verbose))
 
+(defun monk-agent--load-new-libraries ()
+  "Load Monk libraries that exist on disk but were never loaded here.
+A library added to the tree after the agent started, such as
+`monk-connect', is not stale: it is absent.  `monk-reload' does not
+know it; this does.  Return the features loaded."
+  (let (loaded)
+    (dolist (feature monk-libraries)
+      (when (and (not (featurep feature))
+                 (not (memq feature '(monk-testdrive monk-tutorial monk-etcd monk-translate monk-embark)))
+                 (locate-library (symbol-name feature)))
+        (condition-case err
+            (progn (require feature) (push feature loaded))
+          (error (monk-log 'warn "agent: loading %s failed: %s" feature (error-message-string err))))))
+    (nreverse loaded)))
+
 (defun monk-agent--reload-if-stale ()
   "Reload Monk and the policy file when their source changed since they loaded.
 The agent is a long-lived Emacs and must follow its own source: an
@@ -285,6 +310,14 @@ line, or nil when nothing was stale."
             (push (format "reloaded %s" (mapconcat (lambda (c) (symbol-name (car c))) stale ", ")) notes))
         (error (monk-log 'warn "agent: reload failed: %s" (error-message-string err))
                (push "reload FAILED" notes))))
+    (let ((new (monk-agent--load-new-libraries)))
+      (when new
+        (push (format "loaded new %s" (mapconcat #'symbol-name new ", ")) notes)))
+    ;; An agent that started before the socket existed, or whose reload
+    ;; redefined the server without restarting it, serves from now on.
+    (when (and (null monk-agent--server) (fboundp 'monk-agent-serve-local))
+      (when (monk-agent-serve-local)
+        (push "socket started" notes)))
     (when policy-stale
       (condition-case err
           (progn (load policy nil t)
@@ -414,14 +447,17 @@ is already recorded."
     ;; leave a half-torn watch.
     (add-hook 'kill-emacs-hook #'monk-agent-stop)
     (monk-cli-print-line
-     (format "%s %s build %s start on %s, ledger %s, full converge every %ss%s"
+     (format "%s %s build %s start on %s as %s, ledger %s, socket %s, full converge every %ss%s"
              (monk-cli--color "1" "monk-agent") monk-version monk-build (oref m name)
-             (abbreviate-file-name (monk-agent-ledger-path)) monk-agent-full-interval
+             (monk-owner-string (monk-owner))
+             (abbreviate-file-name (monk-agent-ledger-path))
+             (abbreviate-file-name (monk-agent-local-socket-path)) monk-agent-full-interval
              (if monk-cli--tty "" "  (no terminal: progress off)")))
     (let ((delay (monk-agent-splay-seconds)))
       (when (> delay 0)
         (monk-cli-print-line (format "splay: first converge in %ds" delay))
         (sleep-for delay)))
+    (monk-agent-serve-local)
     (monk-agent--full-converge policy)
     (monk-watch-start m policy)
     (monk-cli-idle-start #'monk-agent--idle-text)
@@ -451,6 +487,7 @@ is already recorded."
       (setq monk-agent--full-timer nil
             monk-agent--etcd-timer nil)
       (monk-watch-stop)
+      (monk-agent-stop-local)
       (monk-cli-idle-stop)
       (monk-cli-disable)
       (monk-cli-print-line "monk-agent: stop"))))
@@ -566,9 +603,16 @@ endpoint, and common keys.  Call inside a policy."
 
 ;;;; Query endpoint (socket activated, one process per connection)
 
+(defvar monk-agent--respond-to nil
+  "Where responses go: nil for stdout, else a process to send to.
+Bound per connection by the socket server.")
+
 (defun monk-agent--respond (object)
-  "Write OBJECT as one JSON line to stdout."
-  (princ (monk-event-line object)))
+  "Write OBJECT as one JSON line to stdout, or to the connection being served."
+  (let ((line (monk-event-line object)))
+    (if (and monk-agent--respond-to (process-live-p monk-agent--respond-to))
+        (process-send-string monk-agent--respond-to line)
+      (princ line))))
 
 (defun monk-agent--ledger-tail (n)
   "Return the last N lines of the ledger as strings, oldest first."
@@ -592,17 +636,173 @@ endpoint, and common keys.  Call inside a policy."
          (zerop (call-process "systemctl" nil nil nil "is-active" "--quiet"
                               monk-agent-service-name)))))
 
+(defun monk-agent-status-alist ()
+  "Return what an agent says about itself.
+Host, owner, build, watch state, sudo state, last run."
+  (let ((w (and (boundp 'monk-watch--current) monk-watch--current)))
+    `((host . ,(system-name))
+      (owner . ,(monk-owner-string (monk-owner)))
+      (scope . ,(if (monk-root-p) "root" "user"))
+      (pid . ,(emacs-pid))
+      (version . ,monk-version)
+      (build . ,monk-build)
+      (agent_active . ,(if (or monk-agent--server (monk-agent--service-active-p)) t :false))
+      (watching . ,(if w t :false))
+      (watch_mode . ,(and w (symbol-name monk-watch-mode)))
+      (watch_dirs . ,(and w (length (monk-watch-watched w))))
+      (watch_runs . ,(and w (monk-watch-runs w)))
+      (watch_started . ,(and w (monk-event--time (monk-watch-started w))))
+      (next_full . ,(and monk-agent--full-timer
+                         (monk-event--time (timer--time monk-agent--full-timer))))
+      (sudo . ,(monk-agent--sudo-state))
+      (ledger . ,(monk-agent-ledger-path))
+      (last_run . ,(monk-agent--last-run-end)))))
+
+(defun monk-agent--sudo-state ()
+  "Return what a sudo resource would meet here: `root', `cached', or `password'.
+`sudo -n true' succeeds under NOPASSWD or while the timestamp is
+fresh; otherwise it fails at once instead of prompting."
+  (let ((default-directory temporary-file-directory))
+    (cond ((monk-root-p) "root")
+          ((not (executable-find "sudo")) "none")
+          ((zerop (call-process "sudo" nil nil nil "-n" "true")) "cached")
+          (t "password"))))
+
+(defvar monk-agent--subscribers nil
+  "Connections that asked for every event of this agent.")
+
+(defun monk-agent--broadcast (event)
+  "Send EVENT, an alist, to every live subscriber; drop the dead ones."
+  (when monk-agent--subscribers
+    (let ((line (monk-event-line event)))
+      (setq monk-agent--subscribers
+            (seq-filter (lambda (proc)
+                          (when (process-live-p proc)
+                            (condition-case nil
+                                (progn (process-send-string proc line) t)
+                              (error nil))))
+                        monk-agent--subscribers)))))
+
+(defun monk-agent--broadcast-progress (event data)
+  "Progress hook: turn EVENT with DATA into a record for subscribers."
+  (when monk-agent--subscribers
+    (pcase event
+      ('run-start (monk-agent--broadcast (monk-event-run 'run-start (plist-get data :run))))
+      ('node-end (when monk--current-run
+                   (monk-agent--broadcast
+                    (monk-event-result (plist-get data :result) monk--current-run
+                                       (plist-get data :pass)))))
+      ('run-end (monk-agent--broadcast (monk-event-run 'run-end (plist-get data :run)))))))
+
+;;;; Local socket server (same user, same host)
+;;
+;; The systemd endpoint spawns one Emacs per connection through socket
+;; activation.  A plain agent, `make monk' in a terminal or a launchd
+;; job, serves its own socket from inside the loop: a Unix socket under
+;; the Monk state directory, mode 0600, so only the owner (or root)
+;; can connect.  That is the scope rule made concrete: a user connects
+;; to their own agent, a root agent's socket lives under /etc/monk.
+
+(defun monk-agent-local-socket-path ()
+  "Return the path of the local agent socket for this owner."
+  (expand-file-name monk-agent-local-socket-name (monk-home-directory)))
+
+(defun monk-agent-pid-file ()
+  "Return the path of the pid file for this owner."
+  (expand-file-name monk-agent-pid-file-name (monk-home-directory)))
+
+(defun monk-agent--write-pid-file ()
+  "Write pid, socket, owner, and build so a session can find this agent."
+  (with-temp-file (monk-agent-pid-file)
+    (insert (monk-event-line `((pid . ,(emacs-pid))
+                               (socket . ,(monk-agent-local-socket-path))
+                               (owner . ,(monk-owner-string (monk-owner)))
+                               (host . ,(system-name))
+                               (version . ,monk-version)
+                               (build . ,monk-build)
+                               (started . ,(monk-event--time)))))))
+
+(defun monk-agent-read-pid-file ()
+  "Return the pid file as an alist when the agent it names is alive, else nil.
+A stale file from a crashed agent is removed."
+  (let ((file (monk-agent-pid-file)))
+    (when (file-readable-p file)
+      (let* ((info (with-temp-buffer (insert-file-contents file)
+                                     (monk-event-parse (string-trim (buffer-string)))))
+             (pid (alist-get 'pid info)))
+        (if (and pid (process-attributes pid))
+            info
+          (ignore-errors (delete-file file))
+          nil)))))
+
+(defun monk-agent--connection-filter (proc chunk)
+  "Handle CHUNK from PROC; each complete line in it is one JSON request."
+  (let ((buffer (concat (or (process-get proc 'monk-partial) "") chunk)))
+    (while (string-match "\n" buffer)
+      (let ((line (substring buffer 0 (match-beginning 0))))
+        (setq buffer (substring buffer (match-end 0)))
+        (let ((monk-agent--respond-to proc))
+          (condition-case err
+              (let ((request (monk-event-parse line)))
+                (if request
+                    (monk-agent-handle request)
+                  (monk-agent--respond '((ok . :false) (error . "expected one JSON object")))))
+            (error (monk-agent--respond `((ok . :false) (error . ,(error-message-string err)))))))))
+    (process-put proc 'monk-partial buffer)))
+
+(defun monk-agent--connection-sentinel (proc _event)
+  "Forget PROC when it closes."
+  (unless (process-live-p proc)
+    (setq monk-agent--subscribers (delq proc monk-agent--subscribers))))
+
+(defun monk-agent-serve-local ()
+  "Start serving the local socket.  Return the server process, or nil.
+Nil when this Emacs has no local sockets.  A stale socket file from
+an earlier agent is replaced."
+  (let ((path (monk-agent-local-socket-path)))
+    (make-directory (file-name-directory path) t)
+    (when (file-exists-p path) (delete-file path))
+    (condition-case err
+        (let ((server (make-network-process
+                       :name "monk-agent-local" :server t :family 'local :service path
+                       :noquery t :coding 'utf-8-unix
+                       :filter #'monk-agent--connection-filter
+                       :sentinel #'monk-agent--connection-sentinel)))
+          (set-file-modes path #o600)
+          (setq monk-agent--server server)
+          (add-hook 'monk-progress-functions #'monk-agent--broadcast-progress)
+          (add-hook 'monk-watch-functions #'monk-agent--broadcast-watch)
+          (monk-agent--write-pid-file)
+          (monk-log 'info "agent socket %s" path)
+          server)
+      (error (monk-log 'warn "agent socket: %s" (error-message-string err)) nil))))
+
+(defun monk-agent--broadcast-watch (kind data)
+  "Watch hook: forward a drift KIND with DATA to subscribers."
+  (when monk-agent--subscribers
+    (pcase kind
+      ('drift (monk-agent--broadcast (monk-event-drift (plist-get data :key) (plist-get data :path)
+                                                       (plist-get data :action))))
+      (_ nil))))
+
+(defun monk-agent-stop-local ()
+  "Stop the local socket server and remove its files."
+  (remove-hook 'monk-progress-functions #'monk-agent--broadcast-progress)
+  (remove-hook 'monk-watch-functions #'monk-agent--broadcast-watch)
+  (dolist (proc monk-agent--subscribers) (ignore-errors (delete-process proc)))
+  (setq monk-agent--subscribers nil)
+  (when monk-agent--server
+    (ignore-errors (delete-process monk-agent--server))
+    (setq monk-agent--server nil))
+  (ignore-errors (delete-file (monk-agent-local-socket-path)))
+  (ignore-errors (delete-file (monk-agent-pid-file))))
+
 (defun monk-agent-handle (request)
   "Handle REQUEST, an alist from one JSON line.  Write the response to stdout."
   (let ((op (alist-get 'op request)))
     (pcase op
       ("status"
-       (monk-agent--respond
-        `((op . "status") (ok . t)
-          (host . ,(system-name))
-          (agent_active . ,(if (monk-agent--service-active-p) t :false))
-          (ledger . ,(monk-agent-ledger-path))
-          (last_run . ,(monk-agent--last-run-end)))))
+       (monk-agent--respond (append '((op . "status") (ok . t)) (monk-agent-status-alist))))
       ("tail"
        (dolist (line (monk-agent--ledger-tail (or (alist-get 'n request) monk-agent-tail-default)))
          (princ line) (princ "\n"))
@@ -616,6 +816,28 @@ endpoint, and common keys.  Call inside a policy."
          (monk-agent--respond `((op . ,op) (ok . t)
                                 (count . ,(length rows))
                                 (rows . ,(monk-history-rows-json rows))))))
+      ("subscribe"
+       ;; From now on every event of this agent goes to the connection,
+       ;; until it closes.  The reply says who the agent is, so the
+       ;; subscriber can show it.
+       (when monk-agent--respond-to
+         (cl-pushnew monk-agent--respond-to monk-agent--subscribers))
+       (monk-agent--respond (append '((op . "subscribe") (ok . t)) (monk-agent-status-alist))))
+      ("watch-mode"
+       (let ((mode (alist-get 'mode request)))
+         (if (and (fboundp 'monk-watch-active-p) (monk-watch-active-p))
+             (progn
+               (if (member mode '("assisted" "autopilot"))
+                   (setq monk-watch-mode (intern mode))
+                 (monk-watch-toggle-mode))
+               (monk-agent--respond `((op . "watch-mode") (ok . t) (mode . ,(symbol-name monk-watch-mode)))))
+           (monk-agent--respond '((op . "watch-mode") (ok . :false) (error . "no watch is active"))))))
+      ("watch-log"
+       (let ((lines (and (get-buffer monk-watch-log-buffer-name)
+                         (with-current-buffer monk-watch-log-buffer-name
+                           (split-string (buffer-string) "\n" t)))))
+         (monk-agent--respond `((op . "watch-log") (ok . t)
+                                (lines . ,(vconcat (last lines (or (alist-get 'n request) monk-agent-tail-default))))))))
       ((or "plan" "run")
        (let* ((policy (or monk-batch-policy
                           (signal 'monk-policy-error (list "monk-batch-policy is not set"))))

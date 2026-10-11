@@ -76,7 +76,7 @@ Nil means history.sqlite under `monk-home-directory'."
 
 ;;;; Schema
 
-(defconst monk-history-schema-version 4
+(defconst monk-history-schema-version 5
   "Schema version stored in the `meta' table.")
 
 (defconst monk-history-schema
@@ -95,7 +95,8 @@ Nil means history.sqlite under `monk-home-directory'."
        partial INTEGER, failed INTEGER, skipped INTEGER,
        unreachable INTEGER,
        flapping TEXT,
-       reasons TEXT)"
+       reasons TEXT,
+       owner TEXT)"
     "CREATE TABLE IF NOT EXISTS results (
        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
        host TEXT NOT NULL,
@@ -109,7 +110,8 @@ Nil means history.sqlite under `monk-home-directory'."
        duration_ms REAL,
        source TEXT,
        seq INTEGER,
-       pass INTEGER)"
+       pass INTEGER,
+       scope TEXT)"
     "CREATE TABLE IF NOT EXISTS facts (
        machine TEXT PRIMARY KEY,
        gathered TEXT NOT NULL,
@@ -128,11 +130,11 @@ Nil means history.sqlite under `monk-home-directory'."
 
 (defconst monk-history-run-columns
   '(id started ended dry_run hosts policy passes plan_id ok
-    kept repaired would_repair partial failed skipped unreachable flapping reasons)
+    kept repaired would_repair partial failed skipped unreachable flapping reasons owner)
   "Columns of the runs table, in table order.")
 
 (defconst monk-history-result-columns
-  '(run_id host name type status degree changes comment diff duration_ms source seq pass)
+  '(run_id host name type status degree changes comment diff duration_ms source seq pass scope)
   "Columns of the results table, in table order.")
 
 ;;;; Connection
@@ -143,23 +145,33 @@ Nil means history.sqlite under `monk-home-directory'."
 (defvar monk-history--db-path nil
   "Path `monk-history--db' was opened on.")
 
+(defvar monk-history--db-schema nil
+  "The schema version `monk-history--db' was brought up to.
+A reload can raise `monk-history-schema-version' under an open
+connection; the next use migrates then, instead of at the next open.")
+
 (defun monk-history-db ()
-  "Return the open database, opening or creating it when needed."
+  "Return the open database, opening or creating it when needed.
+The schema is applied on open and again whenever the code's schema
+version is newer than the one this connection was migrated to."
   (let ((path (monk-history-path)))
     (unless (and monk-history--db (equal path monk-history--db-path)
                  (sqlitep monk-history--db))
       (monk-history-close)
       (make-directory (file-name-directory path) t)
       (setq monk-history--db (sqlite-open path)
-            monk-history--db-path path)
+            monk-history--db-path path
+            monk-history--db-schema nil)
       (sqlite-execute monk-history--db "PRAGMA journal_mode = WAL")
-      (sqlite-execute monk-history--db "PRAGMA foreign_keys = ON")
+      (sqlite-execute monk-history--db "PRAGMA foreign_keys = ON"))
+    (unless (eql monk-history--db-schema monk-history-schema-version)
       (dolist (statement monk-history-schema)
         (sqlite-execute monk-history--db statement))
       (monk-history--migrate monk-history--db)
       (sqlite-execute monk-history--db
                       "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?)"
-                      (list (number-to-string monk-history-schema-version))))
+                      (list (number-to-string monk-history-schema-version)))
+      (setq monk-history--db-schema monk-history-schema-version))
     monk-history--db))
 
 (defun monk-history--migrate (db)
@@ -168,10 +180,14 @@ Columns are added, never removed, so an old Monk still reads the file."
   (let ((columns (mapcar #'cadr (sqlite-select db "PRAGMA table_info(results)"))))
     (dolist (column '("seq" "pass"))
       (unless (member column columns)
-        (sqlite-execute db (format "ALTER TABLE results ADD COLUMN %s INTEGER" column)))))
+        (sqlite-execute db (format "ALTER TABLE results ADD COLUMN %s INTEGER" column))))
+    (unless (member "scope" columns)
+      (sqlite-execute db "ALTER TABLE results ADD COLUMN scope TEXT")))
   (let ((columns (mapcar #'cadr (sqlite-select db "PRAGMA table_info(runs)"))))
     (unless (member "unreachable" columns)
-      (sqlite-execute db "ALTER TABLE runs ADD COLUMN unreachable INTEGER"))))
+      (sqlite-execute db "ALTER TABLE runs ADD COLUMN unreachable INTEGER"))
+    (unless (member "owner" columns)
+      (sqlite-execute db "ALTER TABLE runs ADD COLUMN owner TEXT"))))
 
 (defun monk-history-close ()
   "Close the database connection, if open."
@@ -228,7 +244,8 @@ A run id that exists already is replaced, so recording is idempotent."
                  (monk-history--json
                   (mapcar (lambda (cell) (list (cons 'host (caar cell)) (cons 'name (cdar cell))
                                                (cons 'reason (cdr cell))))
-                          (monk-run-reasons run)))))
+                          (monk-run-reasons run)))
+                 (monk-owner-string (monk-run-owner run))))
           (dolist (result (monk-run-results run))
             (cl-incf seq)
             (sqlite-execute
@@ -250,7 +267,8 @@ A run id that exists already is replaced, so recording is idempotent."
                    (* 1000.0 (monk-result-duration result))
                    (car (monk-result-origin result))
                    seq
-                   (monk-run-passes run))))
+                   (monk-run-passes run)
+                   (and (monk-result-scope result) (symbol-name (monk-result-scope result))))))
           (monk-history--record-event db (monk-event-run 'run-end run) id)
           (sqlite-commit db))
       (error
@@ -335,7 +353,7 @@ Each is an alist (ts tag run_id data), with data parsed."
 ;;;; Filters
 
 (defconst monk-history-filter-keys
-  '(:host :name :type :status :run :since :until :dry-run :changed :limit :offset)
+  '(:host :name :type :status :scope :owner :run :since :until :dry-run :changed :limit :offset)
   "Filters that `monk-history-runs' and `monk-history-results' accept.")
 
 (defun monk-history-since-time (since)
@@ -376,6 +394,13 @@ TABLE is `runs' or `results'.  Unknown keys signal."
                   (:status (unless (eq table 'runs)
                              (push "status = ?" clauses)
                              (push (format "%s" value) params)))
+                  (:scope (unless (eq table 'runs)
+                            (push "scope = ?" clauses)
+                            (push (format "%s" value) params)))
+                  (:owner (push (if (eq table 'runs) "owner = ?"
+                                  "run_id IN (SELECT id FROM runs WHERE owner = ?)")
+                                clauses)
+                          (push value params))
                   (:run (push (if (eq table 'runs) "id = ?" "run_id = ?") clauses)
                         (push value params))
                   (:since (push (if (eq table 'runs) "started >= ?"
@@ -492,6 +517,7 @@ Machines are stand-ins named from the row; facts are empty."
    :name (alist-get 'name row)
    :type (alist-get 'type row)
    :status (intern (alist-get 'status row))
+   :scope (and (alist-get 'scope row) (intern (alist-get 'scope row)))
    :degree (or (alist-get 'degree row) 0.0)
    :changes (and (alist-get 'changes row)
                  (condition-case nil
