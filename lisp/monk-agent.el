@@ -241,10 +241,18 @@ failed etcd call is logged and does not fail the run."
 The summary line is printed in any case."
   :type 'boolean)
 
+(defvar monk-agent--run-origin nil
+  "Why the run in progress runs: a short string for the summary line.
+`timed', `start', `drift', `source edit', `SIGUSR1', or `plan for
+pid N' / `apply for pid N' when a connected session asked.  Bound
+around each run by its starter; nil means the run came from the watch.")
+
 (defun monk-agent--report (run &optional _verbose)
   "The agent's report function: record RUN, publish it, print the summary.
-Changed and failed results were printed as they finished by
-`monk-cli'; on a terminal they scrolled above the status line."
+The line names the run's origin, so a run a session asked for over the
+socket does not read like a timer run.  Changed and failed results were
+printed as they finished by `monk-cli'; on a terminal they scrolled
+above the status line."
   (monk-agent-record run)
   (monk-agent--etcd (lambda () (monk-etcd-publish-run run)))
   (monk-agent--announce run)
@@ -253,20 +261,30 @@ Changed and failed results were printed as they finished by
       (dolist (r (monk-run-results run))
         (when (or (monk-result-changed-p r) (monk-result-failed-p r))
           (monk-cli-print-result r)))))
-  (monk-cli-print-line (format "%s %s  %s%s" (monk-cli--color "1" "monk-agent")
+  (monk-cli-print-line (format "%s %s  %s%s%s" (monk-cli--color "1" "monk-agent")
                                (format-time-string "%T")
                                (monk-cli-summary-line run)
+                               (monk-cli--color "90" (format "  (%s)" (or monk-agent--run-origin
+                                                                          (if (monk-run-reasons run) "drift" "run"))))
                                (monk-agent--stale-note))))
 
+(defvar monk-agent--reload-failed nil
+  "Non-nil after a reload attempt failed; cleared by one that succeeds.
+The stale note says \"reload failed\" only when this is set: source
+newer than the process is otherwise just an edit the next converge
+will pick up (an edit seconds after start once read as a failure).")
+
 (defun monk-agent--stale-note ()
-  "Return a note when this agent still runs code older than its source.
-After `monk-agent--reload-if-stale' that is only the case when the
-reload failed; the line then says so on every run until it works."
+  "Return a note when this agent runs code older than its source.
+Says whether a reload failed, or whether the edit is simply pending."
   (let ((stale (monk-stale-libraries)))
-    (if (null stale)
-        ""
-      (monk-cli--color "33" (format "  STALE CODE: %s (reload failed; see the log)"
-                                    (mapconcat (lambda (c) (symbol-name (car c))) stale ", "))))))
+    (cond
+     ((null stale) "")
+     (monk-agent--reload-failed
+      (monk-cli--color "31" (format "  STALE CODE: %s (reload failed; see above)"
+                                    (mapconcat (lambda (c) (symbol-name (car c))) stale ", "))))
+     (t (monk-cli--color "90" (format "  source edited: %s (reload at the next converge)"
+                                      (mapconcat (lambda (c) (symbol-name (car c))) stale ", ")))))))
 
 ;;;; Following the source
 ;;
@@ -290,7 +308,20 @@ An editor saves several files in a burst; one reload covers them."
   :type 'number)
 
 (defvar monk-agent--source-descriptors nil
-  "Filenotify descriptors of the source watch.")
+  "Filenotify descriptors of the source watch, when that backend is used.")
+
+(defvar monk-agent--source-process nil
+  "The fswatch process of the source watch, when that backend is used.")
+
+(defvar monk-agent--source-dirs nil
+  "The real directories the source watch was started on.")
+
+(defvar monk-agent--source-repath-timer nil
+  "Timer that re-resolves the source directories; see `monk-watch-repath-interval'.")
+
+(defvar monk-agent--source-backend nil
+  "Which backend watches the source.
+`fswatch', `filenotify-files', `filenotify', or nil for none.")
 
 (defvar monk-agent--source-timer nil
   "The debounce timer of the source watch, while pending.")
@@ -302,9 +333,13 @@ For a converge started by a signal or a source edit.")
 (defun monk-agent-source-directories ()
   "Return the directories the source watch covers.
 Monk's Lisp directory and the policy file's directory."
+  ;; Real paths: the tree is often reached through a symlink
+  ;; (~/source/emacs/monk -> ~/ai_workspace/source/monk), and FSEvents
+  ;; reports under the real directory while kqueue watches the inode.
   (delete-dups
-   (delq nil (list (let ((f (locate-library "monk"))) (and f (file-name-directory f)))
-                   (and monk-agent-policy-file (file-name-directory monk-agent-policy-file))))))
+   (mapcar #'file-truename
+           (delq nil (list (let ((f (locate-library "monk"))) (and f (file-name-directory f)))
+                           (and monk-agent-policy-file (file-name-directory monk-agent-policy-file)))))))
 
 (defun monk-agent--source-event (event)
   "Handle filenotify EVENT under a source directory.
@@ -323,27 +358,82 @@ The same path as the hourly timer."
   (monk-log 'info "source edit: %s" (abbreviate-file-name file))
   (monk-cli-print-line (format "%s source edit %s" (monk-cli--color "1" "monk-agent")
                                (abbreviate-file-name file)))
-  (monk-agent--full-converge monk-agent--policy t))
+  (let ((monk-agent--run-origin "source edit"))
+    (monk-agent--full-converge monk-agent--policy t)))
+
+(defun monk-agent--source-fswatch-filter (proc chunk)
+  "Feed NUL-separated paths in CHUNK from fswatch PROC to the event handler."
+  (let ((buffer (concat (or (process-get proc 'monk-partial) "") chunk)))
+    (while (string-match "\0" buffer)
+      (let ((path (substring buffer 0 (match-beginning 0))))
+        (setq buffer (substring buffer (match-end 0)))
+        (unless (string-empty-p path)
+          (monk-agent--source-event (list proc 'changed path)))))
+    (process-put proc 'monk-partial buffer)))
 
 (defun monk-agent-source-watch-start ()
-  "Watch the source directories.
-Return the descriptors, nil when none could be watched."
-  (require 'filenotify)
+  "Watch the source directories with the same backend the drift watch uses.
+fswatch on macOS when present: FSEvents reports writes, which kqueue
+through filenotify does not for files under a watched directory; on
+kqueue every .el file is watched by name as well.  Return the backend
+in use, nil when nothing could be watched."
   (monk-agent-source-watch-stop)
-  (dolist (dir (monk-agent-source-directories))
-    (condition-case err
-        (push (file-notify-add-watch dir '(change attribute-change) #'monk-agent--source-event)
-              monk-agent--source-descriptors)
-      (file-notify-error (monk-log 'warn "source watch on %s: %s" dir (error-message-string err)))))
-  (when monk-agent--source-descriptors
-    (monk-log 'info "source watch on %s" (mapconcat #'abbreviate-file-name (monk-agent-source-directories) ", ")))
-  monk-agent--source-descriptors)
+  (let ((dirs (monk-agent-source-directories))
+        (backend (monk-watch--choose-backend)))
+    (setq monk-agent--source-dirs dirs)
+    ;; the kernel watches where the symlinks pointed at start; look
+    ;; again now and then, as the drift watch does
+    (when monk-watch-repath-interval
+      (setq monk-agent--source-repath-timer
+            (run-at-time monk-watch-repath-interval monk-watch-repath-interval
+                         #'monk-agent--source-repath)))
+    (pcase backend
+      ('fswatch
+       (let ((proc (apply #'start-process "monk-source-fswatch" nil monk-watch-fswatch-program
+                          (append monk-watch-fswatch-args
+                                  (mapcan (lambda (re) (list "--exclude" re)) monk-watch-fswatch-excludes)
+                                  (mapcar #'directory-file-name dirs)))))
+         (set-process-filter proc #'monk-agent--source-fswatch-filter)
+         (set-process-query-on-exit-flag proc nil)
+         (setq monk-agent--source-process proc
+               monk-agent--source-backend 'fswatch)))
+      ('filenotify
+       (require 'filenotify)
+       (let ((files (and (monk-watch-file-watch-needed-p)
+                         (mapcan (lambda (dir) (directory-files dir t "\\.el\\'")) dirs))))
+         (dolist (path (append dirs files))
+           (condition-case err
+               (push (file-notify-add-watch path '(change attribute-change) #'monk-agent--source-event)
+                     monk-agent--source-descriptors)
+             (file-notify-error (monk-log 'warn "source watch on %s: %s" path (error-message-string err)))))
+         (when monk-agent--source-descriptors
+           (setq monk-agent--source-backend (if files 'filenotify-files 'filenotify)))))
+      (_ nil))
+    (when monk-agent--source-backend
+      (monk-log 'info "source watch (%s) on %s" monk-agent--source-backend
+                (mapconcat #'abbreviate-file-name dirs ", ")))
+    monk-agent--source-backend))
+
+(defun monk-agent--source-repath ()
+  "Resolve the source directories again; when they moved, watch the new ones."
+  (unless (equal (monk-agent-source-directories) monk-agent--source-dirs)
+    (monk-cli-print-line (format "%s source tree moved to %s; watching again"
+                                 (monk-cli--color "1" "monk-agent")
+                                 (mapconcat #'abbreviate-file-name (monk-agent-source-directories) ", ")))
+    (monk-agent-source-watch-start)))
 
 (defun monk-agent-source-watch-stop ()
   "Stop the source watch."
+  (when monk-agent--source-repath-timer
+    (cancel-timer monk-agent--source-repath-timer)
+    (setq monk-agent--source-repath-timer nil))
   (dolist (desc monk-agent--source-descriptors)
     (ignore-errors (file-notify-rm-watch desc)))
   (setq monk-agent--source-descriptors nil)
+  (when monk-agent--source-process
+    (ignore-errors (delete-process monk-agent--source-process))
+    (setq monk-agent--source-process nil))
+  (setq monk-agent--source-backend nil)
   (when monk-agent--source-timer
     (cancel-timer monk-agent--source-timer)
     (setq monk-agent--source-timer nil)))
@@ -352,7 +442,8 @@ Return the descriptors, nil when none could be watched."
   "SIGUSR1: reload what changed and converge now, as the timer would."
   (interactive)
   (monk-cli-print-line (format "%s SIGUSR1: converging now" (monk-cli--color "1" "monk-agent")))
-  (monk-agent--full-converge monk-agent--policy t))
+  (let ((monk-agent--run-origin "SIGUSR1"))
+    (monk-agent--full-converge monk-agent--policy t)))
 
 (defun monk-agent-poke (&optional pid)
   "Make the agent of this user converge now, with a reload first.
@@ -423,6 +514,7 @@ line, or nil when nothing was stale."
               (monk-reload))
             (if monk-reload-last-failures
                 (progn
+                  (setq monk-agent--reload-failed t)
                   (monk-cli-print-line
                    (format "%s reload: %s" (monk-cli--color "31" "monk-agent")
                            (mapconcat (lambda (f) (format "%s: %s" (car f) (cdr f)))
@@ -430,14 +522,20 @@ line, or nil when nothing was stale."
                   (push (format "reload FAILED for %s" (mapconcat (lambda (f) (symbol-name (car f)))
                                                                   monk-reload-last-failures ", "))
                         notes))
+              (setq monk-agent--reload-failed nil)
               (push (format "reloaded %s" (mapconcat (lambda (c) (symbol-name (car c))) stale ", ")) notes)))
         (error
+         (setq monk-agent--reload-failed t)
          (monk-cli-print-line (format "%s reload failed: %s" (monk-cli--color "31" "monk-agent")
                                       (error-message-string err)))
          (push "reload FAILED" notes))))
     (let ((new (monk-agent--load-new-libraries)))
       (when new
         (push (format "loaded new %s" (mapconcat #'symbol-name new ", ")) notes)))
+    ;; The source watch runs on the code it was started with; after a
+    ;; reload of this file its filter is the old closure, so restart it.
+    (when (and stale monk-agent-source-watch (fboundp 'monk-agent-source-watch-start))
+      (monk-agent-source-watch-start))
     ;; An agent that started before the socket existed, or whose reload
     ;; redefined the server without restarting it, serves from now on.
     (when (and (null monk-agent--server) (fboundp 'monk-agent-serve-local))
@@ -539,7 +637,8 @@ runs is remembered and served right after."
         (load monk-agent-policy-file nil t)))
     (if (and timed monk-agent-only-if-changed monk-agent-policy-repo (not (eq update 'changed)))
         (monk-log 'info "policy repo unchanged; full converge skipped")
-      (let ((monk-watch--running t))
+      (let ((monk-watch--running t)
+            (monk-agent--run-origin (or monk-agent--run-origin (if timed "timed" "start"))))
         (monk-run-report (monk-converge (or monk-agent--machine (monk-agent-machine)) policy))))))
 
 (defun monk-agent--idle-text ()
@@ -550,10 +649,11 @@ runs is remembered and served right after."
                                                              (current-time))))))))
     (if (null w)
         "watching"
-      (format "watching %d dir(s)  %d run(s)  up %s%s"
+      (format "watching %d dir(s)  %d run(s)  up %s%s  source: %s"
               (length (monk-watch-watched w)) (monk-watch-runs w)
               (monk-format-duration (float-time (time-since (monk-watch-started w))) t)
-              (if next (format "  full in %s" (monk-format-duration next)) "")))))
+              (if next (format "  full in %s" (monk-format-duration next)) "")
+              (or monk-agent--source-backend "off")))))
 
 (defun monk-agent-stop ()
   "Make the agent loop return after the current iteration."
@@ -805,6 +905,7 @@ Host, owner, build, watch state, sudo state, last run."
                          (monk-event--time (timer--time monk-agent--full-timer))))
       (sudo . ,(monk-agent--sudo-state))
       (stale . ,(vconcat (mapcar (lambda (c) (symbol-name (car c))) (monk-stale-libraries))))
+      (source_watch . ,(and monk-agent--source-backend (symbol-name monk-agent--source-backend)))
       (load_path . ,(let ((f (locate-library "monk"))) (and f (file-name-directory f))))
       (ledger . ,(monk-agent-ledger-path))
       (last_run . ,(monk-agent--last-run-end)))))
@@ -999,6 +1100,11 @@ an earlier agent is replaced."
                           (signal 'monk-policy-error (list "monk-batch-policy is not set"))))
               (subscribed (and monk-agent--respond-to
                                (memq monk-agent--respond-to monk-agent--subscribers)))
+              (monk-agent--run-origin
+               (format "%s for %s" op
+                       (or (and (alist-get 'client request) (format "%s" (alist-get 'client request)))
+                           (and monk-agent--respond-to "a socket client")
+                           "the endpoint")))
               (monk-report-function #'monk-agent--report)
               (live nil)
               (monk-progress-functions

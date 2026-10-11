@@ -76,6 +76,9 @@ From the subscribe reply, refreshed by `monk-connect-status'.")
 (defvar monk-connect--waiting nil
   "A list (OP . CALLBACK) while a steered request waits for its final reply.")
 
+(defvar monk-connect--waiting-timer nil
+  "Timer that gives up on a request the agent never answered.")
+
 ;;;; Connection
 
 (defun monk-connect-active-p ()
@@ -136,6 +139,9 @@ flips its watch mode, w shows its log, D disconnects.  Signal
     (ignore-errors (delete-process monk-connect--process))
     (setq monk-connect--process nil))
   (setq monk-connect--status nil monk-connect--live-run nil monk-connect--waiting nil)
+  (when monk-connect--waiting-timer
+    (cancel-timer monk-connect--waiting-timer)
+    (setq monk-connect--waiting-timer nil))
   (when (get-buffer monk-ui-buffer-name)
     (with-current-buffer monk-ui-buffer-name (force-mode-line-update)))
   (message "Disconnected from the agent"))
@@ -234,7 +240,12 @@ A request waiting for this run gets it."
         (monk-ui-reset-cache)
         (monk-ui-refresh)
         (force-mode-line-update)))
-    (monk-connect--reply (if (monk-run-dry-run run) "plan" "run") run)
+    ;; Any finished run settles a waiting plan or run request: the
+    ;; agent serializes requests, so the run that ends is the one asked
+    ;; for, or a queued one that supersedes it.  Matching on dry-run
+    ;; left `a' after `g' waiting forever (2026-10-11).
+    (when (and monk-connect--waiting (member (car monk-connect--waiting) '("plan" "run")))
+      (monk-connect--reply (car monk-connect--waiting) run))
     (message "Agent: %s" (monk-run-summary run))))
 
 (defun monk-connect--reply (op value)
@@ -242,7 +253,17 @@ A request waiting for this run gets it."
   (when (and monk-connect--waiting (equal (car monk-connect--waiting) op))
     (let ((callback (cdr monk-connect--waiting)))
       (setq monk-connect--waiting nil)
+      (when monk-connect--waiting-timer
+        (cancel-timer monk-connect--waiting-timer)
+        (setq monk-connect--waiting-timer nil))
       (funcall callback value))))
+
+(defun monk-connect--give-up (op)
+  "Stop waiting for OP after `monk-connect-reply-timeout'; say so."
+  (when (and monk-connect--waiting (equal (car monk-connect--waiting) op))
+    (setq monk-connect--waiting nil monk-connect--waiting-timer nil)
+    (message "Agent: no answer to %s after %ds; the request is dropped here (the agent may still be working)"
+             op monk-connect-reply-timeout)))
 
 (defun monk-connect--show-last-run ()
   "Open `*monk*' on the agent: its last run from the history, else an empty report.
@@ -268,13 +289,32 @@ The buffer is selected, so the agent keys work at once."
 
 ;;;; Steering
 
+(defun monk-connect--client-name ()
+  "Return how this session names itself to the agent: `emacs pid N (USER@HOST)'."
+  (format "emacs pid %d (%s@%s)" (emacs-pid) (user-login-name) (system-name)))
+
 (defun monk-connect-request (op &optional extra callback)
   "Send OP with EXTRA alist pairs to the agent.
 CALLBACK gets the final reply.  One steered request at a time."
   (when monk-connect--waiting
-    (user-error "The agent is still answering %s" (car monk-connect--waiting)))
+    (user-error "The agent is still answering %s (C-u %s to drop that and send anyway)"
+                (car monk-connect--waiting) (substitute-command-keys "\\[monk-connect-drop-request]")))
   (setq monk-connect--waiting (cons op (or callback #'ignore)))
-  (monk-connect--send (cons (cons 'op op) extra)))
+  (when monk-connect--waiting-timer (cancel-timer monk-connect--waiting-timer))
+  (setq monk-connect--waiting-timer
+        (run-at-time monk-connect-reply-timeout nil #'monk-connect--give-up op))
+  (monk-connect--send (append (list (cons 'op op) (cons 'client (monk-connect--client-name))) extra)))
+
+(defun monk-connect-drop-request ()
+  "Forget the request this session is waiting on, so another can be sent."
+  (interactive)
+  (if (null monk-connect--waiting)
+      (message "Not waiting on the agent")
+    (message "Dropped the wait for %s" (car monk-connect--waiting))
+    (setq monk-connect--waiting nil)
+    (when monk-connect--waiting-timer
+      (cancel-timer monk-connect--waiting-timer)
+      (setq monk-connect--waiting-timer nil))))
 
 (defun monk-connect-plan ()
   "Ask the agent to plan its policy; the plan shows in `*monk*'."

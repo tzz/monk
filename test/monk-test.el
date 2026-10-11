@@ -1948,7 +1948,12 @@ change appears, and one resource fails."
       (let ((line (substring-no-properties (monk-cli-summary-line run))))
         (should (string-match-p "1 repaired" line))
         (should-not (string-match-p "skipped" line))
-        (should (string-match-p "partial: 1 of 3" line))))))
+        (should-not (string-match-p "dry run" line))
+        (should (string-match-p "partial: 1 of 3" line)))
+      ;; a plan is marked as one, first
+      (let* ((plan (monk-orchestrate (list m) policy :dry-run t))
+             (line (substring-no-properties (monk-cli-summary-line plan))))
+        (should (string-match-p "\\`\\(◌\\|PLAN\\) dry run" line))))))
 
 ;;;; Watch
 
@@ -5297,7 +5302,13 @@ the run is not ok, and the exit code says 4."
         (cl-letf (((symbol-function 'monk-stale-libraries) (lambda () '((monk-ui . 5))))
                   ((symbol-function 'monk-reload) (lambda (&rest _) (error "boom"))))
           (should (string-match-p "reload FAILED" (monk-agent--reload-if-stale)))
-          (should (string-match-p "STALE CODE: monk-ui" (substring-no-properties (monk-agent--stale-note)))))))))
+          (should (string-match-p "STALE CODE: monk-ui" (substring-no-properties (monk-agent--stale-note)))))
+        ;; stale with no failed attempt is an edit pending, not a failure
+        (setq monk-agent--reload-failed nil)
+        (cl-letf (((symbol-function 'monk-stale-libraries) (lambda () '((monk . 3)))))
+          (let ((note (substring-no-properties (monk-agent--stale-note))))
+            (should (string-match-p "source edited: monk" note))
+            (should-not (string-match-p "failed" note))))))))
 
 (ert-deftest monk-test-libraries-load-alone-in-batch ()
   "Each library loads in a bare Emacs with only its own requires.
@@ -5471,6 +5482,25 @@ is loaded in a fresh subprocess and asked for one function."
                 (should (equal (concat dir "agent-made") (monk-result-name (car (monk-run-results got)))))
                 (should-not (file-directory-p (concat dir "agent-made")))
                 (should-not monk-connect--waiting))
+              ;; a plan then a run: the second request is not blocked by the first
+              (let ((got nil))
+                (monk-connect-request "plan" nil (lambda (r) (push (cons 'plan r) got)))
+                (let ((deadline (+ (float-time) 5)))
+                  (while (and (< (length got) 1) (< (float-time) deadline)) (accept-process-output nil 0.05)))
+                (should-not monk-connect--waiting)
+                (monk-connect-request "run" nil (lambda (r) (push (cons 'run r) got)))
+                (let ((deadline (+ (float-time) 5)))
+                  (while (and (< (length got) 2) (< (float-time) deadline)) (accept-process-output nil 0.05)))
+                (should (= 2 (length got)))
+                (should (eq 'run (caar got)))
+                (should-not (monk-run-dry-run (cdar got)))
+                (should (file-directory-p (concat dir "agent-made")))
+                (should-not monk-connect--waiting))
+              ;; a dropped wait frees the next request
+              (setq monk-connect--waiting (cons "plan" #'ignore))
+              (should-error (monk-connect-request "plan") :type 'user-error)
+              (monk-connect-drop-request)
+              (should-not monk-connect--waiting)
               ;; status op answers
               (let ((status nil))
                 (monk-connect-status (lambda (s) (setq status s)))
@@ -5561,8 +5591,12 @@ is loaded in a fresh subprocess and asked for one function."
                 ((symbol-function 'monk-cli-print-line) #'ignore)
                 ((symbol-function 'locate-library) (lambda (&rest _) (concat dir "lisp/monk.el"))))
         (make-directory (concat dir "lisp") t)
-        (should (equal (list (concat dir "lisp/") (concat dir ""))
+        (should (equal (list (file-truename (concat dir "lisp/")) (file-truename dir))
                        (monk-agent-source-directories)))
+        ;; a symlinked tree resolves to the real one: that is where events come from
+        (make-symbolic-link (concat dir "lisp") (concat dir "link"))
+        (cl-letf (((symbol-function 'locate-library) (lambda (&rest _) (concat dir "link/monk.el"))))
+          (should (equal (file-truename (concat dir "lisp/")) (car (monk-agent-source-directories)))))
         ;; events are injected: delivery itself is the kernel's business
         (monk-agent--source-event (list 'd 'changed (concat dir "lisp/monk-sync.el")))
         (monk-agent--source-event (list 'd 'changed (concat dir "lisp/monk-ui.el")))
@@ -5575,6 +5609,15 @@ is loaded in a fresh subprocess and asked for one function."
         ;; a non-.el file does nothing
         (monk-agent--source-event (list 'd 'changed (concat dir "lisp/notes.txt")))
         (should-not monk-agent--source-timer)
+        ;; the fswatch filter feeds NUL-separated paths through the same handler
+        (let ((proc (start-process "fake" nil "sleep" "5")))
+          (unwind-protect
+              (progn
+                (monk-agent--source-fswatch-filter proc (concat dir "lisp/a.el\0" dir "lisp/b.txt\0" dir "lisp/c."))
+                (should monk-agent--source-timer)
+                (should (equal (concat dir "lisp/c.") (process-get proc 'monk-partial)))
+                (cancel-timer monk-agent--source-timer) (setq monk-agent--source-timer nil))
+            (delete-process proc)))
         ;; SIGUSR1 handler
         (monk-agent--on-sigusr1)
         (should (equal '(t t) converges))
@@ -5610,6 +5653,71 @@ is loaded in a fresh subprocess and asked for one function."
     (cl-letf (((symbol-function 'monk-agent-read-pid-file) (lambda () nil))
               ((symbol-function 'list-system-processes) (lambda () nil)))
       (should-error (monk-agent-poke) :type 'user-error))))
+
+(ert-deftest monk-test-watch-repath-follows-retargeted-symlink ()
+  "When a watched path's symlink is retargeted, the repath tick restarts the watch on the new place."
+  (monk-test-with-tmpdir dir
+    (make-directory (concat dir "a") t)
+    (make-directory (concat dir "b") t)
+    (make-symbolic-link (concat dir "a") (concat dir "cur"))
+    (let ((monk-log-level nil)
+          (monk-watch-repath-interval 3600)   ; the tick is called by hand
+          (monk-report-function #'ignore)
+          (m (monk-test-machine)))
+      (unwind-protect
+          (cl-letf (((symbol-function 'file-notify-add-watch) (lambda (&rest _) (cl-gensym "desc")))
+                    ((symbol-function 'file-notify-rm-watch) #'ignore)
+                    ((symbol-function 'file-notify-valid-p) (lambda (_) t))
+                    ((symbol-value 'file-notify--library) 'test)
+                    ((symbol-value 'monk-watch--delivery) 'yes))
+            (monk-watch-start m (lambda (_m) (monk-file (concat dir "cur/f") :content "x")))
+            (let ((first monk-watch--current)
+                  (sig (monk-watch-path-signature monk-watch--current)))
+              (should (equal (list (concat dir "a/f")) sig))
+              (should (monk-watch-repath-timer first))
+              (setf (monk-watch-runs first) 3)
+              ;; nothing moved: the same watch stays
+              (monk-watch--repath)
+              (should (eq first monk-watch--current))
+              ;; retarget: a tick notices and restarts, counters carried
+              (delete-file (concat dir "cur"))
+              (make-symbolic-link (concat dir "b") (concat dir "cur"))
+              (monk-watch--repath)
+              (should-not (eq first monk-watch--current))
+              (should (equal (list (concat dir "b/f")) (monk-watch-path-signature monk-watch--current)))
+              (should (= 3 (monk-watch-runs monk-watch--current)))
+              (should (monk-watch--nodes-for-file monk-watch--current (concat dir "b/f")))
+              (should-not (monk-watch--nodes-for-file monk-watch--current (concat dir "a/f")))
+              (with-current-buffer monk-watch-log-buffer-name
+                (should (string-match-p "paths moved" (buffer-string))))))
+        (monk-watch-stop)))))
+
+(ert-deftest monk-test-agent-source-repath ()
+  "The source watch re-resolves its directories and restarts when the symlink moved."
+  (require 'monk-agent)
+  (monk-test-with-tmpdir dir
+    (make-directory (concat dir "v1") t)
+    (make-directory (concat dir "v2") t)
+    (make-symbolic-link (concat dir "v1") (concat dir "monk"))
+    (let ((monk-agent-policy-file nil)
+          (monk-agent--source-dirs nil)
+          (monk-agent--source-repath-timer nil)
+          (monk-watch-repath-interval 3600)
+          (starts 0)
+          (monk-log-level nil))
+      (cl-letf (((symbol-function 'locate-library) (lambda (&rest _) (concat dir "monk/monk.el")))
+                ((symbol-function 'monk-cli-print-line) #'ignore)
+                ((symbol-function 'monk-agent-source-watch-start)
+                 (lambda () (cl-incf starts) (setq monk-agent--source-dirs (monk-agent-source-directories)) 'fake)))
+        (monk-agent-source-watch-start)
+        (should (equal (list (file-truename (concat dir "v1/"))) monk-agent--source-dirs))
+        (monk-agent--source-repath)
+        (should (= 1 starts))
+        (delete-file (concat dir "monk"))
+        (make-symbolic-link (concat dir "v2") (concat dir "monk"))
+        (monk-agent--source-repath)
+        (should (= 2 starts))
+        (should (equal (list (file-truename (concat dir "v2/"))) monk-agent--source-dirs))))))
 
 (provide 'monk-test)
 ;;; monk-test.el ends here

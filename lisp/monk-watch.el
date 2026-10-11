@@ -107,6 +107,15 @@ and the system is Darwin, else `filenotify'.  `fswatch' or `filenotify'
 force one.  nil watches nothing locally; remote polling still runs."
   :type '(choice (const auto) (const fswatch) (const filenotify) (const nil)))
 
+(defcustom monk-watch-repath-interval 300
+  "Seconds between checks that watched paths still resolve to the same places.
+FSEvents and kqueue watch the directory a path resolved to when the
+watch started; a symlink retargeted later (a checkout swapped under
+~/source/x) leaves them watching the old tree.  Every this many
+seconds the watch resolves its paths again and, when any moved,
+starts over on the new ones.  Nil turns the check off."
+  :type '(choice (const nil) natnum))
+
 (defcustom monk-watch-mode 'assisted
   "What to do when a watched path changes.
 `assisted' runs a plan for the affected resources and shows it in
@@ -153,7 +162,9 @@ Each check is a dry run over TRAMP, so keep this in minutes."
   (last-run-end 0.0)
   (events 0)
   (runs 0)
-  (started (current-time)))
+  (started (current-time))
+  (repath-timer nil)       ; see `monk-watch-repath-interval'
+  (path-signature nil))    ; what the owned paths resolved to at start
 
 (defvar monk-watch--current nil
   "The active watch, or nil.")
@@ -603,9 +614,13 @@ machines get filesystem notifications; remote ones are polled every
     (when (and (eq backend 'filenotify) (not (monk-watch-notifications-work-p)))
       (monk-watch--log "warning: file notifications are not delivered here; local drift will not be seen"))
     (setq monk-watch--current watch)
+    (setf (monk-watch-path-signature watch) (monk-watch--path-signature nodes))
     (pcase backend
       ('fswatch (monk-watch--fswatch-start watch))
       ('filenotify (monk-watch--add-watches watch)))
+    (when (and backend monk-watch-repath-interval)
+      (setf (monk-watch-repath-timer watch)
+            (run-at-time monk-watch-repath-interval monk-watch-repath-interval #'monk-watch--repath)))
     (when (seq-remove #'monk-machine-local-p machines)
       (setf (monk-watch-poll-timer watch)
             (run-at-time monk-watch-poll-interval monk-watch-poll-interval #'monk-watch--poll)))
@@ -632,6 +647,12 @@ machines get filesystem notifications; remote ones are polled every
     watch))
 
 ;;;###autoload
+(defun monk-watch--cancel-repath (watch)
+  "Cancel the repath timer of WATCH, if any."
+  (when (monk-watch-repath-timer watch)
+    (cancel-timer (monk-watch-repath-timer watch))
+    (setf (monk-watch-repath-timer watch) nil)))
+
 (defun monk-watch-stop ()
   "Stop the active watch."
   (interactive)
@@ -648,6 +669,7 @@ machines get filesystem notifications; remote ones are polled every
         (cancel-timer (monk-watch-debounce-timer watch)))
       (when (monk-watch-poll-timer watch)
         (cancel-timer (monk-watch-poll-timer watch)))
+      (monk-watch--cancel-repath watch)
       (setq monk-watch--current nil)
       (monk-watch--log "stopped after %d event%s, %d run%s"
                        (monk-watch-events watch) (if (= 1 (monk-watch-events watch)) "" "s")
@@ -668,6 +690,37 @@ A reload stops and starts the watch; the status line must not forget."
   (setf (monk-watch-events watch) events
         (monk-watch-runs watch) runs
         (monk-watch-started watch) started))
+
+(defun monk-watch--path-signature (nodes)
+  "Return the real paths every local node in NODES owns, sorted.
+Equal signatures mean the kernel watches the same places."
+  (let (paths)
+    (dolist (node nodes)
+      (when (monk-machine-local-p (monk-node-machine node))
+        (dolist (path (monk-watch--node-paths node))
+          (push (monk-watch-real-path path) paths))))
+    (sort (delete-dups paths) #'string<)))
+
+(defun monk-watch--repath ()
+  "Resolve the watched paths again; when any moved, restart the watch on them.
+Runs every `monk-watch-repath-interval' seconds.  Nothing runs when a
+run is in progress; the next tick looks again."
+  (let ((w monk-watch--current))
+    (when (and w (not monk-watch--running) (not monk--current-run))
+      (let ((now (monk-watch--path-signature (monk-watch-nodes w))))
+        (unless (equal now (monk-watch-path-signature w))
+          (let ((moved (seq-difference now (monk-watch-path-signature w))))
+            (monk-watch--log "paths moved: %s; watching again" (string-join moved ", "))
+            (run-hook-with-args 'monk-watch-functions 'repath (list :watch w :moved moved)))
+          (let ((machines (monk-watch-machines w))
+                (policy (monk-watch-policy w))
+                (options (monk-watch-options w))
+                (events (monk-watch-events w))
+                (runs (monk-watch-runs w))
+                (started (monk-watch-started w)))
+            (monk-watch-stop)
+            (let ((new (apply #'monk-watch-start machines policy options)))
+              (when new (monk-watch--carry-over new events runs started)))))))))
 
 (defun monk-watch-status ()
   "Return a one-line description of the active watch, or nil."

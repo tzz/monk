@@ -222,6 +222,9 @@ only for its own children, so a resize during a long run is missed."
 (defvar monk-cli--idle-text-function nil
   "Function that returns the text after the spinner on the watching line.")
 
+(defvar monk-cli--dry-run nil
+  "Non-nil while the run in progress is a dry run; the status line marks it.")
+
 (defvar monk-cli--status-shown nil
   "Non-nil when a status line is on the terminal and must be erased first.")
 
@@ -239,7 +242,8 @@ only for its own children, so a resize during a long run is missed."
   "Return the status line for the node in progress."
   (let* ((spinner (monk-cli-spinner-frame))
          (width (length (number-to-string monk-cli--total)))
-         (counter (format (format "pass %%d  %%%dd/%%d" width)
+         (counter (format (format "%%spass %%d  %%%dd/%%d" width)
+                          (if monk-cli--dry-run (concat (monk-cli-plan-mark) " ") "")
                           monk-cli--pass monk-cli--done monk-cli--total))
          (node monk-cli--current)
          (fixed (+ 2 (string-width counter) 2 monk-cli--machine-width 2 monk-cli--type-width 2))
@@ -263,6 +267,18 @@ only for its own children, so a resize during a long run is missed."
   "Advance the spinner and redraw."
   (cl-incf monk-cli--frame)
   (monk-cli--draw-status))
+
+(defconst monk-cli-plan-glyph "◌"
+  "Marks a dry run on a UTF-8 terminal: a dotted circle, nothing filled in.
+Next to the result glyphs it reads as the outline of a run that did
+not touch anything.  Purple, like would-repair.")
+
+(defconst monk-cli-plan-ascii "PLAN"
+  "Marks a dry run on a terminal without UTF-8.")
+
+(defun monk-cli-plan-mark ()
+  "Return the dry-run mark, colored, for the terminal in use."
+  (monk-cli--color "35" (if monk-cli--utf8 monk-cli-plan-glyph monk-cli-plan-ascii)))
 
 (defun monk-cli-spinner-frame ()
   "Return the current spinner frame, colored, for the terminal in use."
@@ -353,7 +369,8 @@ Does nothing off a tty or with `monk-cli-idle-interval' nil."
              monk-cli--done 0
              monk-cli--pass 1
              monk-cli--frame 0
-             monk-cli--current nil)
+             monk-cli--current nil
+             monk-cli--dry-run (and (plist-get data :run) (monk-run-dry-run (plist-get data :run))))
        (when monk-cli--tty
          (setq monk-cli--timer
                (run-at-time monk-cli-spinner-interval monk-cli-spinner-interval #'monk-cli--tick)))))
@@ -390,6 +407,10 @@ resources it left out instead of counting them as skipped: those are
 not a verdict on anything."
   (let* ((parts nil)
          (unselected (monk-run-unselected-count run)))
+    ;; a dry run says so first: on a clean host its counts are all
+    ;; kept and read exactly like an apply otherwise
+    (when (monk-run-dry-run run)
+      (push (concat (monk-cli-plan-mark) " dry run") parts))
     (dolist (status (list monk-status-repaired monk-status-would-repair monk-status-partial
                           monk-status-failed monk-status-unreachable monk-status-kept monk-status-skipped))
       (let ((n (- (monk-run-count run status) (if (eq status monk-status-skipped) unselected 0))))
