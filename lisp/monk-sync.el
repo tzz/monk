@@ -87,6 +87,39 @@ protocol 31 on, which is why the middle run is 9 or 10 wide.  rsync
 3.2 on Linux printed 11 in the sandbox; rsync on macOS printed 12.")
 
 
+(defconst monk-rsync-default-timeout 60
+  "Default for the `:timeout' of `monk-rsync': seconds without data before
+rsync gives up (`--timeout').  A peer that answers the TCP connect and
+then goes silent held one converge for 1835 s on 2026-10-12, and the
+agent with it.")
+
+(defcustom monk-rsync-default-transport
+  '("ssh" "-o" "ConnectTimeout=15" "-o" "ServerAliveInterval=15" "-o" "ServerAliveCountMax=2"
+    "-o" "BatchMode=yes")
+  "The remote shell rsync runs for a remote side (`-e'), unless the
+resource gives its own `:transport'.  A string is passed as is; a list
+is the program and its arguments.  Connect in 15 s or fail; two missed
+keepalives (30 s) end a session whose peer went away; `BatchMode=yes'
+fails instead of asking for a password the agent cannot type.  Nil
+passes no `-e' and rsync uses its own default."
+  :type '(choice (const nil) string (repeat string))
+  :group 'monk)
+
+(defun monk-rsync-transport-string (transport)
+  "Return TRANSPORT, a string or a list of words, as the one string rsync wants.
+rsync splits the `-e' value on spaces itself, so a word that holds a
+space cannot be passed; signal `monk-resource-error' for one."
+  (cond
+   ((or (null transport) (eq transport 'none)) nil)
+   ((stringp transport) transport)
+   ((listp transport)
+    (dolist (word transport)
+      (when (string-match-p "[[:space:]]" word)
+        (signal 'monk-resource-error
+                (list (format ":transport word %S holds a space; rsync cannot pass it" word)))))
+    (string-join transport " "))
+   (t (signal 'monk-resource-error (list (format ":transport must be a string or a list, not %S" transport))))))
+
 (defcustom monk-rsync-reach-port 22
   "TCP port a `:reachable' probe connects to."
   :type 'natnum
@@ -165,7 +198,16 @@ umask.  Without -t rsync re-stamps identical files on every run.")
             :documentation "Extra rsync arguments, verbatim.")
    (reachable :initarg :reachable
               :initform nil
-              :documentation "Host name to probe first.  Unreachable means skipped, not failed."))
+              :documentation "Host name to probe first.  Unreachable means skipped, not failed.")
+   (timeout :initarg :timeout
+            :initform 60
+            :documentation "Seconds without data before rsync gives up (`--timeout').
+0 or nil passes no limit (rsync's own meaning of 0); `monk-exec-timeout' still applies.")
+   (transport :initarg :transport
+              :initform 'default
+              :documentation "The remote shell for `-e': a string, a list of words, or
+the symbol `none' for rsync's own.  The symbol `default' (what a
+policy gets without `:transport') means `monk-rsync-default-transport'."))
   "A destination kept in step with sources through rsync.")
 
 (cl-defmethod monk-resource-available-p ((r monk-rsync-resource) (m monk-machine))
@@ -176,9 +218,26 @@ Both are availability, not policy: a mock run asks neither."
            (not (monk-host-reachable-p (oref r reachable)))
            (format "%s is not reachable" (oref r reachable)))))
 
+(defun monk--rsync-remote-side-p (r)
+  "Return non-nil when a source or the destination of R is HOST:PATH or rsync://."
+  (seq-some (lambda (path)
+              (or (string-prefix-p "rsync://" path)
+                  (string-match-p "\\`[^/]+:" path)))
+            (cons (oref r destination) (oref r sources))))
+
+(defun monk--rsync-timeout-arguments (r)
+  "Return the timeout arguments for R: `--timeout' and `-e ssh ...' when remote."
+  (let ((transport (monk-rsync-transport-string
+                    (if (eq (oref r transport) 'default) monk-rsync-default-transport (oref r transport)))))
+    (append (and (oref r timeout) (> (oref r timeout) 0)
+                 (list (format "--timeout=%d" (oref r timeout))))
+            (and transport (monk--rsync-remote-side-p r)
+                 (list "-e" transport)))))
+
 (defun monk--rsync-arguments (r m)
   "Return the rsync argument list for R on M, without the dry-run flags."
-  (append (and (oref r archive) '("-rlptD"))
+  (append (monk--rsync-timeout-arguments r)
+          (and (oref r archive) '("-rlptD"))
           (and (oref r recursive) (not (oref r archive)) '("-r"))
           (and (oref r follow-links) '("-L"))
           (and (oref r perms) (not (oref r archive)) '("-p" "-t"))
@@ -302,7 +361,9 @@ CHANGES: the two can differ when the source moved in between."
    (delete :type boolean :doc "--delete: remove destination files absent from the source.")
    (excludes :type list :doc "Patterns for --exclude.")
    (options :type list :doc "Extra rsync arguments, verbatim.")
-   (reachable :type string :doc "Host to probe on the ssh port first; unreachable means skipped.")))
+   (reachable :type string :doc "Host to probe on the ssh port first; unreachable means skipped.")
+   (timeout :type integer :doc "Seconds without data before rsync gives up (--timeout).  60 unless given; 0 for no limit.")
+   (transport :type any :doc "Remote shell for -e: a string, a list of words, or the symbol `none' for rsync's own.  `monk-rsync-default-transport' unless given.")))
 
 (monk-note-load 'monk-sync)
 (provide 'monk-sync)

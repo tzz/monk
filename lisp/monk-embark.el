@@ -119,8 +119,9 @@ names have, is read whole."
 A `*monk*' row, a heading with the `monk-ui-machine' property, or a
 symbol that names an inventory host in a Lisp buffer."
   (cond
-   ((and (derived-mode-p 'monk-ui-mode) (tabulated-list-get-id))
-    (cons 'monk-machine (cons (tabulated-list-get-id)
+   ((and (derived-mode-p 'monk-ui-mode) (monk-ui-machine-at-point)
+         (not (get-text-property (point) 'monk-ui-result)))
+    (cons 'monk-machine (cons (monk-ui-machine-at-point)
                               (cons (line-beginning-position) (line-end-position)))))
    ((or (get-text-property (point) 'monk-ui-machine)
         (get-text-property (line-beginning-position) 'monk-ui-machine))

@@ -425,13 +425,17 @@ so `~' in the policy lands there."
        (cons (= 8 (monk-run-count second monk-status-kept)) (monk-run-summary second))
        (cons (= 1 (monk-run-passes second)) "more than one pass")
        (cons (equal "reloaded\n" (monk-testdrive--text ".config/app/reloads")) "handler ran again")))
-    (monk-testdrive--step "converge" "report buffer shows one row, kept"
+    (monk-testdrive--step "converge" "report buffer shows the tree: local, the drive row, kept"
       (monk-ui-show second)
       (with-current-buffer (get-buffer monk-ui-buffer-name)
         (let ((text (buffer-substring-no-properties (point-min) (point-max))))
           (monk-testdrive--checks
-           (cons (string-match-p "^ ?drive " text) "no row for drive")
+           (cons (string-match-p "^. local (1)" text) "no local connection heading")
+           (cons (string-match-p "^  . drive " text) "no row for drive")
            (cons (string-match-p "kept" text) "no kept badge")
+           (cons (progn (goto-char (point-min)) (monk-ui-next-machine)
+                        (equal "drive" (monk-ui-machine-at-point)))
+                 "n does not land on the drive row")
            (cons (string-match-p "APPLY" (substring-no-properties (monk-ui--header-line))) "header lacks APPLY")))))))
 
 (defun monk-testdrive--section-plan ()
@@ -452,7 +456,7 @@ so `~' in the policy lands there."
       (with-current-buffer (get-buffer monk-ui-buffer-name)
         (monk-testdrive--checks
          (cons (string-match-p "PLAN" (substring-no-properties (monk-ui--header-line))) "header lacks PLAN")
-         (cons (equal "Would" (car (aref tabulated-list-format 4))) "column is not Would")
+         (cons (equal "Would" (car (aref monk-ui--columns 4))) "column is not Would")
          (cons (eq 'monk-ui-plan-badge
                    (get-text-property 1 'face (monk-ui--header-line)))
                "PLAN badge face missing"))))
@@ -489,7 +493,7 @@ so `~' in the policy lands there."
         (let* ((row (cadr (car (monk-ui--entries))))
                (cell (substring-no-properties (aref row 7))))
           (monk-testdrive--checks
-           (cons (= 9 (length tabulated-list-format)) "no Plan column")
+           (cons (= 9 (length monk-ui--columns)) "no Plan column")
            (cons (string-match-p "unfulfilled\\|○ 1\\|o 1" cell) (format "plan cell: %S" cell))
            (cons (string-match-p "from plan" (substring-no-properties (monk-ui--header-line)))
                  "header lacks 'from plan'")))))))
@@ -1535,7 +1539,7 @@ so `~' in the policy lands there."
     (monk-testdrive--step "tour" "PLAN header, purple badge, Would column, bar with two colors"
       (monk-ui-show (monk-plan m #'monk-testdrive--policy))
       (monk-testdrive--focus-monk)
-      (monk-testdrive--ask "Top line of the window (above the column names): a purple PLAN box, a bar, '◐ 3' and '✓ 5', and 'a to apply'.  In the row: Would column shows 3?"))
+      (monk-testdrive--ask "Top line of the window (above the column names): a purple PLAN box, a bar, '◐ 3' and '✓ 5', and 'a to apply'.  Below: a 'local (1)' heading, the drive row under it with Would 3, and under the row 'would-repair (3)' open with three resource lines and 'kept (5)' folded.  TAB on 'kept (5)': does it open?  S-TAB: does the tree fold to the drive row?"))
     (monk-testdrive--step "tour" "detail buffer: groups, fontified diff"
       (monk-testdrive--focus-detail "drive")
       (monk-testdrive--ask "Detail shows 'would-repair (3)' first with a colored diff for app.conf, then 'kept'?"))))
@@ -1761,7 +1765,7 @@ so `~' in the policy lands there."
         (monk-ui-show (monk-plan m #'monk-testdrive--policy))
         (monk-testdrive--focus-monk)
         (goto-char (point-min))
-        (while (and (not (tabulated-list-get-id)) (not (eobp))) (forward-line 1))
+        (monk-ui-next-machine)
         (monk-testdrive--ask "Point is on the drive row.  Press embark-act: does it say 'monk-machine' and offer . p i /?  Press i: does the inspector for drive open (q closes)?")))))
 
 (defun monk-testdrive--tour-connect ()

@@ -26,7 +26,7 @@ A policy is a function of one argument, the machine. Inside it, constructors des
 (monk-converge tutorial-m #'tutorial-policy-1)
 ```
 
-The `*monk*` buffer opens with one row per machine: a badge, a bar, counts, and time. `RET` on the row opens the detail buffer. The symlink target was expanded on the machine, so `~/dotfiles/zshrc` became an absolute path under the sandbox:
+The `*monk*` buffer opens as a tree: a `local` heading, under it one row per machine with a badge, a bar, counts, and time, and under the machine the status groups with their resources. `TAB` folds a heading. `RET` on the machine row opens the detail buffer. The symlink target was expanded on the machine, so `~/dotfiles/zshrc` became an absolute path under the sandbox:
 
 ```elisp
 (file-symlink-p (expand-file-name ".zshrc" tutorial-home))

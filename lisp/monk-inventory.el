@@ -40,7 +40,9 @@
 ;;          :hosts
 ;;          ((kamen :address "kamen.local" :user "pi"))))))))
 ;;
-;; A host with no :address is the local machine.  Any variable whose
+;; A host with no :address is the local machine.  :method names the
+;; TRAMP method that reaches a remote host ("ssh" unless given; "rpc"
+;; for tramp-rpc).  Any variable whose
 ;; value is t becomes a class on the machine.
 ;;
 ;; Select machines with `monk-inventory-select', which accepts a host
@@ -85,6 +87,7 @@
                    :address (plist-get host-plist :address)
                    :user (plist-get host-plist :user)
                    :port (plist-get host-plist :port)
+                   :method (plist-get host-plist :method)
                    :vars all-vars
                    :groups groups
                    :ignore-unreachable (and (cdr (assq 'ignore_unreachable all-vars)) t))

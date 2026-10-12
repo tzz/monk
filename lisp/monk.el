@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.6.10
+;; Version: 0.8.3
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -82,12 +82,12 @@
 
 ;;;; Version
 
-(defconst monk-version "0.6.10"
+(defconst monk-version "0.8.3"
   "Monk's version.  Patch for small work, minor for a large ask.
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-10-11.11"
+(defconst monk-build "2026-10-12.15"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -704,6 +704,10 @@ That means two or more resources disagree about the same state."
    (port :initarg :port
          :initform nil
          :documentation "SSH port for remote connections.")
+   (method :initarg :method
+           :initform nil
+           :documentation "TRAMP method for remote connections, a string
+such as \"ssh\" or \"rpc\".  Nil means `monk-tramp-method'.")
    (vars :initarg :vars
          :initform nil
          :documentation "Alist of inventory variables after group merge.")
@@ -815,6 +819,17 @@ The next compile gathers them again.  Ansible's --flush-cache."
   "Return non-nil when M belongs to GROUP, a symbol."
   (memq group (oref m groups)))
 
+(cl-defmethod monk-machine-method ((m monk-machine))
+  "Return the TRAMP method that reaches M: its own, else `monk-tramp-method'."
+  (or (oref m method) monk-tramp-method))
+
+(cl-defmethod monk-machine-connection ((m monk-machine))
+  "Return how M is reached: `local', or its TRAMP method as a symbol.
+`ssh' and `rpc' are the usual values.  Reports group machines by it."
+  (if (monk-machine-local-p m)
+      'local
+    (intern (monk-machine-method m))))
+
 (cl-defmethod monk-machine-remote-prefix ((m monk-machine) &optional sudo)
   "Return the TRAMP prefix for M.
 When SUDO is non-nil, add a sudo hop.  For the local host without
@@ -826,10 +841,11 @@ SUDO, return the empty string."
    (t
     (let ((host (concat (and (oref m user) (concat (oref m user) "@"))
                         (oref m address)
-                        (and (oref m port) (format "#%s" (oref m port))))))
+                        (and (oref m port) (format "#%s" (oref m port)))))
+          (method (monk-machine-method m)))
       (if sudo
-          (format "/%s:%s|%s::" monk-tramp-method host monk-tramp-sudo-method)
-        (format "/%s:%s:" monk-tramp-method host))))))
+          (format "/%s:%s|%s::" method host monk-tramp-sudo-method)
+        (format "/%s:%s:" method host))))))
 
 (cl-defmethod monk-machine-path ((m monk-machine) path &optional sudo)
   "Return PATH as seen from the controller for machine M.
@@ -891,11 +907,35 @@ SUDO, `~' is the home of root."
   "Return non-nil when EXEC exited with zero."
   (eql 0 (monk-exec-exit-code exec)))
 
+(defcustom monk-exec-timeout 600
+  "Seconds a command may run before Monk kills it and reports exit 124.
+The limit a shell's `timeout' gives.  One rsync against a silent peer
+ran for 1835 s on 2026-10-12; every other resource and every agent
+request waited behind it.  Nil means no limit.  A resource that needs
+longer passes `:timeout SECONDS' to `monk-exec'."
+  :type '(choice (const nil) natnum))
+
+(defconst monk-exec-timeout-exit 124
+  "Exit code of a command Monk stopped at its timeout; `timeout(1)' uses it too.")
+
+(defconst monk-exec-poll-seconds 0.1
+  "How long one wait on a running command lasts before timers and sockets run.")
+
+(defvar monk-exec-yield-functions nil
+  "Functions called while a command runs, between waits, with no arguments.
+The agent uses it to serve socket requests during a converge.  The
+functions must not start a run.")
+
 (cl-defgeneric monk-exec (machine program &rest args)
   "Run PROGRAM with ARGS on MACHINE.  Return a `monk-exec'.
 ARGS can end with keyword pairs: :sudo BOOL to run as root, :input
 STRING to send on standard input, :directory PATH to run in a
-directory on MACHINE.")
+directory on MACHINE, :timeout SECONDS to override `monk-exec-timeout'.
+While the command runs, timers and process filters run too: the
+command is an asynchronous process that this function waits on in
+short steps, so an agent answers its socket in the middle of a long
+converge.  A sudo command on a remote host runs synchronously through
+`process-file', where TRAMP's password handling lives.")
 
 (cl-defgeneric monk-exec-string (machine program &rest args)
   "Run PROGRAM with ARGS on MACHINE and return trimmed output.
@@ -905,7 +945,7 @@ Signal `monk-exec-error' on non-zero exit.")
   "Run PROGRAM with ARGS on MACHINE and return output lines.")
 
 (cl-defmethod monk-exec ((m monk-machine) program &rest args)
-  (let (sudo input directory)
+  (let ((sudo nil) (input nil) (directory nil) (timeout monk-exec-timeout))
     (when (and args (keywordp (car (last args))))
       (signal 'monk-exec-error (list "Keyword without a value" (car (last args)))))
     (while (and (>= (length args) 2) (keywordp (car (last args 2))))
@@ -916,6 +956,7 @@ Signal `monk-exec-error' on non-zero exit.")
           (:sudo (setq sudo value))
           (:input (setq input value))
           (:directory (setq directory value))
+          (:timeout (setq timeout value))
           (_ (signal 'monk-exec-error (list "Unknown keyword" key))))))
     (let ((default-directory (cond
                               (directory
@@ -932,14 +973,11 @@ Signal `monk-exec-error' on non-zero exit.")
       (with-temp-buffer
         (let ((code
                (condition-case err
-                   (if input
-                       (let ((stdin (make-temp-file "monk-stdin")))
-                         (unwind-protect
-                             (progn
-                               (with-temp-file stdin (insert input))
-                               (apply #'process-file program stdin t nil args))
-                           (delete-file stdin)))
-                     (apply #'process-file program nil t nil args))
+                   (if (and sudo (not (monk-machine-local-p m)))
+                       ;; remote sudo: TRAMP's synchronous path knows
+                       ;; how to answer the password prompt
+                       (monk-exec--synchronous program args input)
+                     (monk-exec--yielding program args input timeout))
                  ;; A missing program is an exit like any other, code
                  ;; 127 as the shell would say, so callers that test
                  ;; `monk-exec-ok-p' need no separate error path.
@@ -949,6 +987,52 @@ Signal `monk-exec-error' on non-zero exit.")
           (monk-exec-create :command (cons program args)
                             :exit-code code
                             :output (buffer-string)))))))
+
+(defun monk-exec--synchronous (program args input)
+  "Run PROGRAM with ARGS through `process-file', output into the current buffer.
+INPUT, when non-nil, is its standard input.  Return the exit code."
+  (if input
+      (let ((stdin (make-temp-file "monk-stdin")))
+        (unwind-protect
+            (progn
+              (with-temp-file stdin (insert input))
+              (apply #'process-file program stdin t nil args))
+          (delete-file stdin)))
+    (apply #'process-file program nil t nil args)))
+
+(cl-defun monk-exec--yielding (program args input timeout)
+  "Run PROGRAM with ARGS as a process, output into the current buffer.
+Wait in steps of `monk-exec-poll-seconds', so timers and other
+process filters run meanwhile, and call `monk-exec-yield-functions'
+between steps.  INPUT goes to standard input.  After TIMEOUT seconds
+the process is killed and `monk-exec-timeout-exit' is returned, with
+a note at the end of the output.  `make-process' with `:file-handler'
+runs through TRAMP on a remote `default-directory'."
+  (let* ((buffer (current-buffer))
+         (process-connection-type nil)
+         (proc (make-process :name (concat "monk-" (file-name-nondirectory program))
+                             :buffer buffer
+                             :command (cons program args)
+                             :connection-type 'pipe
+                             :noquery t
+                             :file-handler t
+                             :sentinel #'ignore))
+         (deadline (and timeout (+ (float-time) timeout))))
+    (when input
+      (process-send-string proc input))
+    (process-send-eof proc)
+    (while (process-live-p proc)
+      (accept-process-output proc monk-exec-poll-seconds)
+      (run-hooks 'monk-exec-yield-functions)
+      (when (and deadline (> (float-time) deadline) (process-live-p proc))
+        (delete-process proc)
+        (with-current-buffer buffer
+          (goto-char (point-max))
+          (insert (format "\nmonk: %s stopped after %ds (monk-exec-timeout)\n" program timeout)))
+        (cl-return-from monk-exec--yielding monk-exec-timeout-exit)))
+    ;; a last drain: output that arrived with the exit
+    (accept-process-output proc 0)
+    (process-exit-status proc)))
 
 (cl-defmethod monk-exec-string ((m monk-machine) program &rest args)
   (let ((exec (apply #'monk-exec m program args)))
@@ -1178,6 +1262,60 @@ Keys are `classes' (list), `groups' (list), `facts' (alist), and
           (cons 'groups (oref m groups))
           (cons 'facts (sort (copy-sequence (oref m facts)) by-key))
           (cons 'vars (sort (copy-sequence (oref m vars)) by-key)))))
+
+(defvar monk-object--layouts nil
+  "Slot layouts EIEIO classes had in this process.
+Entries are ((CLASS . COUNT) . NAMES).
+A `defvar', so it survives a reload of this file; each load of a class
+adds the layout it defines.  `monk-object-rebuild' reads an old object
+through the layout of its own length.")
+
+(defun monk-object-note-layout (class)
+  "Record the slot layout of CLASS as defined now."
+  (let* ((names (mapcar #'eieio-slot-descriptor-name (eieio-class-slots class)))
+         (key (cons class (length names))))
+    (unless (equal (cdr (assoc key monk-object--layouts)) names)
+      (push (cons key names) monk-object--layouts))))
+
+(defun monk-object-stale-p (object)
+  "Return non-nil when OBJECT was built by an older definition of its class.
+An EIEIO object is a record of the slot values by position; a class
+redefined with another slot count leaves old objects reading the
+wrong slots (2026-10-11: a new `method' slot on `monk-machine' made
+the agent read a time value as the `groups' list on every converge
+after a reload)."
+  (not (= (1- (length object))
+          (length (eieio-class-slots (eieio-object-class object))))))
+
+(defun monk-object-rebuild (object)
+  "Return OBJECT as an instance of the current definition of its class.
+OBJECT itself when it is current.  Else a fresh instance with the slot
+values of OBJECT placed by name, read through the layout OBJECT was
+built with.  A slot OBJECT lacks takes its default; a slot the class
+lost is dropped.  With no recorded layout for OBJECT's length, signal
+an error: guessing would be worse than a restart."
+  (if (not (monk-object-stale-p object))
+      object
+    (let* ((class (eieio-object-class object))
+           (count (1- (length object)))
+           (names (or (cdr (assoc (cons class count) monk-object--layouts))
+                      (error "%s has %d slots and no layout is known for that; restart"
+                             class count)))
+           (current (mapcar #'eieio-slot-descriptor-name (eieio-class-slots class)))
+           (new (make-instance class))
+           (i 1))
+      (dolist (name names)
+        (when (memq name current)
+          (eieio-oset new name (aref object i)))
+        (cl-incf i))
+      new)))
+
+(monk-object-note-layout 'monk-machine)
+
+(defun monk-machine-rebuild (m)
+  "Return M as an object of the current `monk-machine' class.
+See `monk-object-rebuild'."
+  (monk-object-rebuild m))
 
 (defun monk-machine-describe-string (m &optional indent)
   "Return `monk-machine-describe' of M as text, each line after INDENT."

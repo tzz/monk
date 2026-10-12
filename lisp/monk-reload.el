@@ -58,6 +58,8 @@
 (defvar monk-version)
 (defvar monk-build)
 (defvar monk-report-function)
+(defvar monk-inventory)
+(defvar monk-agent--machine)
 (defvar monk-progress-functions)
 (require 'seq)
 
@@ -150,20 +152,27 @@ Bodies from earlier loads would run again with stale closures."
                    ;; the status line
                    :events (monk-watch-events w)
                    :runs (monk-watch-runs w)
-                   :started (monk-watch-started w))
+                   :started (monk-watch-started w)
+                   :unmanaged (bound-and-true-p monk-watch--unmanaged-count)
+                   :by-directory (bound-and-true-p monk-watch--unmanaged-by-directory))
         (monk-watch-stop)))))
 
 (defun monk-reload--restore-watch (snapshot)
-  "Start a watch again from SNAPSHOT, a plist from `monk-reload--snapshot-watch'."
+  "Start a watch again from SNAPSHOT, a plist from `monk-reload--snapshot-watch'.
+The machines are rebuilt first: a reload that changed the class of
+`monk-machine' leaves the old objects with shifted slots."
   (when (and snapshot (fboundp 'monk-watch-start))
     (setq monk-watch-mode (plist-get snapshot :mode))
-    (let ((w (apply #'monk-watch-start (plist-get snapshot :machines) (plist-get snapshot :policy)
+    (let ((w (apply #'monk-watch-start
+                    (mapcar (intern "monk-machine-rebuild") (plist-get snapshot :machines))
+                    (plist-get snapshot :policy)
                     (plist-get snapshot :options))))
       (when (and w (plist-get snapshot :started))
         ;; struct setters by name: this file loads before monk-watch and
         ;; must not depend on its accessors at compile time
         (funcall (intern "monk-watch--carry-over") w (plist-get snapshot :events)
-                 (plist-get snapshot :runs) (plist-get snapshot :started)))
+                 (plist-get snapshot :runs) (plist-get snapshot :started)
+                 (plist-get snapshot :unmanaged) (plist-get snapshot :by-directory)))
       w)))
 
 (defun monk-reload--refresh-buffers ()
@@ -248,6 +257,11 @@ With VERBOSE, list each file as it loads."
              (push (cons feature (error-message-string err)) failed))))))
     (when (boundp 'monk-watch--delivery)
       (setq monk-watch--delivery nil))
+    ;; machines held outside any run: the agent's own, the inventory
+    (when (and (boundp 'monk-inventory) monk-inventory (fboundp 'monk-machine-rebuild))
+      (setq monk-inventory (mapcar #'monk-machine-rebuild monk-inventory)))
+    (when (and (boundp 'monk-agent--machine) monk-agent--machine (fboundp 'monk-machine-rebuild))
+      (setq monk-agent--machine (funcall 'monk-machine-rebuild monk-agent--machine)))
     (when report-function
       (setq monk-report-function report-function))
     (when (and cli-on (fboundp 'monk-cli-enable))

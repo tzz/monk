@@ -389,12 +389,38 @@ after a few, the count in `monk-watch-status' is the record.")
 (defvar monk-watch--unmanaged-count 0
   "Unmanaged events seen since the watch started.")
 
+(defvar monk-watch--unmanaged-by-directory nil
+  "Alist of (DIRECTORY . COUNT): where the unmanaged events came from.
+20,000 events in two hours with 0 runs (2026-10-12) needed this to
+say which directory was the noise.")
+
+(defconst monk-watch-noisy-directories-shown 3
+  "How many noisy directories the stop line and the status name.")
+
+(defun monk-watch-noisy-directories (&optional n)
+  "Return the N (default `monk-watch-noisy-directories-shown') busiest
+unmanaged directories as ((DIRECTORY . COUNT) ...), busiest first."
+  (seq-take (sort (copy-sequence monk-watch--unmanaged-by-directory)
+                  (lambda (a b) (> (cdr a) (cdr b))))
+            (or n monk-watch-noisy-directories-shown)))
+
+(defun monk-watch--noisy-directories-string ()
+  "Return the busiest unmanaged directories as text, or \"\" when none."
+  (let ((top (monk-watch-noisy-directories)))
+    (if (null top)
+        ""
+      (format "; unmanaged mostly from %s"
+              (mapconcat (lambda (c) (format "%s (%d)" (abbreviate-file-name (car c)) (cdr c)))
+                         top ", ")))))
+
 (defun monk-watch--unmanaged (watch file action)
   "Note that WATCH saw ACTION on FILE, which no resource owns.
 The first few are logged by name, at info, so a watch that looks dead
-can be checked; after that only the count grows."
+can be checked; after that only the counts grow, per directory."
   (ignore watch)
   (cl-incf monk-watch--unmanaged-count)
+  (let ((dir (file-name-directory (directory-file-name file))))
+    (cl-incf (alist-get dir monk-watch--unmanaged-by-directory 0 nil #'equal)))
   (unless (member file monk-watch--unmanaged-seen)
     (push file monk-watch--unmanaged-seen)
     (cond
@@ -625,7 +651,8 @@ machines get filesystem notifications; remote ones are polled every
       (setf (monk-watch-poll-timer watch)
             (run-at-time monk-watch-poll-interval monk-watch-poll-interval #'monk-watch--poll)))
     (setq monk-watch--unmanaged-seen nil
-          monk-watch--unmanaged-count 0)
+          monk-watch--unmanaged-count 0
+          monk-watch--unmanaged-by-directory nil)
     (let ((remote (length (seq-remove #'monk-machine-local-p machines)))
           (local (length (seq-filter #'monk-machine-local-p machines))))
       (monk-watch--log "started: %s, %s%s, mode %s"
@@ -671,9 +698,11 @@ machines get filesystem notifications; remote ones are polled every
         (cancel-timer (monk-watch-poll-timer watch)))
       (monk-watch--cancel-repath watch)
       (setq monk-watch--current nil)
-      (monk-watch--log "stopped after %d event%s, %d run%s"
+      (monk-watch--log "stopped after %d event%s (%d unmanaged), %d run%s%s"
                        (monk-watch-events watch) (if (= 1 (monk-watch-events watch)) "" "s")
-                       (monk-watch-runs watch) (if (= 1 (monk-watch-runs watch)) "" "s"))
+                       monk-watch--unmanaged-count
+                       (monk-watch-runs watch) (if (= 1 (monk-watch-runs watch)) "" "s")
+                       (monk-watch--noisy-directories-string))
       (run-hook-with-args 'monk-watch-functions 'stopped (list :watch watch)))))
 
 ;;;###autoload
@@ -684,12 +713,15 @@ machines get filesystem notifications; remote ones are polled every
   (monk-watch--log "mode %s" monk-watch-mode)
   (message "Monk watch: %s" monk-watch-mode))
 
-(defun monk-watch--carry-over (watch events runs started)
+(defun monk-watch--carry-over (watch events runs started &optional unmanaged by-directory)
   "Give WATCH the EVENTS and RUNS counts and the STARTED time of an earlier watch.
-A reload stops and starts the watch; the status line must not forget."
+UNMANAGED and BY-DIRECTORY carry the unmanaged counts.  A reload stops
+and starts the watch; the status line must not forget."
   (setf (monk-watch-events watch) events
         (monk-watch-runs watch) runs
-        (monk-watch-started watch) started))
+        (monk-watch-started watch) started)
+  (when unmanaged (setq monk-watch--unmanaged-count unmanaged))
+  (when by-directory (setq monk-watch--unmanaged-by-directory by-directory)))
 
 (defun monk-watch--path-signature (nodes)
   "Return the real paths every local node in NODES owns, sorted.
@@ -726,11 +758,12 @@ run is in progress; the next tick looks again."
   "Return a one-line description of the active watch, or nil."
   (when monk-watch--current
     (let ((w monk-watch--current))
-      (format "%s, %s, %d dir(s), %d event(s) (%d unmanaged), %d run(s), up %s"
+      (format "%s, %s, %d dir(s), %d event(s) (%d unmanaged), %d run(s), up %s%s"
               monk-watch-mode (or (monk-watch-backend w) "no local backend")
               (length (monk-watch-watched w))
               (monk-watch-events w) monk-watch--unmanaged-count (monk-watch-runs w)
-              (monk-format-duration (float-time (time-since (monk-watch-started w))) t)))))
+              (monk-format-duration (float-time (time-since (monk-watch-started w))) t)
+              (monk-watch--noisy-directories-string)))))
 
 (monk-note-load 'monk-watch)
 (provide 'monk-watch)

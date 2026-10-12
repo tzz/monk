@@ -120,6 +120,33 @@
     (should-error (monk-exec m "true" :bogus t) :type 'monk-exec-error)
     (should (equal "/" (monk-exec-string m "pwd" :directory "/")))))
 
+(ert-deftest monk-test-exec-yields-and-times-out ()
+  "A command runs as a process Monk waits on in steps: the yield hook
+and timers run meanwhile, stderr is captured, and a command past its
+timeout is killed with exit 124 and a note."
+  (let* ((m (monk-local-machine))
+         (yields 0)
+         (timer-fired nil)
+         (monk-exec-yield-functions (list (lambda () (cl-incf yields)))))
+    ;; a timer fires during the command: the agent's socket would too
+    (run-at-time 0.2 nil (lambda () (setq timer-fired t)))
+    (let ((exec (monk-exec m "sh" "-c" "echo out; echo err >&2; sleep 0.6; exit 2")))
+      (should (eql 2 (monk-exec-exit-code exec)))
+      (should (string-match-p "out" (monk-exec-output exec)))
+      (should (string-match-p "err" (monk-exec-output exec)))
+      (should (> yields 2))
+      (should timer-fired))
+    ;; the limit
+    (let* ((start (float-time))
+           (exec (monk-exec m "sleep" "30" :timeout 1)))
+      (should (eql monk-exec-timeout-exit (monk-exec-exit-code exec)))
+      (should (string-match-p "stopped after 1s" (monk-exec-output exec)))
+      (should (< (- (float-time) start) 5)))
+    ;; the default limit is on, so a resource cannot hang a converge
+    (should (natnump monk-exec-timeout))
+    ;; input still works through the pipe
+    (should (equal "piped" (monk-exec-output (monk-exec m "cat" :input "piped"))))))
+
 (ert-deftest monk-test-compile-collects-in-order ()
   (let ((resources (monk-compile (monk-test-machine)
                                  (lambda (_m)
@@ -1162,9 +1189,243 @@ A :degree threshold on a require lets a follower run anyway."
         (should (string-match-p "1/1" (substring-no-properties (monk-ui--header-line))))
         ;; The summary owns the header line; the column names are in the body.
         (should (equal '(:eval (monk-ui--header-line)) header-line-format))
-        (should-not tabulated-list-use-header-line)
-        (should (string-match-p "\\` ?Machine +State" (buffer-substring-no-properties
-                                                         (point-min) (line-end-position))))))))
+        (should (string-match-p "\\` *Machine +State" (buffer-substring-no-properties
+                                                         (point-min) (line-end-position))))
+        ;; the tree: connection -> machine -> status -> resource
+        (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+          (should (string-match-p "^. local (1)\n  . testbox " text))
+          (should (string-match-p "repaired (1)" text))
+          (should (string-match-p (regexp-quote (concat dir "d")) text)))
+        ;; a machine row carries its name for the keys; a kept group starts folded
+        (goto-char (point-min))
+        (monk-ui-next-machine)
+        (should (equal "testbox" (monk-ui-machine-at-point)))
+        ;; a fold survives a refresh
+        (monk-ui-toggle-fold)
+        (should (monk-ui--fold-closed-p (point)))
+        (monk-ui-refresh)
+        (should (equal "testbox" (monk-ui-machine-at-point)))
+        (should (monk-ui--fold-closed-p (point)))))))
+
+(ert-deftest monk-test-ui-tree-groups-by-connection-and-scope ()
+  "Machines group under their connection; results under a machine group by scope."
+  (require 'monk-ui)
+  (monk-test-with-tmpdir dir
+    (let* ((local (monk-test-machine))
+           (far (monk-local-machine :name "far"))
+           (monk-ui-style 'text)
+           (monk-log-level nil))
+      (oset far address "far.invalid") (oset far method "rpc")
+      (oset far facts monk-test-fake-facts) (oset far classes (monk-hard-classes far))
+      (should (eq 'local (monk-machine-connection local)))
+      (should (eq 'rpc (monk-machine-connection far)))
+      (should (equal "/rpc:far.invalid:" (monk-machine-remote-prefix far)))
+      ;; a run with one user and one sudo result on the local machine, and
+      ;; a stand-in result on far: built by hand, no connection is made
+      (let ((run (monk-run-create :machines (list local far) :dry-run t :passes 1)))
+        (setf (monk-run-results run)
+              (list (monk-result-create :machine "testbox" :name (concat dir "a") :type "directory"
+                                        :status monk-status-kept :scope monk-scope-user)
+                    (monk-result-create :machine "testbox" :name (concat dir "b") :type "directory"
+                                        :status monk-status-would-repair :scope monk-scope-sudo)
+                    (monk-result-create :machine "far" :name "/x" :type "directory"
+                                        :status monk-status-kept :scope monk-scope-user)))
+        (with-temp-buffer
+          (monk-ui-mode)
+          (setq monk-ui--run run)
+          (monk-ui-refresh)
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match "^. local (1)" text))
+            (should (string-match "^. rpc (1)" text))
+            (should (< (string-match "local (1)" text) (string-match "rpc (1)" text)))
+            ;; two scopes on testbox: scope headings appear
+            (should (string-match-p "^      . user (1)" text))
+            (should (string-match-p "^      . sudo (1)" text))
+            ;; one scope on far: no scope heading, straight to the status group
+            (let ((far-part (substring text (string-match "rpc (1)" text))))
+              (should-not (string-match-p "user (1)" far-part))
+              (should (string-match-p "kept (1)" far-part))))
+          ;; n/p walk the machine rows
+          (goto-char (point-min))
+          (monk-ui-next-machine)
+          (should (equal "testbox" (monk-ui-machine-at-point)))
+          (monk-ui-next-machine)
+          (should (equal "far" (monk-ui-machine-at-point)))
+          (monk-ui-previous-machine)
+          (should (equal "testbox" (monk-ui-machine-at-point)))
+          ;; S-TAB folds every machine to its row
+          (monk-ui-fold-all)
+          (should (monk-ui--fold-closed-p (point)))
+          (monk-ui-fold-all t)
+          ;; point on a result line stays on that result across a redraw
+          (goto-char (point-min))
+          (search-forward (concat dir "b"))
+          (beginning-of-line)
+          (let ((key (monk-result-key (get-text-property (point) 'monk-ui-result))))
+            (monk-ui-refresh)
+            (should (equal key (monk-result-key (get-text-property (line-beginning-position) 'monk-ui-result)))))
+          ;; nested folds keep their own state: open kept, fold the
+          ;; machine, unfold it: would-repair is still open, kept still open,
+          ;; and a group folded by hand stays folded
+          (goto-char (point-min))
+          (re-search-forward "would-repair (1)") (beginning-of-line)
+          (monk-ui-toggle-fold)
+          (should (monk-ui--fold-closed-p (point)))
+          (goto-char (point-min))
+          (monk-ui-next-machine)
+          (monk-ui-toggle-fold)
+          (should (monk-ui--fold-closed-p (point)))
+          (monk-ui-toggle-fold)
+          (should-not (monk-ui--fold-closed-p (point)))
+          (goto-char (point-min))
+          (re-search-forward "would-repair (1)") (beginning-of-line)
+          (should (monk-ui--fold-closed-p (point)))
+          (should (invisible-p (1+ (line-end-position))))
+          (monk-ui-toggle-fold)
+          (should-not (invisible-p (1+ (line-end-position))))
+          ;; point inside a folded kept body while the cursor is drawn on
+          ;; the skipped heading below: TAB acts on skipped, not kept
+          (goto-char (point-min))
+          (re-search-forward "kept (1)") (beginning-of-line)
+          (monk-ui-toggle-fold)
+          (let ((kept-h (point)))
+            (forward-line 1)
+            (should (invisible-p (point)))
+            (monk-ui-toggle-fold)
+            (should (monk-ui--fold-closed-p kept-h))
+            ;; point moved to the next visible heading (sudo here) and
+            ;; TAB toggled that one, not kept
+            (let ((next-h (monk-ui--fold-heading-at (line-beginning-position))))
+              (should next-h)
+              (should-not (eq next-h kept-h))
+              (should (monk-ui--fold-closed-p next-h))
+              (monk-ui-toggle-fold)
+              (should-not (monk-ui--fold-closed-p next-h)))
+            (goto-char kept-h)
+            (monk-ui-toggle-fold)
+            (should-not (monk-ui--fold-closed-p kept-h)))
+          ;; the enclosing heading of a line inside a folded kept body
+          ;; is kept, not the machine (the walk used to stop one level up)
+          (goto-char (point-min))
+          (re-search-forward "kept (1)") (beginning-of-line)
+          (let ((kept-h (point)))
+            (monk-ui-toggle-fold)
+            (forward-line 1)
+            (should (eq (monk-ui--enclosing-heading (point)) kept-h))
+            (goto-char kept-h)
+            (monk-ui-toggle-fold)
+            (should-not (monk-ui--fold-closed-p kept-h)))
+          ;; TAB on the last status heading at column 0, and on the blank
+          ;; line after the tree (acts on the heading above)
+          (goto-char (point-min))
+          (re-search-forward "skipped\\|kept (1)" nil t)
+          (goto-char (point-max))
+          (should (bolp))
+          (let ((heading (monk-ui--enclosing-heading (point))))
+            (should heading)
+            (monk-ui-toggle-fold)
+            (should (monk-ui--fold-closed-p heading))
+            (monk-ui-toggle-fold)
+            (should-not (monk-ui--fold-closed-p heading)))
+          ;; point on a status heading stays on it; TAB at column 0 folds it
+          (goto-char (point-min))
+          (re-search-forward "kept (1)")
+          (beginning-of-line)
+          (let ((id (monk-ui--fold-id-at (point))))
+            (should id)
+            (monk-ui-toggle-fold)
+            (should (monk-ui--fold-closed-p (monk-ui--fold-heading-at (point))))
+            (monk-ui-refresh)
+            (should (eq id (monk-ui--fold-id-at (line-beginning-position))))
+            (should (monk-ui--fold-closed-p (monk-ui--fold-heading-at (line-beginning-position))))))))))
+
+(ert-deftest monk-test-ui-display-modes-and-quit-restores-layout ()
+  "`monk-ui-display' picks the window; q after full-frame restores the layout."
+  (require 'monk-ui)
+  (skip-unless (not noninteractive))
+  (let ((run (monk-run-create :machines (list (monk-test-machine)) :dry-run t :passes 1))
+        (monk-ui-style 'text))
+    (delete-other-windows)
+    (split-window-right)
+    (let ((windows-before (length (window-list))))
+      (let ((monk-ui-display 'full-frame))
+        (monk-ui-report run)
+        (should (= 1 (length (window-list))))
+        (should (eq (current-buffer) (get-buffer monk-ui-buffer-name)))
+        (monk-ui-quit)
+        (should (= windows-before (length (window-list)))))
+      (let ((monk-ui-display 'pop))
+        (monk-ui-report run)
+        (should (get-buffer-window monk-ui-buffer-name))
+        (quit-window)))))
+
+(ert-deftest monk-test-ui-fold-walk-terminates ()
+  "TAB twice on every line of a large tree ends, keeps the buffer size,
+and never grows undo: one TAB left 24 MB of undo and a hung Emacs
+(2026-10-12), from a heading walk that did not move backward."
+  (require 'monk-ui)
+  (monk-test-with-tmpdir dir
+    (let* ((policy (lambda (_m)
+                     (dotimes (i 30) (monk-directory (format "%sd%d" dir i)))
+                     (monk-directory (concat dir "x") :when '(= 1 2))))
+           (m (monk-test-machine))
+           (monk-ui-style 'text)
+           (monk-log-level nil))
+      (monk-converge m policy)
+      (with-current-buffer (monk-ui-show (monk-converge m policy))
+        (should (eq buffer-undo-list t))
+        (let ((size (buffer-size)) (lines (count-lines (point-min) (point-max))) (steps 0))
+          (goto-char (point-min))
+          (while (and (not (eobp)) (< steps 500))
+            (cl-incf steps)
+            (with-timeout (2 (ert-fail (format "TAB hung on %S" (buffer-substring-no-properties (line-beginning-position) (line-end-position)))))
+              (ignore-errors (monk-ui-toggle-fold))
+              (ignore-errors (monk-ui-toggle-fold)))
+            ;; move like C-n does: past hidden text
+            (let ((line-move-visual nil)) (ignore-errors (next-line 1)))
+            (when (invisible-p (point)) (goto-char (next-single-char-property-change (point) 'invisible))))
+          (should (< steps 500))
+          (should (= size (buffer-size)))
+          (should (= lines (count-lines (point-min) (point-max)))))))))
+
+(ert-deftest monk-test-ui-unasked-runs-do-not-pop-the-window ()
+  "A run nobody asked for updates *monk* but never brings it up.
+In batch there are no windows, so this checks the decision itself."
+  (require 'monk-ui)
+  (let* ((buffer (monk-ui-show (monk-run-create :machines (list (monk-test-machine)) :dry-run t :passes 1)))
+         (shown nil))
+    (cl-letf (((symbol-function 'get-buffer-window) (lambda (&rest _) nil))
+              ((symbol-function 'display-buffer) (lambda (&rest _) (setq shown 'pop) 'window))
+              ((symbol-function 'pop-to-buffer) (lambda (&rest _) (setq shown 'full) nil))
+              ((symbol-function 'selected-window) (lambda () 'window)))
+      (dolist (mode '(full-frame pop))
+        (let ((monk-ui-display mode))
+          ;; unasked under when-visible: nothing is shown
+          (setq shown nil)
+          (let ((monk-ui-show-unasked-runs 'when-visible))
+            (should-not (monk-ui-display-buffer buffer t))
+            (should-not shown))
+          ;; unasked under nil: nothing either
+          (let ((monk-ui-show-unasked-runs nil))
+            (should-not (monk-ui-display-buffer buffer t))
+            (should-not shown))
+          ;; unasked under t: shown as any run
+          (let ((monk-ui-show-unasked-runs t))
+            (should (monk-ui-display-buffer buffer t))
+            (should shown))
+          ;; asked: shown
+          (setq shown nil)
+          (should (monk-ui-display-buffer buffer nil))
+          (should shown))))))
+
+(ert-deftest monk-test-ui-display-buffer-in-batch ()
+  "In batch, `monk-ui-display-buffer' returns a window for every mode and keeps an existing one."
+  (require 'monk-ui)
+  (let ((buffer (monk-ui-show (monk-run-create :machines (list (monk-test-machine)) :dry-run t :passes 1))))
+    (dolist (mode '(full-frame pop same-window auto))
+      (let ((monk-ui-display mode))
+        (should (window-live-p (monk-ui-display-buffer buffer)))
+        (should (eq (monk-ui-display-buffer buffer) (get-buffer-window buffer)))))))
 
 ;;;; Bridge parsing
 
@@ -1421,12 +1682,12 @@ inside a walked tree is dropped, and ~ itself is never walked."
   ":archive is -rlptD, never -o -g: a user cannot chown and the run would flap."
   (require 'monk-sync)
   (let* ((m (monk-test-machine))
-         (r (monk-rsync-resource :name "x" :sources '("/s/") :destination "/d/" :archive t :delete t)))
+         (r (monk-rsync-resource :name "x" :sources '("/s/") :destination "/d/" :archive t :delete t :timeout nil)))
     (should (equal '("-rlptD" "--delete" "/s/" "/d/") (monk--rsync-arguments r m)))
     (should (equal '("-r" "-L" "-p" "-t" "/s/" "/d/")
                    (monk--rsync-arguments
                     (monk-rsync-resource :name "y" :sources '("/s/") :destination "/d/"
-                                         :recursive t :follow-links t :perms t)
+                                         :recursive t :follow-links t :perms t :timeout nil)
                     m)))))
 
 (ert-deftest monk-test-rsync-perms-converges-with-old-mtimes ()
@@ -1861,16 +2122,16 @@ change appears, and one resource fails."
         (monk-ui-mode)
         (setq monk-ui--run plan)
         (monk-ui-refresh)
-        (should (equal "Would" (car (aref tabulated-list-format 4))))
-        (should (= 8 (length tabulated-list-format)))
+        (should (equal "Would" (car (aref monk-ui--columns 4))))
+        (should (= 8 (length monk-ui--columns)))
         (let ((header (substring-no-properties (monk-ui--header-line))))
           (should (string-match-p "PLAN" header))
           (should (string-match-p "to apply" header)))
         (let ((apply (monk-apply plan)))
           (setq monk-ui--run apply)
           (monk-ui-refresh)
-          (should (= 9 (length tabulated-list-format)))
-          (should (equal "Plan" (car (aref tabulated-list-format 7))))
+          (should (= 9 (length monk-ui--columns)))
+          (should (equal "Plan" (car (aref monk-ui--columns 7))))
           (let ((row (cadr (car (monk-ui--entries)))))
             (should (equal "= as planned" (substring-no-properties (aref row 7)))))
           (let ((header (substring-no-properties (monk-ui--header-line))))
@@ -4218,7 +4479,7 @@ the run is not ok, and the exit code says 4."
             (monk-ui-refresh)
             ;; machine row in *monk*
             (goto-char (point-min))
-            (forward-line 1)
+            (monk-ui-next-machine)
             (save-window-excursion
               (monk-ui-find-definition)
               (should (equal (buffer-file-name) inventory-file)))
@@ -4965,8 +5226,7 @@ the run is not ok, and the exit code says 4."
             (other (ert-fail (format "no result target: %S" other)))))
         (with-current-buffer (monk-ui-show run)
           (goto-char (point-min))
-          ;; the first row with an id: the header line is not an entry
-          (while (and (not (tabulated-list-get-id)) (not (eobp))) (forward-line 1))
+          (monk-ui-next-machine)
           (pcase (monk-embark-machine-target)
             (`(monk-machine ,name . ,_) (should (equal "testbox" name)))
             (other (ert-fail (format "no machine target: %S" other)))))))))
@@ -5267,6 +5527,30 @@ the run is not ok, and the exit code says 4."
           ;; and it reaches the event record
           (should (alist-get 'evidence (alist-get 'changes (monk-event-result r run)))))))))
 
+(ert-deftest monk-test-agent-reload-drops-the-monk-reload-message ()
+  "The agent prints its own reload line; `monk-reload's \"monk: ...\" message
+must not reach stderr, where it lands behind the terminal's idle line.
+The message is sent as (message \"%s\" summary), so the filter must look
+at the formatted text, not the format string (2026-10-11)."
+  (require 'monk-agent)
+  (let ((seen nil)
+        (monk-agent-policy-file nil)
+        (monk-agent-source-watch nil)
+        (monk-agent--server t)
+        (monk-log-level nil))
+    (cl-letf* ((real (symbol-function 'message))
+               ((symbol-function 'message)
+                (lambda (fmt &rest args)
+                  (when fmt (push (apply #'format-message fmt args) seen))
+                  nil))
+               ((symbol-function 'monk-stale-libraries) (lambda () '((monk-sync . 3))))
+               ((symbol-function 'monk-reload)
+                (lambda (&rest _) (message "%s" "monk: 1.0 build x, reloaded 2 libraries") nil))
+               ((symbol-function 'monk-agent--load-new-libraries) (lambda () nil)))
+      (ignore real)
+      (should (string-match-p "reloaded monk-sync" (monk-agent--reload-if-stale)))
+      (should-not (seq-find (lambda (m) (string-prefix-p "monk: " m)) seen)))))
+
 (ert-deftest monk-test-agent-reloads-stale-source-in-place ()
   "A timed converge reloads edited libraries and the policy file; nothing restarts."
   (require 'monk-agent)
@@ -5496,24 +5780,395 @@ is loaded in a fresh subprocess and asked for one function."
                 (should-not (monk-run-dry-run (cdar got)))
                 (should (file-directory-p (concat dir "agent-made")))
                 (should-not monk-connect--waiting))
+              ;; an op the agent rejects settles the wait and says so
+              (let ((said nil))
+                (cl-letf (((symbol-function 'message) (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+                  (monk-connect-request "no-such-op" nil #'ignore)
+                  (let ((deadline (+ (float-time) 3)))
+                    (while (and monk-connect--waiting (< (float-time) deadline)) (accept-process-output nil 0.05))))
+                (should-not monk-connect--waiting)
+                (should (string-match-p "could not send no-such-op: unknown op" said)))
+              ;; during a run the agent still answers read-only requests,
+              ;; and queues a plan until the run ends
+              (let* ((machine-at nil) (run-end-at nil) (plan-done nil)
+                     (monk-batch-policy
+                      (lambda (_m)
+                        ;; :unless false -> the check itself sleeps, in plan and apply
+                        (monk-command "slow" "true" :unless '("sh" "-c" "sleep 1.5; exit 1"))
+                        (monk-directory (concat dir "agent-made-2")))))
+                (monk-connect-request "run" nil (lambda (_r) (setq run-end-at (float-time))))
+                ;; 0.4 s in: the run is inside its sleep
+                (run-at-time 0.4 nil
+                             (lambda ()
+                               (monk-connect--send `((op . "machine") (client . "t")))
+                               (monk-connect--send `((op . "plan") (client . "t")))))
+                (cl-letf* ((real-handle (symbol-function 'monk-connect--handle))
+                           ((symbol-function 'monk-connect--handle)
+                            (lambda (event)
+                              (when (equal (alist-get 'op event) "machine")
+                                (setq machine-at (float-time)))
+                              (when (and (equal (alist-get 'event event) "run-end")
+                                         run-end-at (eq t (alist-get 'dry_run event)))
+                                (setq plan-done t))
+                              (funcall real-handle event))))
+                  (let ((deadline (+ (float-time) 15)))
+                    (while (and (not plan-done) (< (float-time) deadline))
+                      (accept-process-output nil 0.05))))
+                (should machine-at)
+                (should run-end-at)
+                ;; the facts answer came back before the run ended
+                (should (< machine-at run-end-at))
+                ;; and the queued plan ran after it
+                (should plan-done)
+                (should-not monk-connect--waiting))
               ;; a dropped wait frees the next request
               (setq monk-connect--waiting (cons "plan" #'ignore))
               (should-error (monk-connect-request "plan") :type 'user-error)
-              (monk-connect-drop-request)
+              (should (string-match-p "asked for a plan" (substring-no-properties (monk-connect--ui-badge))))
+              ;; k in *monk* drops it
+              (with-current-buffer (monk-ui--buffer)
+                (should (eq (key-binding "k") 'monk-ui-drop-request))
+                (monk-ui-drop-request))
               (should-not monk-connect--waiting)
+              (should-not (string-match-p "asked for" (substring-no-properties (monk-connect--ui-badge))))
               ;; status op answers
               (let ((status nil))
                 (monk-connect-status (lambda (s) (setq status s)))
                 (should (equal (system-name) (alist-get 'host status))))
+              ;; a run the agent starts on its own carries its origin and does
+              ;; not bring *monk* up; one this session asked for does
+              (let ((popped nil))
+                (cl-letf (((symbol-function 'monk-ui-display-buffer)
+                           (lambda (_b &optional unasked) (push (if unasked 'unasked 'asked) popped) nil))
+                          ((symbol-function 'monk-ui--spinner-start) #'ignore))
+                  (let ((noninteractive nil))
+                    (monk-connect--run-start '((event . "run-start") (run . "r20261012T170000.001") (hosts . ["testbox"])
+                                               (dry_run . t) (origin . "timed")))
+                    (should (equal '(unasked) popped))
+                    (setq monk-connect--asked t)
+                    (monk-connect--run-start '((event . "run-start") (run . "r20261012T170000.002") (hosts . ["testbox"])
+                                               (dry_run . t) (origin . "timed")))
+                    (should (equal '(asked unasked) popped))
+                    (should-not monk-connect--asked)
+                    ;; the agent names this session in the origin: asked too
+                    (monk-connect--run-start `((event . "run-start") (run . "r20261012T170000.003") (hosts . ["testbox"])
+                                               (dry_run . t)
+                                               (origin . ,(format "plan for %s" (monk-connect--client-name)))))
+                    (should (equal '(asked asked unasked) popped))))
+                (setq monk-connect--live-run nil monk-connect--run-events nil))
+              ;; the subscribe reply carried the agent's machine: i needs no request
+              (should monk-connect--machine)
+              (let ((m monk-connect--machine))
+                (should (equal "testbox" (oref m name)))
+                (should (equal (alist-get 'os monk-test-fake-facts) (alist-get 'os (oref m facts))))
+                (should (memq 'linux (oref m classes)))
+                ;; the machine op still answers, for scripts
+                (let ((got nil))
+                  (monk-connect-request "machine" nil (lambda (r) (setq got r)))
+                  (let ((deadline (+ (float-time) 3)))
+                    (while (and (null got) (< (float-time) deadline)) (accept-process-output nil 0.05)))
+                  (should (equal "testbox" (alist-get 'name got))))
+                ;; a fact gather on the agent pushes the new machine; a
+                ;; live-gathered one has a symbol source and a time, both
+                ;; must serialize (they did not, 2026-10-12)
+                (let ((before monk-connect--machine))
+                  (setq monk-agent--machine (monk-test-machine))
+                  (oset monk-agent--machine facts (cons '(pushed . "yes") monk-test-fake-facts))
+                  (oset monk-agent--machine facts-source 'live)
+                  (oset monk-agent--machine gathered (current-time))
+                  (run-hook-with-args 'monk-facts-ready-functions monk-agent--machine)
+                  (let ((deadline (+ (float-time) 3)))
+                    (while (and (eq before monk-connect--machine) (< (float-time) deadline))
+                      (accept-process-output nil 0.05)))
+                  (should-not (eq before monk-connect--machine))
+                  (should (equal "yes" (alist-get 'pushed (oref monk-connect--machine facts))))
+                  (should (eq 'live (oref monk-connect--machine facts-source)))
+                  (should (oref monk-connect--machine gathered)))
+                ;; i while connected shows the pushed copy at once, no wait
+                (save-window-excursion
+                  (with-current-buffer (monk-ui-show (monk-run-create :machines (list m) :dry-run t :passes 1))
+                    (goto-char (point-min))
+                    (monk-ui-next-machine)
+                    (monk-ui-inspect-machine)))
+                (should-not monk-connect--waiting)
+                (should (get-buffer "*monk: testbox facts*"))
+                (with-current-buffer "*monk: testbox facts*"
+                  (should (string-match-p "linux" (buffer-string)))
+                  (should (string-match-p "pushed" (buffer-string))))
+                (kill-buffer "*monk: testbox facts*"))
+              ;; a second monk-connect while connected shows the window, no error
+              (let ((proc monk-connect--process))
+                (cl-letf (((symbol-function 'monk-connect--show-last-run) #'ignore))
+                  (should (eq proc (monk-connect))))
+                (should (eq proc monk-connect--process)))
+              ;; the header names the host and the agent's version and build
+              (should (string-match-p (concat "AGENT " (regexp-quote (system-name)) " "
+                                              (regexp-quote monk-version) " "
+                                              (regexp-quote (monk-connect--short-build monk-build)))
+                                      (substring-no-properties (monk-connect--ui-badge))))
+              (should (equal ".9" (monk-connect--short-build (concat (format-time-string "%F") ".9"))))
+              (should (equal "2020-01-01.3" (monk-connect--short-build "2020-01-01.3")))
+              ;; the agent goes away: the session is LOST, not silently local
+              (monk-agent-stop-local)
+              (let ((deadline (+ (float-time) 3)))
+                (while (and (monk-connect-active-p) (< (float-time) deadline))
+                  (accept-process-output nil 0.05)))
+              (accept-process-output nil 0.1)
+              (should-not (monk-connect-active-p))
+              (should (monk-connect-lost-p))
+              (should (string-match-p "AGENT LOST" (substring-no-properties (monk-connect--ui-badge))))
+              ;; g in *monk* asks to reconnect; a "no" is a user-error, no local run
+              (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) nil)))
+                (should-error (monk-ui--agent-key-p "plan") :type 'user-error))
+              ;; a "yes" reconnects when the agent is back
+              (should (monk-agent-serve-local))
+              (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                        ((symbol-function 'monk-connect--show-last-run) #'ignore))
+                (should (monk-ui--agent-key-p "plan")))
+              (should (monk-connect-active-p))
+              (should-not monk-connect--lost)
               ;; disconnect drops the subscriber on the agent side
               (monk-disconnect)
               (accept-process-output nil 0.2)
               (should-not (monk-connect-active-p))
+              (should-not (monk-connect-lost-p))
               (should-not monk-agent--subscribers))
           (ignore-errors (monk-disconnect))
           (monk-agent-stop-local)
           (should-not (file-exists-p (monk-agent-local-socket-path)))
           (should-not (file-exists-p (monk-agent-pid-file))))))))
+
+(ert-deftest monk-test-ui-apply-with-nothing-to-change-asks-nothing ()
+  "A plan with 0 changes and 0 failures applies without the yes-or-no question.
+Asked \"Apply 0 changes?\" (2026-10-11): the question has one answer."
+  (monk-test-with-tmpdir dir
+    (let* ((policy (lambda (_m) (monk-directory dir)))
+           (m (monk-test-machine))
+           (monk-log-level nil)
+           (plan (monk-plan m policy))
+           (asked nil))
+      (should (= 0 (monk-run-count plan monk-status-would-repair)))
+      (with-current-buffer (monk-ui--buffer)
+        (monk-ui-mode)
+        (setq monk-ui--run plan)
+        (monk-ui-refresh)
+        (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) (setq asked t) t)))
+          (save-window-excursion (monk-ui-apply)))
+        (should-not asked)
+        (should-not (monk-run-dry-run monk-ui--run))
+        (should (eq plan (monk-run-plan monk-ui--run)))))))
+
+(ert-deftest monk-test-connect-refuses-other-build-and-reconnects ()
+  "A session connects only to an agent on its own build; monk-reconnect
+pokes the agent and connects once the builds agree; reconnect-all walks
+every agent this session used."
+  (require 'monk-connect)
+  (skip-unless (featurep 'make-network-process))
+  (monk-test-with-tmpdir dir
+    (let* ((home (concat dir "home"))
+           (process-environment (cons (concat monk-home-environment-variable "=" home) process-environment))
+           (monk-log-level nil)
+           (monk-agent--server nil) (monk-agent--subscribers nil)
+           (monk-connect--process nil) (monk-connect--status nil) (monk-connect--prefix nil)
+           (monk-connect--known-prefixes nil) (monk-connect--waiting nil)
+           (monk-connect--run-events nil) (monk-connect--live-run nil) (monk-connect--lost nil)
+           (agent-build "0.0.0-old")
+           (poked 0))
+      (cl-letf (((symbol-function 'monk-agent-machine) (lambda () (monk-test-machine)))
+                ((symbol-function 'monk-agent--sudo-state) (lambda () "cached"))
+                ((symbol-function 'monk-connect--show-last-run) #'ignore)
+                ;; the agent reports its own build; the poke "reloads" it
+                ((symbol-function 'monk-agent-status-alist)
+                 (lambda () `((host . "h") (owner . "o") (version . "v") (build . ,agent-build) (sudo . "cached"))))
+                ((symbol-function 'signal-process)
+                 (lambda (_pid _sig) (cl-incf poked) (setq agent-build monk-build) 0)))
+        (unwind-protect
+            (progn
+              (should (monk-agent-serve-local))
+              ;; mismatch: refused, nothing left open
+              (should-error (monk-connect) :type 'user-error)
+              (should-not (monk-connect-active-p))
+              (should-not monk-connect--process)
+              ;; the agent is still serving and has no stale subscriber
+              (accept-process-output nil 0.2)
+              (should-not monk-agent--subscribers)
+              ;; reconnect: poke, wait, connect
+              (let ((monk-connect-reload-wait 5))
+                (monk-reconnect))
+              (should (= 1 poked))
+              (should (monk-connect-active-p))
+              (should (equal monk-build (alist-get 'build monk-connect--status)))
+              (should (equal '(nil) monk-connect--known-prefixes))
+              ;; the agent falls behind again; reconnect-all brings it back
+              (setq agent-build "0.0.0-older")
+              (let ((monk-connect-reload-wait 5) (said nil))
+                (cl-letf (((symbol-function 'message) (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+                  (monk-reconnect-all))
+                (should (string-match-p "Reconnected: local" said)))
+              (should (= 2 poked))
+              (should (monk-connect-active-p))
+              ;; with the check off, a mismatched agent connects and the badge says so
+              (setq agent-build "0.0.0-off")
+              (monk-disconnect)
+              (let ((monk-connect-require-same-build nil))
+                (monk-connect)
+                (should (monk-connect-active-p))
+                (should (string-match-p "0.0.0-off ≠" (substring-no-properties (monk-connect--ui-badge))))))
+          (ignore-errors (monk-disconnect))
+          (monk-agent-stop-local))))))
+
+(ert-deftest monk-test-watch-names-noisy-directories ()
+  "Unmanaged events are counted per directory; the stop line and status name the busiest."
+  (require 'monk-watch)
+  (monk-test-with-tmpdir dir
+    (let* ((m (monk-test-machine))
+           (noisy (concat dir "noisy/"))
+           (quiet (concat dir "quiet/"))
+           (monk-log-level 'info)
+           (monk-watch--unmanaged-seen nil) (monk-watch--unmanaged-count 0)
+           (monk-watch--unmanaged-by-directory nil)
+           (w (monk-watch-create :machines (list m) :policy #'ignore :path-index (make-hash-table :test #'equal))))
+      (make-directory noisy) (make-directory quiet)
+      (let ((monk-watch--current w))
+        (dotimes (i 5) (monk-watch--on-event (list nil 'changed (format "%sf%d" noisy i))))
+        (monk-watch--on-event (list nil 'changed (concat quiet "g")))
+        (should (= 6 monk-watch--unmanaged-count))
+        (should (equal (list (cons noisy 5) (cons quiet 1)) (monk-watch-noisy-directories)))
+        (should (string-match-p "unmanaged mostly from .*noisy/ (5), .*quiet/ (1)" (monk-watch-status)))
+        ;; the counts survive a carry-over (a reload)
+        (let ((w2 (monk-watch-create :machines (list m) :policy #'ignore :path-index (make-hash-table :test #'equal))))
+          (setq monk-watch--unmanaged-count 0 monk-watch--unmanaged-by-directory nil)
+          (monk-watch--carry-over w2 6 0 (current-time) 6 (list (cons noisy 5) (cons quiet 1)))
+          (should (= 6 monk-watch--unmanaged-count))
+          (should (equal (cons noisy 5) (car (monk-watch-noisy-directories)))))))))
+
+(ert-deftest monk-test-rsync-arguments-carry-timeouts ()
+  "rsync gets --timeout always and an ssh with connect and keepalive limits when a side is remote."
+  (require 'monk-sync)
+  (let* ((m (monk-test-machine))
+         (local (car (monk-compile m (lambda (_m) (monk-rsync "l" '("/a/") "/b/")))))
+         (remote (car (monk-compile m (lambda (_m) (monk-rsync "r" '("host:src/") "/b/")))))
+         (monk-rsync-default-transport '("ssh" "-o" "ConnectTimeout=15")))
+    (let ((args (monk--rsync-arguments local m)))
+      (should (member "--timeout=60" args))
+      (should-not (member "-e" args)))
+    (let ((args (monk--rsync-arguments remote m)))
+      (should (member "--timeout=60" args))
+      (should (equal "ssh -o ConnectTimeout=15" (cadr (member "-e" args)))))
+    ;; per resource: another value, or none
+    (let ((slow (car (monk-compile m (lambda (_m) (monk-rsync "s" '("host:src/") "/b/" :timeout 300))))))
+      (should (member "--timeout=300" (monk--rsync-arguments slow m))))
+    (let ((none (car (monk-compile m (lambda (_m) (monk-rsync "n" '("host:src/") "/b/" :timeout 0 :transport 'none))))))
+      (should-not (seq-some (lambda (a) (string-prefix-p "--timeout" a)) (monk--rsync-arguments none m)))
+      (should-not (member "-e" (monk--rsync-arguments none m))))
+    ;; the transport per resource: a string, or a list of words
+    (let ((str (car (monk-compile m (lambda (_m) (monk-rsync "t" '("host:src/") "/b/" :transport "ssh -p 2222"))))))
+      (should (equal "ssh -p 2222" (cadr (member "-e" (monk--rsync-arguments str m))))))
+    (let ((lst (car (monk-compile m (lambda (_m) (monk-rsync "u" '("host:src/") "/b/" :transport '("ssh" "-J" "jump")))))))
+      (should (equal "ssh -J jump" (cadr (member "-e" (monk--rsync-arguments lst m))))))
+    ;; a word with a space cannot be passed through -e
+    (should-error (monk-rsync-transport-string '("ssh" "-o" "ProxyCommand=nc x")) :type 'monk-resource-error)
+    (should (= 60 monk-rsync-default-timeout))))
+
+(ert-deftest monk-test-object-rebuild-after-class-grew ()
+  "An object built before a class gained a slot is rebuilt by slot name.
+Reproduces 2026-10-11: `monk-machine' gained `method' in a reload and
+the agent's machine read `started' time as its `groups'."
+  (eval '(defclass monk-test-grow () ((a :initarg :a :initform nil) (c :initarg :c :initform nil))) t)
+  (monk-object-note-layout 'monk-test-grow)
+  (let ((old (monk-test-grow :a 1 :c 3)))
+    ;; the class grows in the middle, as monk-machine did
+    (eval '(defclass monk-test-grow () ((a :initarg :a :initform nil)
+                                        (b :initarg :b :initform 'default-b)
+                                        (c :initarg :c :initform nil)))
+          t)
+    (monk-object-note-layout 'monk-test-grow)
+    (should (monk-object-stale-p old))
+    ;; reading the old object through the new class is wrong: c is now b
+    (should (eq 3 (slot-value old 'b)))
+    (let ((new (monk-object-rebuild old)))
+      (should-not (monk-object-stale-p new))
+      (should (eq 1 (slot-value new 'a)))
+      (should (eq 'default-b (slot-value new 'b)))
+      (should (eq 3 (slot-value new 'c)))
+      ;; a current object comes back as itself
+      (should (eq new (monk-object-rebuild new))))
+    ;; monk-machine itself has a layout on record, so the agent path works
+    (should (assoc (cons 'monk-machine (length (eieio-class-slots 'monk-machine))) monk-object--layouts))
+    (let ((m (monk-test-machine)))
+      (should (eq m (monk-machine-rebuild m))))))
+
+(ert-deftest monk-test-reload-rebuilds-machines-it-keeps ()
+  "`monk-reload' rebuilds the agent machine, the inventory, and the watch machines."
+  (require 'monk-reload)
+  (let* ((m (monk-test-machine))
+         (monk-inventory (list m))
+         (monk-agent--machine m)
+         (rebuilt nil)
+         (monk-log-level nil))
+    (cl-letf (((symbol-function 'monk-machine-rebuild)
+               (lambda (x) (push x rebuilt) x))
+              ((symbol-function 'load) (lambda (&rest _) t))
+              ((symbol-function 'monk-reload--refresh-buffers) (lambda () 0))
+              ((symbol-function 'monk-reload--clear-caches) (lambda () 0))
+              ((symbol-function 'message) #'ignore))
+      (monk-reload)
+      (should (memq m rebuilt)))))
+
+(ert-deftest monk-test-connect-targets-and-remote-plumbing ()
+  "`monk-connect' offers this host and every addressed inventory machine.
+A typed METHOD:HOST or TRAMP prefix works too; the remote socket is
+read from the pid file over TRAMP and reached through nc or socat."
+  (require 'monk-connect)
+  (let* ((far (monk-local-machine :name "far"))
+         (box (monk-local-machine :name "box"))
+         (monk-inventory nil))
+    (oset far address "far.invalid") (oset far method "rpc")
+    (oset box address "box.invalid")
+    (setq monk-inventory (list (monk-test-machine) far box))
+    (let ((targets (monk-connect-targets)))
+      (should (equal '("local" . nil) (car targets)))
+      (should (equal "/rpc:far.invalid:" (cdr (assoc "far (rpc far.invalid)" targets))))
+      (should (equal "/ssh:box.invalid:" (cdr (assoc "box (ssh box.invalid)" targets))))
+      (should (= 3 (length targets))))
+    ;; the answers a person can type
+    (dolist (case '(("local" . nil)
+                    ("far (rpc far.invalid)" . "/rpc:far.invalid:")
+                    ("rpc:elsewhere" . "/rpc:elsewhere:")
+                    ("pi@kamen.local" . "/ssh:pi@kamen.local:")
+                    ("/sshx:host:" . "/sshx:host:")))
+      (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) (car case))))
+        (should (equal (cdr case) (monk-connect-read-target)))))
+    ;; the pipe command: nc first, socat second, the socket appended right
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (name &rest _) (and (equal name "socat") "/usr/bin/socat"))))
+      (should (equal '("socat" "-" "UNIX-CONNECT:/tmp/agent.sock")
+                     (monk-connect-pipe-command nil "/tmp/agent.sock"))))
+    (cl-letf (((symbol-function 'executable-find) (lambda (name &rest _) (and (equal name "nc") "/usr/bin/nc"))))
+      (should (equal '("nc" "-U" "/tmp/agent.sock") (monk-connect-pipe-command nil "/tmp/agent.sock"))))
+    (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) nil)))
+      (should-error (monk-connect-pipe-command nil "/tmp/agent.sock") :type 'user-error))
+    ;; the remote pid file: read through the prefix, pid checked there
+    (monk-test-with-tmpdir dir
+      (let ((pidfile (concat dir "agent.pid")))
+        (with-temp-file pidfile
+          (insert (monk-event-line '((pid . 4242) (socket . "/home/u/.local/share/monk/agent.sock")))))
+        (cl-letf (((symbol-function 'expand-file-name)
+                   (lambda (name &optional default)
+                     (if (and default (equal default "/ssh:box.invalid:")) pidfile name)))
+                  ((symbol-function 'process-file)
+                   (lambda (program &rest args)
+                     (should (equal program "kill"))
+                     (should (member "4242" args))
+                     0)))
+          (should (equal "/home/u/.local/share/monk/agent.sock"
+                         (monk-connect-remote-socket "/ssh:box.invalid:"))))
+        ;; a dead pid there is no agent
+        (cl-letf (((symbol-function 'expand-file-name)
+                   (lambda (name &optional default)
+                     (if (and default (equal default "/ssh:box.invalid:")) pidfile name)))
+                  ((symbol-function 'process-file) (lambda (&rest _) 1)))
+          (should-error (monk-connect-remote-socket "/ssh:box.invalid:") :type 'user-error))))))
 
 (ert-deftest monk-test-history-migrates-under-open-connection ()
   "A schema version raised by a reload is applied to the connection already open."

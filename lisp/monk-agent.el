@@ -147,7 +147,7 @@ The first converge on start always runs.  See `monk-agent-policy-repo'."
 (defconst monk-agent-template-name "monk-agent@.service")
 
 (defconst monk-agent-ops '("status" "tail" "plan" "run" "history-runs" "history-results"
-                           "subscribe" "watch-mode" "watch-log")
+                           "subscribe" "watch-mode" "watch-log" "machine")
   "Operations the query endpoint accepts.")
 
 (defconst monk-agent-local-socket-name "agent.sock"
@@ -503,14 +503,19 @@ line, or nil when nothing was stale."
       (require 'monk-reload)
       (condition-case err
           (progn
-            ;; `monk-reload' messages its own summary; the agent prints
-            ;; its own line instead.  Errors must stay visible, so the
-            ;; message is caught, not inhibited (an `inhibit-message'
+            ;; `monk-reload' logs its summary (which the CLI prints as a
+            ;; line) and also `message's it.  In batch that message goes
+            ;; to stderr behind the terminal's back and lands after the
+            ;; idle line, so it is dropped here; the format is "%s", so
+            ;; the test is on the text.  Errors must stay visible, so
+            ;; the message is caught, not inhibited (an `inhibit-message'
             ;; here swallowed the reason for a failed reload, 2026-10-11).
             (cl-letf* ((real (symbol-function 'message))
                        ((symbol-function 'message)
                         (lambda (fmt &rest args)
-                          (if (and fmt (string-prefix-p "monk: " fmt)) nil (apply real fmt args)))))
+                          (if (and fmt (string-prefix-p "monk: " (apply #'format-message fmt args)))
+                              nil
+                            (apply real fmt args)))))
               (monk-reload))
             (if monk-reload-last-failures
                 (progn
@@ -603,19 +608,43 @@ A signal or edit meanwhile is queued, not nested.")
 (defvar monk-agent--converge-again nil
   "Non-nil when a converge was asked for during one; it runs after.")
 
+(defvar monk-agent--respond-to)
+(defvar monk-agent--machine)
+(defvar monk-agent--queued-requests nil
+  "Plan and run requests that arrived while a run was in progress, oldest last.
+Each is (REQUEST . CONNECTION).  Served in order once the run ends;
+read-only requests never queue, they answer in the middle of a run.")
+
+(defun monk-agent--run-in-progress-p ()
+  "Return non-nil while a converge of any kind runs in this agent."
+  (or monk-agent--converging monk--current-run))
+
+(defun monk-agent--serve-queued-requests ()
+  "Serve the plan and run requests that waited for the run to end."
+  (while (and monk-agent--queued-requests (not (monk-agent--run-in-progress-p)))
+    (pcase-let ((`(,request . ,connection) (pop monk-agent--queued-requests)))
+      (when (or (null connection) (process-live-p connection))
+        (let ((monk-agent--respond-to connection))
+          (condition-case err
+              (monk-agent-handle request)
+            (error (monk-agent--respond `((ok . :false) (error . ,(error-message-string err)))))))))))
+
 (defun monk-agent--full-converge (policy &optional timed)
   "Converge the whole local POLICY and record it.
 With TIMED, this is a scheduled converge: wait a splay first, update
 the policy repo, and when `monk-agent-only-if-changed' is set and the
 repo did not move, skip the converge.  A second request while one
 runs is remembered and served right after."
-  (if monk-agent--converging
+  (if (monk-agent--run-in-progress-p)
+      ;; also when a socket plan or run is on: `monk--current-run' is
+      ;; set for the whole of any run, and timers fire inside monk-exec
       (setq monk-agent--converge-again t)
     (let ((monk-agent--converging t))
       (monk-agent--full-converge-1 policy timed))
     (when monk-agent--converge-again
       (setq monk-agent--converge-again nil)
-      (monk-agent--full-converge policy timed))))
+      (monk-agent--full-converge policy timed))
+    (monk-agent--serve-queued-requests)))
 
 (defun monk-agent--full-converge-1 (policy &optional timed)
   "The body of `monk-agent--full-converge'; POLICY and TIMED as there."
@@ -939,7 +968,12 @@ fresh; otherwise it fails at once instead of prompting."
   "Progress hook: turn EVENT with DATA into a record for subscribers."
   (when monk-agent--subscribers
     (pcase event
-      ('run-start (monk-agent--broadcast (monk-event-run 'run-start (plist-get data :run))))
+      ;; the origin rides on run-start so a session can tell a run it
+      ;; asked for from one the agent started on its own (and not pop
+      ;; its window for the latter, 2026-10-12)
+      ('run-start (monk-agent--broadcast
+                   (append (monk-event-run 'run-start (plist-get data :run))
+                           (and monk-agent--run-origin (list (cons 'origin monk-agent--run-origin))))))
       ('node-end (when monk--current-run
                    (monk-agent--broadcast
                     (monk-event-result (plist-get data :result) monk--current-run
@@ -1002,10 +1036,19 @@ A stale file from a crashed agent is removed."
             (error (monk-agent--respond `((ok . :false) (error . ,(error-message-string err)))))))))
     (process-put proc 'monk-partial buffer)))
 
-(defun monk-agent--connection-sentinel (proc _event)
-  "Forget PROC when it closes."
+(defun monk-agent--connection-sentinel (proc event)
+  "Forget PROC when it closes; say who left and why.
+A subscriber that drops without `monk-disconnect' is worth a line: it
+tells whether the agent closed it (a reload, a restart) or the other
+side went away (2026-10-12: sessions lost their agent at every reload
+and nothing said which end hung up)."
   (unless (process-live-p proc)
-    (setq monk-agent--subscribers (delq proc monk-agent--subscribers))))
+    (when (memq proc monk-agent--subscribers)
+      (setq monk-agent--subscribers (delq proc monk-agent--subscribers))
+      (monk-cli-print-line (format "%s subscriber %s left: %s (%d remain)"
+                                   (monk-cli--color "90" "monk-agent")
+                                   (or (process-get proc 'monk-client) "unnamed")
+                                   (string-trim event) (length monk-agent--subscribers))))))
 
 (defun monk-agent-serve-local ()
   "Start serving the local socket.  Return the server process, or nil.
@@ -1024,10 +1067,33 @@ an earlier agent is replaced."
           (setq monk-agent--server server)
           (add-hook 'monk-progress-functions #'monk-agent--broadcast-progress)
           (add-hook 'monk-watch-functions #'monk-agent--broadcast-watch)
+          (add-hook 'monk-facts-ready-functions #'monk-agent--broadcast-facts)
           (monk-agent--write-pid-file)
           (monk-log 'info "agent socket %s" path)
           server)
       (error (monk-log 'warn "agent socket: %s" (error-message-string err)) nil))))
+
+(defun monk-agent-machine-alist (&optional m)
+  "Return M, default the agent's machine, as the `machine' message body.
+Facts, classes, groups, vars, where the facts came from and when."
+  (let* ((m (or m monk-agent--machine (monk-agent-machine)))
+         (description (monk-machine-describe m)))
+    `((name . ,(oref m name))
+      (classes . ,(vconcat (mapcar #'symbol-name (alist-get 'classes description))))
+      (groups . ,(vconcat (mapcar #'symbol-name (alist-get 'groups description))))
+      (facts . ,(monk-event--jsonable (alist-get 'facts description)))
+      (vars . ,(monk-event--jsonable (alist-get 'vars description)))
+      (facts_source . ,(if (oref m facts-source) (symbol-name (oref m facts-source)) "none"))
+      (gathered . ,(and (oref m gathered) (monk-event--time (oref m gathered)))))))
+
+(defun monk-agent--broadcast-facts (m)
+  "Facts hook: tell subscribers the facts of M changed, with the new facts.
+Runs after a live gather and after a cache load; only the agent's own
+machine is of interest to a session."
+  (when (and monk-agent--subscribers
+             (or (eq m monk-agent--machine)
+                 (and monk-agent--machine (equal (oref m name) (oref monk-agent--machine name)))))
+    (monk-agent--broadcast (append '((event . "machine")) (monk-agent-machine-alist m)))))
 
 (defun monk-agent--broadcast-watch (kind data)
   "Watch hook: forward a drift KIND with DATA to subscribers."
@@ -1040,6 +1106,7 @@ an earlier agent is replaced."
 (defun monk-agent-stop-local ()
   "Stop the local socket server and remove its files."
   (remove-hook 'monk-progress-functions #'monk-agent--broadcast-progress)
+  (remove-hook 'monk-facts-ready-functions #'monk-agent--broadcast-facts)
   (remove-hook 'monk-watch-functions #'monk-agent--broadcast-watch)
   (dolist (proc monk-agent--subscribers) (ignore-errors (delete-process proc)))
   (setq monk-agent--subscribers nil)
@@ -1073,8 +1140,21 @@ an earlier agent is replaced."
        ;; until it closes.  The reply says who the agent is, so the
        ;; subscriber can show it.
        (when monk-agent--respond-to
-         (cl-pushnew monk-agent--respond-to monk-agent--subscribers))
-       (monk-agent--respond (append '((op . "subscribe") (ok . t)) (monk-agent-status-alist))))
+         (process-put monk-agent--respond-to 'monk-client (alist-get 'client request))
+         (cl-pushnew monk-agent--respond-to monk-agent--subscribers)
+         (monk-cli-print-line (format "%s subscriber %s joined (%d now)"
+                                      (monk-cli--color "90" "monk-agent")
+                                      (or (alist-get 'client request) "unnamed")
+                                      (length monk-agent--subscribers))))
+       ;; the machine rides along; a failure to describe it must not
+       ;; cost the subscription, so it is logged and left out
+       (monk-agent--respond (append '((op . "subscribe") (ok . t))
+                                    (monk-agent-status-alist)
+                                    (condition-case err
+                                        (list (cons 'machine (monk-agent-machine-alist)))
+                                      (error (monk-log 'warn "subscribe: machine not described: %s"
+                                                       (error-message-string err))
+                                             nil)))))
       ("watch-mode"
        (let ((mode (alist-get 'mode request)))
          (if (and (fboundp 'monk-watch-active-p) (monk-watch-active-p))
@@ -1084,12 +1164,28 @@ an earlier agent is replaced."
                  (monk-watch-toggle-mode))
                (monk-agent--respond `((op . "watch-mode") (ok . t) (mode . ,(symbol-name monk-watch-mode)))))
            (monk-agent--respond '((op . "watch-mode") (ok . :false) (error . "no watch is active"))))))
+      ("machine"
+       ;; what guards can see on the agent's machine; also sent with
+       ;; the subscribe reply and whenever facts are gathered, so a
+       ;; session never has to ask a busy agent (2026-10-12)
+       (monk-agent--respond (append '((op . "machine") (ok . t)) (monk-agent-machine-alist))))
       ("watch-log"
        (let ((lines (and (get-buffer monk-watch-log-buffer-name)
                          (with-current-buffer monk-watch-log-buffer-name
                            (split-string (buffer-string) "\n" t)))))
          (monk-agent--respond `((op . "watch-log") (ok . t)
                                 (lines . ,(vconcat (last lines (or (alist-get 'n request) monk-agent-tail-default))))))))
+      ((and (or "plan" "run") (guard (monk-agent--run-in-progress-p)))
+       ;; The socket is served from inside `monk-exec' while a run is
+       ;; on, so this request arrived mid-run.  A run inside a run is
+       ;; not allowed; it goes to the queue and starts when this one
+       ;; ends.  The asker sees the run in progress through the
+       ;; broadcast meanwhile.
+       (setq monk-agent--queued-requests
+             (append monk-agent--queued-requests (list (cons request monk-agent--respond-to))))
+       (monk-cli-print-line (format "%s %s from %s queued behind the run in progress"
+                                    (monk-cli--color "90" "monk-agent") op
+                                    (or (alist-get 'client request) "a client"))))
       ((or "plan" "run")
        ;; A subscriber already receives every event through the
        ;; broadcast; streaming them again on the request would double
@@ -1120,7 +1216,12 @@ an earlier agent is replaced."
               (run (monk-converge (monk-agent-machine) policy :dry-run (equal op "plan"))))
          (monk-run-report run)
          (unless subscribed
-           (monk-agent--respond (monk-event-run 'run-end run)))))
+           (monk-agent--respond (monk-event-run 'run-end run)))
+         ;; a source edit or SIGUSR1 that fired during this run
+         (when monk-agent--converge-again
+           (setq monk-agent--converge-again nil)
+           (monk-agent--full-converge monk-agent--policy t))
+         (monk-agent--serve-queued-requests)))
       (_
        (monk-agent--respond `((op . ,(or op "")) (ok . :false)
                               (error . ,(format "unknown op; expected one of %s"
