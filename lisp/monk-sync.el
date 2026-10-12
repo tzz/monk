@@ -80,6 +80,23 @@ owner (`o', `g') difference on a file or directory keeps the line.")
 (defconst monk-rsync-unreachable-exit 255
   "Exit code rsync gives when ssh could not connect.")
 
+(defconst monk-rsync-transport-failure-exits '(124 127 255)
+  "Exit codes that mean the transport, not rsync, failed.
+255 is ssh could not connect; 124 and 127 come from a ProxyCommand or
+Match exec in the ssh config whose helper timed out or does not exist
+on this host (2026-10-12: a jump-host lookup tool on a Mac).  All
+read as unreachable: the peer was never spoken to, and the rest of
+the policy must go on.")
+
+(defun monk-rsync--transport-message (exec)
+  "Return the line of EXEC's output that explains a transport failure.
+The ssh or helper message, not rsync's generic trailer and not the
+command line: a \"failed to run command\" from a ProxyCommand says
+what to fix, the 14-path argv does not."
+  (let* ((lines (split-string (monk-exec-output exec) "\n" t))
+         (telling (seq-remove (lambda (l) (string-match-p "\\`rsync\\(:\\| error\\)\\|\\`client_loop" l)) lines)))
+    (string-trim (string-join (or telling lines) "\n"))))
+
 (defconst monk-rsync-item-regexp "\\`\\([<>ch.][fdLDS][^ ]\\{9,10\\}\\|\\*deleting\\) +\\(.*\\)\\'"
   "One `--itemize-changes' line: the flags, then the path.
 The flag field is 11 characters up to protocol 30 and 12 from
@@ -293,10 +310,15 @@ The real run itemizes too, so the repair comment can name the items."
 (cl-defmethod monk-check ((r monk-rsync-resource) (m monk-machine))
   (let ((exec (monk--rsync-run r m t)))
     (cond
-     ((= (monk-exec-exit-code exec) monk-rsync-unreachable-exit)
+     ((memq (monk-exec-exit-code exec) monk-rsync-transport-failure-exits)
       (signal 'monk-resource-error
-              (list (format "rsync could not reach %s: %s" (oref r destination)
-                            (string-trim (monk-exec-output exec))))))
+              (list (format "rsync could not reach %s (ssh exit %d%s): %s"
+                            (oref r destination) (monk-exec-exit-code exec)
+                            (pcase (monk-exec-exit-code exec)
+                              (124 ", a ProxyCommand or Match exec timed out")
+                              (127 ", a ProxyCommand or Match exec helper is missing on this host")
+                              (_ ""))
+                            (monk-rsync--transport-message exec)))))
      ((not (monk-exec-ok-p exec))
       (signal 'monk-exec-error
               (list (oref m name) (monk-exec-command exec) (monk-exec-exit-code exec)

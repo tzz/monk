@@ -1793,7 +1793,26 @@ inside a walked tree is dropped, and ~ itself is never walked."
                    (monk-exec-create :exit-code 0 :output "")))))
       (let ((run (monk-converge m (lambda (_m) (monk-rsync "s" '("/x") "dead:x")) :passes 1)))
         (should (eq 'failed (monk-test-status run "s")))
-        (should (string-match-p "could not reach dead:x" (monk-result-comment (monk-test-result run "s"))))))))
+        (should (string-match-p "could not reach dead:x (ssh exit 255)" (monk-result-comment (monk-test-result run "s"))))))
+    ;; a ProxyCommand helper missing on this host: exit 124 from
+    ;; timeout(1) inside the ssh config, with the helper's own message;
+    ;; the comment names the cause, not the 14-path argv
+    (cl-letf (((symbol-function 'monk-exec)
+               (lambda (_m program &rest args)
+                 (if (equal program "rsync")
+                     (monk-exec-create :exit-code 124
+                                       :output (concat "timeout: failed to run command \u2018hostlookup\u2019: No such file or directory\n"
+                                                       "rsync: connection unexpectedly closed (0 bytes received so far) [sender]\n"
+                                                       "rsync error: unexplained error (code 255) at io.c(232) [sender=3.4.1]\n"))
+                   (ignore args)
+                   (monk-exec-create :exit-code 0 :output "")))))
+      (let* ((run (monk-converge m (lambda (_m) (monk-rsync "s" '("/x") "work:x")) :passes 1))
+             (comment (monk-result-comment (monk-test-result run "s"))))
+        (should (eq 'failed (monk-test-status run "s")))
+        (should (string-match-p "could not reach work:x (ssh exit 124, a ProxyCommand or Match exec timed out)" comment))
+        (should (string-match-p "hostlookup" comment))
+        (should-not (string-match-p "rsync error" comment))
+        (should-not (string-match-p "--itemize" comment))))))
 
 (ert-deftest monk-test-host-reachable-p ()
   "A listening local port is reachable; a closed one is not; answers are cached per run."
@@ -6027,7 +6046,7 @@ every agent this session used."
            (monk-log-level 'info)
            (monk-watch--unmanaged-seen nil) (monk-watch--unmanaged-count 0)
            (monk-watch--unmanaged-by-directory nil)
-           (w (monk-watch-create :machines (list m) :policy #'ignore :path-index (make-hash-table :test #'equal))))
+           (w (monk-watch-create :machines (list m) :policy #'ignore :path-index nil)))
       (make-directory noisy) (make-directory quiet)
       (let ((monk-watch--current w))
         (dotimes (i 5) (monk-watch--on-event (list nil 'changed (format "%sf%d" noisy i))))
@@ -6036,7 +6055,7 @@ every agent this session used."
         (should (equal (list (cons noisy 5) (cons quiet 1)) (monk-watch-noisy-directories)))
         (should (string-match-p "unmanaged mostly from .*noisy/ (5), .*quiet/ (1)" (monk-watch-status)))
         ;; the counts survive a carry-over (a reload)
-        (let ((w2 (monk-watch-create :machines (list m) :policy #'ignore :path-index (make-hash-table :test #'equal))))
+        (let ((w2 (monk-watch-create :machines (list m) :policy #'ignore :path-index nil)))
           (setq monk-watch--unmanaged-count 0 monk-watch--unmanaged-by-directory nil)
           (monk-watch--carry-over w2 6 0 (current-time) 6 (list (cons noisy 5) (cons quiet 1)))
           (should (= 6 monk-watch--unmanaged-count))

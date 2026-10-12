@@ -87,7 +87,7 @@
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-10-12.15"
+(defconst monk-build "2026-10-12.16"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
