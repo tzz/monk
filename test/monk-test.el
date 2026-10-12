@@ -145,7 +145,14 @@ timeout is killed with exit 124 and a note."
     ;; the default limit is on, so a resource cannot hang a converge
     (should (natnump monk-exec-timeout))
     ;; input still works through the pipe
-    (should (equal "piped" (monk-exec-output (monk-exec m "cat" :input "piped"))))))
+    (should (equal "piped" (monk-exec-output (monk-exec m "cat" :input "piped"))))
+    ;; a child that exits at once, before stdin is closed on it, is not
+    ;; a failure: `defaults read' did this on a Mac
+    (dotimes (_ 20)
+      (let ((exec (monk-exec m "true")))
+        (should (monk-exec-ok-p exec))))
+    (dotimes (_ 20)
+      (should (eql 3 (monk-exec-exit-code (monk-exec m "sh" "-c" "exit 3" :input "ignored")))))))
 
 (ert-deftest monk-test-compile-collects-in-order ()
   (let ((resources (monk-compile (monk-test-machine)

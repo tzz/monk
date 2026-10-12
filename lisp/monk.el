@@ -87,7 +87,7 @@
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-10-12.16"
+(defconst monk-build "2026-10-12.17"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -1018,9 +1018,16 @@ runs through TRAMP on a remote `default-directory'."
                              :file-handler t
                              :sentinel #'ignore))
          (deadline (and timeout (+ (float-time) timeout))))
-    (when input
-      (process-send-string proc input))
-    (process-send-eof proc)
+    ;; A fast child (`defaults read') can exit before this line runs;
+    ;; writing to it then signals "not running: finished" and the
+    ;; resource failed for nothing (2026-10-12).  A child that quit
+    ;; without reading its input did not want it.
+    (condition-case nil
+        (progn
+          (when input
+            (process-send-string proc input))
+          (process-send-eof proc))
+      (error nil))
     (while (process-live-p proc)
       (accept-process-output proc monk-exec-poll-seconds)
       (run-hooks 'monk-exec-yield-functions)
