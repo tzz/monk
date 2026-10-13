@@ -314,6 +314,33 @@ when no agent runs there.  Already connected: show `*monk*' again."
     (cancel-timer monk-connect--waiting-timer)
     (setq monk-connect--waiting-timer nil)))
 
+(defun monk-connect-probe-build (prefix)
+  "Return the build of the agent behind PREFIX from one `status' request, or nil.
+A short-lived connection that never subscribes: the agent prints
+nothing for it.  Nil when the agent is not there or did not answer
+within 3 s."
+  (condition-case nil
+      (let* ((socket (if prefix (monk-connect-remote-socket prefix) (monk-connect-socket)))
+             (reply nil)
+             (proc (and socket
+                        (file-exists-p (if prefix (concat prefix socket) socket))
+                        (monk-connect--open prefix socket))))
+        (when proc
+          (unwind-protect
+              (progn
+                (set-process-sentinel proc #'ignore)
+                (set-process-filter proc (lambda (_p chunk)
+                                           (let ((event (monk-event-parse (car (split-string chunk "\n" t)))))
+                                             (when (equal (alist-get 'op event) "status")
+                                               (setq reply event)))))
+                (process-send-string proc (monk-event-line '((op . "status"))))
+                (let ((deadline (+ (float-time) 3)))
+                  (while (and (null reply) (< (float-time) deadline) (process-live-p proc))
+                    (accept-process-output proc 0.1)))
+                (alist-get 'build reply))
+            (ignore-errors (delete-process proc)))))
+    (error nil)))
+
 (defun monk-connect--poke (prefix)
   "Send SIGUSR1 to the agent behind PREFIX (nil: this host), so it reloads.
 Return non-nil when a signal was sent."
@@ -353,22 +380,21 @@ differ: the agent could not reload, and its log says why."
     (unless (monk-connect--poke prefix)
       (user-error "No agent is running on %s to reconnect to"
                   (if prefix (file-remote-p prefix 'host) "this host")))
+    ;; Poll the agent's build with a bare `status' probe, not a
+    ;; subscription: ten subscribe/leave pairs in the agent log for one
+    ;; reconnect was noise (2026-10-13).  Connect once, when it matches.
     (let ((deadline (+ (float-time) monk-connect-reload-wait))
-          (monk-connect-require-same-build nil)
           (last-build nil))
       (while (and (< (float-time) deadline)
                   (not (equal last-build monk-build)))
         (sleep-for 1)
-        (condition-case nil
-            (let ((inhibit-message t))
-              (monk-connect--open-session nil prefix)
-              (setq last-build (alist-get 'build monk-connect--status))
-              (unless (equal last-build monk-build)
-                (monk-connect--close)))
-          (user-error nil)))
+        (setq last-build (or (monk-connect-probe-build prefix) last-build)))
       (if (equal last-build monk-build)
-          (message "Reconnected to the agent on %s, build %s"
-                   (alist-get 'host monk-connect--status) monk-build)
+          (progn
+            (let ((inhibit-message t))
+              (monk-connect--open-session nil prefix))
+            (message "Reconnected to the agent on %s, build %s"
+                     (alist-get 'host monk-connect--status) monk-build))
         (user-error "The agent on %s is still on build %s after %ds (this session: %s); see its log"
                     (if prefix (file-remote-p prefix 'host) "this host")
                     (or last-build "unknown") monk-connect-reload-wait monk-build)))))

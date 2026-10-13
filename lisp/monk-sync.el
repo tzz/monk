@@ -88,6 +88,15 @@ on this host (2026-10-12: a jump-host lookup tool on a Mac).  All
 read as unreachable: the peer was never spoken to, and the rest of
 the policy must go on.")
 
+(defun monk-rsync--last-lines (exec n)
+  "Return the last N lines of EXEC's output as one string.
+Monk's own notes are left out."
+  (let ((lines (seq-remove (lambda (l) (string-prefix-p "monk: " l))
+                           (split-string (monk-exec-output exec) "\n" t))))
+    (if lines
+        (string-join (last lines n) " | ")
+      "(none)")))
+
 (defun monk-rsync--transport-message (exec)
   "Return the line of EXEC's output that explains a transport failure.
 The ssh or helper message, not rsync's generic trailer and not the
@@ -310,6 +319,25 @@ The real run itemizes too, so the repair comment can name the items."
 (cl-defmethod monk-check ((r monk-rsync-resource) (m monk-machine))
   (let ((exec (monk--rsync-run r m t)))
     (cond
+     ;; the machine slept while rsync ran: the peer was away, not broken
+     ((and (not (monk-exec-ok-p exec)) (monk-exec-slept-p exec))
+      (signal 'monk-resource-error
+              (list (format "rsync to %s did not finish: the machine slept during the transfer%s"
+                            (oref r destination)
+                            (if (monk-exec-timed-out-p exec)
+                                (format " (stopped after %ds)" monk-exec-timeout)
+                              "")))))
+     ;; Monk's own wall-clock kill, not ssh.  rsync's --timeout only
+     ;; counts once the protocol runs and ssh keepalives only once the
+     ;; session is up, so a stall before either (DNS, a LocalCommand,
+     ;; a ProxyCommand, a VPN that dropped) reaches this limit with no
+     ;; message of its own (2026-10-13, 600 s, machine awake).  The
+     ;; last lines of output say how far ssh got.
+     ((monk-exec-timed-out-p exec)
+      (signal 'monk-resource-error
+              (list (format "rsync to %s hung for %ds before any transfer and was stopped; last output: %s"
+                            (oref r destination) monk-exec-timeout
+                            (monk-rsync--last-lines exec 3)))))
      ((memq (monk-exec-exit-code exec) monk-rsync-transport-failure-exits)
       (signal 'monk-resource-error
               (list (format "rsync could not reach %s (ssh exit %d%s): %s"

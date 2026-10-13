@@ -87,7 +87,7 @@
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-10-12.17"
+(defconst monk-build "2026-10-13.2"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -921,6 +921,28 @@ longer passes `:timeout SECONDS' to `monk-exec'."
 (defconst monk-exec-poll-seconds 0.1
   "How long one wait on a running command lasts before timers and sockets run.")
 
+(defconst monk-exec-sleep-gap-seconds 30
+  "A single wait that takes this much longer than asked means the machine slept.
+`accept-process-output' with a 0.1 s limit returning after minutes is
+not a slow command; the laptop lid was closed.  The command then gets
+its timeout budget back and, when it still fails, the result says the
+machine slept rather than that the command overran.")
+
+(defconst monk-exec-slept-note "monk: the machine slept during the command"
+  "Text appended to a command's output when a sleep was detected while it ran.
+`monk-exec-slept-p' finds it; rsync reads it as the host having been
+away, not as a transport fault.")
+
+(defun monk-exec-timed-out-p (exec)
+  "Return non-nil when EXEC was stopped by `monk-exec-timeout'.
+Nil when the command exited on its own, even with code 124."
+  (and (eql (monk-exec-exit-code exec) monk-exec-timeout-exit)
+       (string-match-p "(monk-exec-timeout)" (monk-exec-output exec))))
+
+(defun monk-exec-slept-p (exec)
+  "Return non-nil when the machine slept while EXEC ran."
+  (string-match-p (regexp-quote monk-exec-slept-note) (monk-exec-output exec)))
+
 (defvar monk-exec-yield-functions nil
   "Functions called while a command runs, between waits, with no arguments.
 The agent uses it to serve socket requests during a converge.  The
@@ -1028,15 +1050,33 @@ runs through TRAMP on a remote `default-directory'."
             (process-send-string proc input))
           (process-send-eof proc))
       (error nil))
-    (while (process-live-p proc)
-      (accept-process-output proc monk-exec-poll-seconds)
-      (run-hooks 'monk-exec-yield-functions)
-      (when (and deadline (> (float-time) deadline) (process-live-p proc))
-        (delete-process proc)
+    (let ((slept nil))
+      (while (process-live-p proc)
+        (let ((before (float-time)))
+          (accept-process-output proc monk-exec-poll-seconds)
+          ;; A wait of 0.1 s that took half a minute: the machine was
+          ;; asleep (laptop lid, 2026-10-13).  Neither rsync's io timer
+          ;; nor ssh keepalives fire across a sleep, and the command's
+          ;; own deadline would count the nap against it.  Push the
+          ;; deadline out by the nap and remember it for the result.
+          (let ((gap (- (float-time) before)))
+            (when (> gap monk-exec-sleep-gap-seconds)
+              (setq slept t)
+              (when deadline (setq deadline (+ deadline gap)))
+              (monk-log 'info "%s: machine slept %ds during the command" program (round gap)))))
+        (run-hooks 'monk-exec-yield-functions)
+        (when (and deadline (> (float-time) deadline) (process-live-p proc))
+          (delete-process proc)
+          (with-current-buffer buffer
+            (goto-char (point-max))
+            (insert (format "\nmonk: %s stopped after %ds (monk-exec-timeout)\n" program timeout))
+            (when slept (insert monk-exec-slept-note "\n")))
+          (cl-return-from monk-exec--yielding monk-exec-timeout-exit)))
+      (when slept
         (with-current-buffer buffer
           (goto-char (point-max))
-          (insert (format "\nmonk: %s stopped after %ds (monk-exec-timeout)\n" program timeout)))
-        (cl-return-from monk-exec--yielding monk-exec-timeout-exit)))
+          (unless (bolp) (insert "\n"))
+          (insert monk-exec-slept-note "\n"))))
     ;; a last drain: output that arrived with the exit
     (accept-process-output proc 0)
     (process-exit-status proc)))

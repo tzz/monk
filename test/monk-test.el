@@ -144,6 +144,23 @@ timeout is killed with exit 124 and a note."
       (should (< (- (float-time) start) 5)))
     ;; the default limit is on, so a resource cannot hang a converge
     (should (natnump monk-exec-timeout))
+    ;; a nap: one wait returns far later than asked; the deadline moves
+    ;; out by the nap and the output says the machine slept
+    (let ((monk-exec-sleep-gap-seconds 0.5) (naps 0))
+      (cl-letf* ((real-accept (symbol-function 'accept-process-output))
+                 ((symbol-function 'accept-process-output)
+                  (lambda (&rest args)
+                    (when (and (= naps 0) (processp (car args)))
+                      (cl-incf naps)
+                      ;; pretend the machine was away for 0.8 s
+                      (sleep-for 0.8))
+                    (apply real-accept args))))
+        (let ((exec (monk-exec m "sh" "-c" "sleep 1.2; exit 0" :timeout 1)))
+          ;; without the nap credit this would have hit the 1 s limit
+          (should (monk-exec-ok-p exec))
+          (should (monk-exec-slept-p exec))
+          (should-not (monk-exec-timed-out-p exec)))))
+    (should (monk-exec-timed-out-p (monk-exec m "sleep" "5" :timeout 1)))
     ;; input still works through the pipe
     (should (equal "piped" (monk-exec-output (monk-exec m "cat" :input "piped"))))
     ;; a child that exits at once, before stdin is closed on it, is not
@@ -1819,7 +1836,34 @@ inside a walked tree is dropped, and ~ itself is never walked."
         (should (string-match-p "could not reach work:x (ssh exit 124, a ProxyCommand or Match exec timed out)" comment))
         (should (string-match-p "hostlookup" comment))
         (should-not (string-match-p "rsync error" comment))
-        (should-not (string-match-p "--itemize" comment))))))
+        (should-not (string-match-p "--itemize" comment))))
+    ;; Monk's own 600 s kill is not an ssh helper timeout: the comment
+    ;; says the transfer hung and quotes the last ssh lines
+    (cl-letf (((symbol-function 'monk-exec)
+               (lambda (_m program &rest args)
+                 (if (equal program "rsync")
+                     (monk-exec-create :exit-code monk-exec-timeout-exit
+                                       :output "debug1: Authenticating to work:22 as 't'\nmonk: rsync stopped after 600s (monk-exec-timeout)\n")
+                   (ignore args)
+                   (monk-exec-create :exit-code 0 :output "")))))
+      (let* ((run (monk-converge m (lambda (_m) (monk-rsync "s" '("/x") "work:x")) :passes 1))
+             (comment (monk-result-comment (monk-test-result run "s"))))
+        (should (eq 'failed (monk-test-status run "s")))
+        (should (string-match-p "hung for 600s before any transfer" comment))
+        (should (string-match-p "Authenticating to work" comment))
+        (should-not (string-match-p "ProxyCommand" comment))))
+    ;; and when the machine slept meanwhile, the comment says that instead
+    (cl-letf (((symbol-function 'monk-exec)
+               (lambda (_m program &rest args)
+                 (if (equal program "rsync")
+                     (monk-exec-create :exit-code monk-exec-timeout-exit
+                                       :output (concat "monk: rsync stopped after 600s (monk-exec-timeout)\n"
+                                                       monk-exec-slept-note "\n"))
+                   (ignore args)
+                   (monk-exec-create :exit-code 0 :output "")))))
+      (let* ((run (monk-converge m (lambda (_m) (monk-rsync "s" '("/x") "work:x")) :passes 1))
+             (comment (monk-result-comment (monk-test-result run "s"))))
+        (should (string-match-p "the machine slept during the transfer (stopped after 600s)" comment))))))
 
 (ert-deftest monk-test-host-reachable-p ()
   "A listening local port is reachable; a closed one is not; answers are cached per run."
@@ -6018,9 +6062,15 @@ every agent this session used."
               ;; the agent is still serving and has no stale subscriber
               (accept-process-output nil 0.2)
               (should-not monk-agent--subscribers)
-              ;; reconnect: poke, wait, connect
-              (let ((monk-connect-reload-wait 5))
-                (monk-reconnect))
+              ;; reconnect: poke, probe with status (no subscribe), connect once
+              (let ((monk-connect-reload-wait 5) (joins 0))
+                (cl-letf* ((real-handle (symbol-function 'monk-agent-handle))
+                           ((symbol-function 'monk-agent-handle)
+                            (lambda (request)
+                              (when (equal (alist-get 'op request) "subscribe") (cl-incf joins))
+                              (funcall real-handle request))))
+                  (monk-reconnect))
+                (should (= 1 joins)))
               (should (= 1 poked))
               (should (monk-connect-active-p))
               (should (equal monk-build (alist-get 'build monk-connect--status)))
