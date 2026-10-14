@@ -159,7 +159,38 @@ timeout is killed with exit 124 and a note."
           ;; without the nap credit this would have hit the 1 s limit
           (should (monk-exec-ok-p exec))
           (should (monk-exec-slept-p exec))
-          (should-not (monk-exec-timed-out-p exec)))))
+          (should-not (monk-exec-timed-out-p exec))))
+      ;; a command that fails across a nap runs once more; the second
+      ;; attempt's output and exit stand, with a note
+      (setq naps 0)
+      (monk-test-with-tmpdir dir
+        (let ((flag (concat dir "second")))
+          (cl-letf* ((real-accept (symbol-function 'accept-process-output))
+                     ((symbol-function 'accept-process-output)
+                      (lambda (&rest args)
+                        (when (and (= naps 0) (processp (car args)))
+                          (cl-incf naps)
+                          (sleep-for 0.8))
+                        (apply real-accept args))))
+            ;; first run: no flag yet -> exit 1 (across the nap); second run: flag -> ok
+            (let ((exec (monk-exec m "sh" "-c" (format "if [ -e %s ]; then echo second; exit 0; else touch %s; sleep 0.3; exit 1; fi" flag flag))))
+              (should (monk-exec-ok-p exec))
+              (should (string-match-p "second" (monk-exec-output exec)))
+              (should (string-match-p (regexp-quote monk-exec-retried-note) (monk-exec-output exec)))))
+          ;; with the retry off, the first attempt is what you get
+          (delete-file flag)
+          (setq naps 0)
+          (cl-letf* ((real-accept (symbol-function 'accept-process-output))
+                     ((symbol-function 'accept-process-output)
+                      (lambda (&rest args)
+                        (when (and (= naps 0) (processp (car args)))
+                          (cl-incf naps)
+                          (sleep-for 0.8))
+                        (apply real-accept args)))
+                     (monk-exec-retry-after-sleep nil))
+            (let ((exec (monk-exec m "sh" "-c" (format "if [ -e %s ]; then exit 0; else touch %s; sleep 0.3; exit 1; fi" flag flag))))
+              (should (eql 1 (monk-exec-exit-code exec)))
+              (should (monk-exec-slept-p exec)))))))
     (should (monk-exec-timed-out-p (monk-exec m "sleep" "5" :timeout 1)))
     ;; input still works through the pipe
     (should (equal "piped" (monk-exec-output (monk-exec m "cat" :input "piped"))))
@@ -1863,7 +1894,11 @@ inside a walked tree is dropped, and ~ itself is never walked."
                    (monk-exec-create :exit-code 0 :output "")))))
       (let* ((run (monk-converge m (lambda (_m) (monk-rsync "s" '("/x") "work:x")) :passes 1))
              (comment (monk-result-comment (monk-test-result run "s"))))
-        (should (string-match-p "the machine slept during the transfer (stopped after 600s)" comment))))))
+        ;; interrupted: skipped with the reason, and the run is ok
+        (should (eq 'skipped (monk-test-status run "s")))
+        (should (monk-run-ok-p run))
+        (should-not (monk-run-unreachable run))
+        (should (string-match-p "the machine slept during the transfer to work:x (stopped after 600s); next run" comment))))))
 
 (ert-deftest monk-test-host-reachable-p ()
   "A listening local port is reachable; a closed one is not; answers are cached per run."

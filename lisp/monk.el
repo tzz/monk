@@ -87,7 +87,7 @@
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-10-13.2"
+(defconst monk-build "2026-10-14.1"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -291,6 +291,7 @@ Each is called with two arguments: EVENT, one of `run-start',
 (define-error 'monk-requisite-error "Monk requisite error" 'monk-error)
 (define-error 'monk-guard-error "Monk guard error" 'monk-error)
 (define-error 'monk-command-unchanged "Monk command ran without change" 'monk-error)
+(define-error 'monk-interrupted-error "Monk resource interrupted" 'monk-error)
 (define-error 'monk-cel-error "Monk CEL error" 'monk-guard-error)
 
 ;;;; Scopes and owners
@@ -928,6 +929,17 @@ not a slow command; the laptop lid was closed.  The command then gets
 its timeout budget back and, when it still fails, the result says the
 machine slept rather than that the command overran.")
 
+(defcustom monk-exec-retry-after-sleep t
+  "When non-nil, a command that failed after the machine slept runs once more.
+A network command that was open across a sleep has a dead connection
+and fails on wake whatever the remote state; the second attempt
+answers for the real state.  The retry's output replaces the first;
+a note says there was one.  Nil reports the first attempt."
+  :type 'boolean)
+
+(defconst monk-exec-retried-note "monk: retried once after the machine slept"
+  "Text appended to a command's output when it ran again after a sleep.")
+
 (defconst monk-exec-slept-note "monk: the machine slept during the command"
   "Text appended to a command's output when a sleep was detected while it ran.
 `monk-exec-slept-p' finds it; rsync reads it as the host having been
@@ -999,7 +1011,21 @@ Signal `monk-exec-error' on non-zero exit.")
                        ;; remote sudo: TRAMP's synchronous path knows
                        ;; how to answer the password prompt
                        (monk-exec--synchronous program args input)
-                     (monk-exec--yielding program args input timeout))
+                     (let ((code (monk-exec--yielding program args input timeout)))
+                       (if (and monk-exec-retry-after-sleep
+                                (not (eql code 0))
+                                (monk-exec-slept-p (monk-exec-create :exit-code code :output (buffer-string))))
+                           ;; the first attempt went across a sleep: its
+                           ;; connection is dead whatever the far side
+                           ;; looks like; one more try, output replaced
+                           (progn
+                             (monk-log 'info "%s: failed across a sleep; running it again" program)
+                             (erase-buffer)
+                             (prog1 (monk-exec--yielding program args input timeout)
+                               (goto-char (point-max))
+                               (unless (bolp) (insert "\n"))
+                               (insert monk-exec-retried-note "\n")))
+                         code)))
                  ;; A missing program is an exit like any other, code
                  ;; 127 as the shell would say, so callers that test
                  ;; `monk-exec-ok-p' need no separate error path.
@@ -2703,15 +2729,24 @@ report only.  After a repair, `monk-resource-verify' can still fail it."
               (signal 'monk-resource-error
                       (list (format "repaired, but verify failed: %s" reason))))))))
     (error
-     (if (monk-unreachable-error-p err)
-         (progn
-           (monk--mark-unreachable machine (error-message-string err))
-           (setf (monk-result-status result) monk-status-unreachable
-                 (monk-result-degree result) 0.0
-                 (monk-result-comment result) (monk-unreachable-reason (error-message-string err))))
+     (cond
+      ((monk-unreachable-error-p err)
+       (monk--mark-unreachable machine (error-message-string err))
+       (setf (monk-result-status result) monk-status-unreachable
+             (monk-result-degree result) 0.0
+             (monk-result-comment result) (monk-unreachable-reason (error-message-string err))))
+      ;; The resource did not get to finish and nothing is known to be
+      ;; wrong: the machine slept under it.  Not a failure, not an
+      ;; unreachable machine (the next resource may be fine); skipped,
+      ;; with the reason, and the run stays ok (2026-10-14: three
+      ;; overnight converges read as failed for a laptop nap).
+      ((eq (car err) 'monk-interrupted-error)
+       (setf (monk-result-status result) monk-status-skipped
+             (monk-result-comment result) (cadr err)))
+      (t
        (setf (monk-result-status result)
              (if (> (monk-result-degree result) 0.0) monk-status-partial monk-status-failed)
-             (monk-result-comment result) (error-message-string err)))
+             (monk-result-comment result) (error-message-string err))))
      ;; The result itself carries the failure; reports and the CLI
      ;; print it.  Logged at info so a terminal does not see it twice.
      (monk-log 'info "%s: %s %s %s: %s"

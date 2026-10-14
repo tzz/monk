@@ -319,10 +319,11 @@ The real run itemizes too, so the repair comment can name the items."
 (cl-defmethod monk-check ((r monk-rsync-resource) (m monk-machine))
   (let ((exec (monk--rsync-run r m t)))
     (cond
-     ;; the machine slept while rsync ran: the peer was away, not broken
+     ;; the machine slept while rsync ran: interrupted, not failed; the
+     ;; next converge does the sync
      ((and (not (monk-exec-ok-p exec)) (monk-exec-slept-p exec))
-      (signal 'monk-resource-error
-              (list (format "rsync to %s did not finish: the machine slept during the transfer%s"
+      (signal 'monk-interrupted-error
+              (list (format "the machine slept during the transfer to %s%s; next run"
                             (oref r destination)
                             (if (monk-exec-timed-out-p exec)
                                 (format " (stopped after %ds)" monk-exec-timeout)
