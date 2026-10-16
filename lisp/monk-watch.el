@@ -107,6 +107,16 @@ and the system is Darwin, else `filenotify'.  `fswatch' or `filenotify'
 force one.  nil watches nothing locally; remote polling still runs."
   :type '(choice (const auto) (const fswatch) (const filenotify) (const nil)))
 
+(defcustom monk-watch-follow-links t
+  "When non-nil, a watched path that is a symlink is watched at its target too.
+What the machine sees through ~/.tmux.conf is the file in the repo it
+points at; an edit there is drift for whatever reads the link (an
+rsync that copies through it, a program that loads it) even though
+the link itself is unchanged.  The link is watched as well, so a
+retarget is seen, and the repath check (`monk-watch-repath-interval')
+moves the watch when the target changes.  Nil watches the link only."
+  :type 'boolean)
+
 (defcustom monk-watch-repath-interval 300
   "Seconds between checks that watched paths still resolve to the same places.
 FSEvents and kqueue watch the directory a path resolved to when the
@@ -164,6 +174,7 @@ Each check is a dry run over TRAMP, so keep this in minutes."
   (runs 0)
   (started (current-time))
   (repath-timer nil)       ; see `monk-watch-repath-interval'
+  (repath-soon-timer nil)  ; armed by a link event; see `monk-watch--repath-soon'
   (path-signature nil))    ; what the owned paths resolved to at start
 
 (defvar monk-watch--current nil
@@ -299,11 +310,25 @@ The frame advances with each call, so consecutive lines roll."
 ;;;; Path index
 
 (defun monk-watch--node-paths (node)
-  "Return the expanded target-side paths that NODE owns."
-  (let ((m (monk-node-machine node))
-        (r (monk-node-resource node)))
-    (mapcar (lambda (p) (monk-machine-expand m p (oref r sudo)))
-            (monk-resource-paths r))))
+  "Return the expanded target-side paths that NODE owns.
+With `monk-watch-follow-links', a local path that is a symlink
+contributes its current target as well: ~/.tmux.conf ->
+autodist/files/tmux.conf edited in the repo is drift for everything
+that reads the link \(2026-10-16: an edit there changed nothing the
+watch indexed).  The link stays owned too.  Targets are resolved at
+index time; the repath check sees a retarget and reindexes."
+  (let* ((m (monk-node-machine node))
+         (r (monk-node-resource node))
+         (paths (mapcar (lambda (p) (monk-machine-expand m p (oref r sudo)))
+                        (monk-resource-paths r))))
+    (if (not (and monk-watch-follow-links (monk-machine-local-p m)))
+        paths
+      (append paths
+              (delq nil (mapcar (lambda (p)
+                                  (and (file-symlink-p (directory-file-name p))
+                                       (file-exists-p p)
+                                       (file-truename p)))
+                                paths))))))
 
 (defun monk-watch-real-path (path)
   "Return PATH with every symlink in its directory part resolved.
@@ -372,11 +397,36 @@ writes the kernel reports late."
          (t
           (dolist (f (cons file rest))
             (monk-watch--adopt-new-file watch f)
+            ;; an event on an owned path that is a symlink is a possible
+            ;; retarget: resolve again now, not at the next 300 s tick
+            (when (and monk-watch-follow-links (monk-watch--owned-link-p watch f))
+              (monk-watch--repath-soon watch))
             (let ((nodes (monk-watch--nodes-for-file watch f)))
               (if nodes
                   (dolist (node nodes)
                     (monk-watch--queue watch (monk-node-key node) f action))
                 (monk-watch--unmanaged watch f action))))))))))
+
+(defun monk-watch--owned-link-p (watch file)
+  "Return non-nil when FILE is an owned path of WATCH and is a symlink now."
+  (let ((full (monk-watch-real-path file)))
+    (and (seq-some (lambda (entry) (assoc full (cdr entry)))
+                   (monk-watch-path-index watch))
+         (file-symlink-p (directory-file-name full)))))
+
+(defconst monk-watch-repath-soon-delay 0.5
+  "Seconds after a link event before the paths are resolved again.
+Long enough for `ln -sf' (unlink then link) to finish both steps.")
+
+(defun monk-watch--repath-soon (watch)
+  "Arm one short timer that runs `monk-watch--repath' for WATCH."
+  (unless (monk-watch-repath-soon-timer watch)
+    (setf (monk-watch-repath-soon-timer watch)
+          (run-at-time monk-watch-repath-soon-delay nil
+                       (lambda ()
+                         (when (eq watch monk-watch--current)
+                           (setf (monk-watch-repath-soon-timer watch) nil)
+                           (monk-watch--repath)))))))
 
 (defvar monk-watch--unmanaged-seen nil
   "Paths already reported as unmanaged, so a busy directory logs once.")
@@ -678,7 +728,10 @@ machines get filesystem notifications; remote ones are polled every
   "Cancel the repath timer of WATCH, if any."
   (when (monk-watch-repath-timer watch)
     (cancel-timer (monk-watch-repath-timer watch))
-    (setf (monk-watch-repath-timer watch) nil)))
+    (setf (monk-watch-repath-timer watch) nil))
+  (when (monk-watch-repath-soon-timer watch)
+    (cancel-timer (monk-watch-repath-soon-timer watch))
+    (setf (monk-watch-repath-soon-timer watch) nil)))
 
 (defun monk-watch-stop ()
   "Stop the active watch."
@@ -738,7 +791,12 @@ Equal signatures mean the kernel watches the same places."
 Runs every `monk-watch-repath-interval' seconds.  Nothing runs when a
 run is in progress; the next tick looks again."
   (let ((w monk-watch--current))
-    (when (and w (not monk-watch--running) (not monk--current-run))
+    (cond
+     ((null w) nil)
+     ((or monk-watch--running monk--current-run)
+      ;; a run is on: look again right after it, not a tick later
+      (monk-watch--repath-soon w))
+     (t
       (let ((now (monk-watch--path-signature (monk-watch-nodes w))))
         (unless (equal now (monk-watch-path-signature w))
           (let ((moved (seq-difference now (monk-watch-path-signature w))))
@@ -752,7 +810,7 @@ run is in progress; the next tick looks again."
                 (started (monk-watch-started w)))
             (monk-watch-stop)
             (let ((new (apply #'monk-watch-start machines policy options)))
-              (when new (monk-watch--carry-over new events runs started)))))))))
+              (when new (monk-watch--carry-over new events runs started))))))))))
 
 (defun monk-watch-status ()
   "Return a one-line description of the active watch, or nil."

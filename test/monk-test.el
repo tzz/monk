@@ -6128,6 +6128,51 @@ every agent this session used."
           (ignore-errors (monk-disconnect))
           (monk-agent-stop-local))))))
 
+(ert-deftest monk-test-watch-follows-rsync-source-links-to-their-targets ()
+  "Every resource owns the target behind a symlinked path, by default:
+an edit to the target is drift for it, the target's directory is
+watched, and a retarget moves the watch.  `monk-watch-follow-links' nil
+owns the link only."
+  (require 'monk-sync) (require 'monk-watch)
+  (monk-test-with-tmpdir dir
+    (let* ((m (monk-test-machine))
+           (repo (concat dir "repo/files/"))
+           (home (concat dir "home/")))
+      (make-directory repo t) (make-directory home t)
+      (with-temp-file (concat repo "tmux.conf") (insert "set -g x\n"))
+      (make-symbolic-link (concat repo "tmux.conf") (concat home ".tmux.conf"))
+      (let* ((nodes (monk--nodes-for (list m)
+                                     (lambda (_m)
+                                       (monk-rsync "home files" (list (concat home ".tmux.conf")) "work.invalid:"
+                                                   :follow-links t)
+                                       (monk-rsync "plain" (list (concat home ".tmux.conf")) "work.invalid:other/"))))
+             (w (monk-watch-create :machines (list m) :policy #'ignore
+                                   :path-index (monk-watch--build-index nodes)))
+             (target (file-truename (concat repo "tmux.conf"))))
+        ;; the target is owned by both resources that name the link
+        (should (= 2 (length (monk-watch--nodes-for-file w target))))
+        ;; the link itself is owned by both
+        (should (= 2 (length (monk-watch--nodes-for-file w (concat home ".tmux.conf")))))
+        ;; the target's directory is among the watched flat dirs
+        (pcase-let ((`(,flat . ,_trees) (monk-watch--fswatch-paths w)))
+          (should (member (directory-file-name (file-truename repo)) flat)))
+        ;; a retarget changes the signature, so the repath check restarts the watch
+        (let ((before (monk-watch--path-signature nodes)))
+          (make-directory (concat dir "repo2/files/") t)
+          (with-temp-file (concat dir "repo2/files/tmux.conf") (insert "set -g y\n"))
+          (delete-file (concat home ".tmux.conf"))
+          (make-symbolic-link (concat dir "repo2/files/tmux.conf") (concat home ".tmux.conf"))
+          (let ((after (monk-watch--path-signature nodes)))
+            (should-not (equal before after))
+            (should (member (file-truename (concat dir "repo2/files/tmux.conf")) after))
+            (should-not (member target after))))
+        ;; with following off, only the link
+        (let ((monk-watch-follow-links nil))
+          (let ((w2 (monk-watch-create :machines (list m) :policy #'ignore
+                                       :path-index (monk-watch--build-index nodes))))
+            (should-not (monk-watch--nodes-for-file w2 (file-truename (concat dir "repo2/files/tmux.conf"))))
+            (should (= 2 (length (monk-watch--nodes-for-file w2 (concat home ".tmux.conf")))))))))))
+
 (ert-deftest monk-test-watch-names-noisy-directories ()
   "Unmanaged events are counted per directory; the stop line and status name the busiest."
   (require 'monk-watch)
@@ -6456,6 +6501,58 @@ read from the pid file over TRAMP and reached through nc or socat."
               (should-not (monk-watch--nodes-for-file monk-watch--current (concat dir "a/f")))
               (with-current-buffer monk-watch-log-buffer-name
                 (should (string-match-p "paths moved" (buffer-string))))))
+        (monk-watch-stop)))))
+
+(ert-deftest monk-test-watch-link-event-repaths-at-once ()
+  "An event on an owned symlink arms a short repath; the watch follows a
+retarget within `monk-watch-repath-soon-delay', not at the next tick.
+When a run is on, the repath is retried shortly after instead."
+  (monk-test-with-tmpdir dir
+    (make-directory (concat dir "a") t)
+    (make-directory (concat dir "b") t)
+    (with-temp-file (concat dir "a/f") (insert "x"))
+    (with-temp-file (concat dir "b/f") (insert "y"))
+    (make-symbolic-link (concat dir "a/f") (concat dir "link"))
+    (let ((monk-log-level nil)
+          (monk-watch-repath-interval 3600)
+          (monk-report-function #'ignore)
+          (m (monk-test-machine)))
+      (unwind-protect
+          (cl-letf (((symbol-function 'file-notify-add-watch) (lambda (&rest _) (cl-gensym "desc")))
+                    ((symbol-function 'file-notify-rm-watch) #'ignore)
+                    ((symbol-function 'file-notify-valid-p) (lambda (_) t))
+                    ((symbol-value 'file-notify--library) 'test)
+                    ((symbol-value 'monk-watch--delivery) 'yes))
+            (monk-watch-start m (lambda (_m) (monk-symlink (concat dir "link") (concat dir "a/f"))))
+            (let ((first monk-watch--current))
+              (should (member (concat dir "a/f") (monk-watch-path-signature first)))
+              ;; retarget the link, then the kernel reports the link path
+              (delete-file (concat dir "link"))
+              (make-symbolic-link (concat dir "b/f") (concat dir "link"))
+              (monk-watch--on-event (list nil 'changed (concat dir "link")))
+              (should (monk-watch-repath-soon-timer first))
+              ;; before the short delay nothing moved yet
+              (should (eq first monk-watch--current))
+              (let ((deadline (+ (float-time) 3)))
+                (while (and (eq first monk-watch--current) (< (float-time) deadline))
+                  (accept-process-output nil 0.1)))
+              (should-not (eq first monk-watch--current))
+              ;; the new target is owned now; a/f stays because the
+              ;; symlink resource declares it as the wanted target
+              (should (member (concat dir "b/f") (monk-watch-path-signature monk-watch--current)))
+              (should-not (member (concat dir "b/f") (monk-watch-path-signature first))))
+            ;; during a run the repath defers itself, then runs after
+            (let ((w monk-watch--current)
+                  (monk-watch--running t))
+              (monk-watch--repath)
+              (should (monk-watch-repath-soon-timer w))
+              (should (eq w monk-watch--current)))
+            ;; an event on a plain file arms nothing
+            (let ((w monk-watch--current))
+              (cancel-timer (monk-watch-repath-soon-timer w))
+              (setf (monk-watch-repath-soon-timer w) nil)
+              (monk-watch--on-event (list nil 'changed (concat dir "b/f")))
+              (should-not (monk-watch-repath-soon-timer w))))
         (monk-watch-stop)))))
 
 (ert-deftest monk-test-agent-source-repath ()

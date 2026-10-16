@@ -400,6 +400,7 @@ CHANGES: the two can differ when the source moved in between."
 (cl-defmethod monk-resource-owns-subtree-p ((_r monk-rsync-resource))
   t)
 
+
 (monk-define-resource monk-rsync monk-rsync-resource
   "Ensure DESTINATION mirrors SOURCES through rsync."
   ((name :type string :doc "Identifies the sync.")
