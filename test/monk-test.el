@@ -3130,6 +3130,59 @@ and a file that appears later is adopted on its directory event."
             (monk-watch-stop)
             (should-not (and proc (process-live-p proc)))))))))
 
+(ert-deftest monk-test-watch-fswatch-restarts-after-crash ()
+  "An fswatch that dies comes back after the first restart delay; the
+status says DOWN meanwhile; a stop does not restart it."
+  (monk-test-with-tmpdir dir
+    (let* ((bin (concat dir "bin/"))
+           (conf (concat dir "conf"))
+           (fake (concat bin "fswatch"))
+           (count (concat dir "starts"))
+           (monk-log-level nil)
+           (monk-watch-backend 'fswatch)
+           (monk-watch-fswatch-restart-delays '(0.3 0.3))
+           (monk-report-function #'ignore)
+           (m (monk-test-machine)))
+      (make-directory bin)
+      (with-temp-file conf (insert "x"))
+      ;; the fake counts its starts; the first one dies at once like a
+      ;; crash, later ones stay alive
+      (with-temp-file fake
+        (insert "#!/bin/sh\nn=$(cat " (shell-quote-argument count) " 2>/dev/null || echo 0)\n"
+                "echo $((n+1)) > " (shell-quote-argument count) "\n"
+                "if [ \"$n\" = 0 ]; then kill -SEGV $$; fi\nsleep 30\n"))
+      (set-file-modes fake #o755)
+      (let ((exec-path (cons (directory-file-name bin) exec-path)))
+        (unwind-protect
+            (progn
+              (monk-watch-start m (lambda (_m) (monk-file conf :content "x")))
+              (let ((w monk-watch--current))
+                (should (eq 'fswatch (monk-watch-backend w)))
+                ;; the first fswatch crashes: down, with a restart pending
+                (let ((deadline (+ (float-time) 3)))
+                  (while (and (monk-watch-backend-alive-p w) (< (float-time) deadline))
+                    (accept-process-output nil 0.05)))
+                (should-not (monk-watch-backend-alive-p w))
+                (should (string-match-p "DOWN" (monk-watch-status)))
+                (should (monk-watch-restart-timer w))
+                ;; after the delay it is back
+                (let ((deadline (+ (float-time) 5)))
+                  (while (and (not (monk-watch-backend-alive-p w)) (< (float-time) deadline))
+                    (accept-process-output nil 0.05) (sit-for 0.02)))
+                (should (monk-watch-backend-alive-p w))
+                (should (= 1 (monk-watch-restarts w)))
+                (should-not (string-match-p "DOWN" (monk-watch-status)))
+                (should (eq w monk-watch--current))
+                (with-current-buffer monk-watch-log-buffer-name
+                  (should (string-match-p "fswatch exited: .*restarting in 0s" (buffer-string)))
+                  (should (string-match-p "fswatch restarted (attempt 1)" (buffer-string))))
+                ;; a deliberate stop restarts nothing
+                (monk-watch-stop)
+                (accept-process-output nil 0.5)
+                (should-not monk-watch--current)
+                (should (equal "2" (string-trim (with-temp-buffer (insert-file-contents count) (buffer-string)))))))
+          (ignore-errors (monk-watch-stop)))))))
+
 (ert-deftest monk-test-testdrive-focus-from-side-window ()
   "The tour can take the frame even when a side window is selected.
 That is where the report leaves point, and `delete-other-windows'
@@ -6156,6 +6209,8 @@ owns the link only."
         ;; the target's directory is among the watched flat dirs
         (pcase-let ((`(,flat . ,_trees) (monk-watch--fswatch-paths w)))
           (should (member (directory-file-name (file-truename repo)) flat)))
+        ;; the link targets are countable, for the start line and the idle line
+        (should (equal (list (cons (concat home ".tmux.conf") target)) (monk-watch-link-targets nodes)))
         ;; a retarget changes the signature, so the repath check restarts the watch
         (let ((before (monk-watch--path-signature nodes)))
           (make-directory (concat dir "repo2/files/") t)

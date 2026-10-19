@@ -678,8 +678,13 @@ runs is remembered and served right after."
                                                              (current-time))))))))
     (if (null w)
         "watching"
-      (format "watching %d dir(s)  %d run(s)  up %s%s  source: %s"
-              (length (monk-watch-watched w)) (monk-watch-runs w)
+      (format "%s %d dir(s) %d link(s)  %d run(s)  up %s%s  source: %s"
+              (if (monk-watch-backend-alive-p w)
+                  "watching"
+                (monk-cli--color "31" "WATCH DOWN, restart pending;"))
+              (length (monk-watch-watched w))
+              (length (monk-watch-link-targets (monk-watch-nodes w)))
+              (monk-watch-runs w)
               (monk-format-duration (float-time (time-since (monk-watch-started w))) t)
               (if next (format "  full in %s" (monk-format-duration next)) "")
               (or monk-agent--source-backend "off")))))

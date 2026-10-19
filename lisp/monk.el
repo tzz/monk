@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.8.3
+;; Version: 0.8.4
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -82,12 +82,12 @@
 
 ;;;; Version
 
-(defconst monk-version "0.8.3"
+(defconst monk-version "0.8.4"
   "Monk's version.  Patch for small work, minor for a large ask.
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-10-16.3"
+(defconst monk-build "2026-10-19.2"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")

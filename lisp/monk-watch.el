@@ -95,8 +95,26 @@ process that watches owned subtrees: a home directory that holds a
 few managed dotfiles must not be walked, or every application's
 scratch file under it becomes an event.")
 
-(defconst monk-watch-fswatch-excludes '("/\\.git/" "/\\.Trash/" "/Library/Caches/")
-  "Regexps fswatch drops before Monk sees them.  Noise that no policy owns.")
+(defconst monk-watch-fswatch-excludes
+  '("/\\.git/" "/\\.Trash/" "/Library/Caches/"
+    ;; macOS writes under these every few seconds; a flat watch on
+    ;; ~/Library (one owned path there is enough) saw 5600 of 5900
+    ;; events from them in a day, and fswatch crashed under the load
+    ;; (2026-10-17, segmentation fault: 11)
+    "/Library/Biome/" "/Library/Preferences/" "/Library/Application Support/"
+    "/Library/Saved Application State/" "/Library/Containers/" "/Library/Group Containers/"
+    "/Library/HTTPStorages/" "/Library/Cookies/" "/Library/WebKit/" "/Library/Metadata/")
+  "Regexps fswatch drops before Monk sees them.  Noise that no policy owns.
+A path a policy does own under one of these would be missed; none of
+Monk's resources write there.")
+
+(defcustom monk-watch-fswatch-restart-delays '(2 10 60 300)
+  "Seconds to wait before restarting an fswatch that died, per attempt.
+The last value repeats.  fswatch crashed under a flood of events
+(2026-10-17) and the watch stayed dead for three days while the agent
+said \"watching\"; now it comes back on its own and the status says
+when it is down.  Nil never restarts."
+  :type '(repeat natnum))
 
 ;;;; Customization
 
@@ -164,6 +182,8 @@ Each check is a dry run over TRAMP, so keep this in minutes."
   (backend nil)         ; `fswatch', `filenotify', or nil
   (process nil)         ; the fswatch process over parent directories, flat
   (tree-process nil)    ; the recursive fswatch over owned subtrees
+  (restart-timer nil)   ; pending fswatch restart, see `monk-watch--fswatch-sentinel'
+  (restarts 0)          ; fswatch restarts so far, picks the delay
   (path-index nil)      ; alist of (EXPANDED-DIR . ((FILE . NODE) ...))
   (pending nil)         ; keys collected since the last reaction
   (pending-reasons nil) ; alist of (KEY . PATH) for the log
@@ -308,6 +328,20 @@ The frame advances with each call, so consecutive lines roll."
         (and (string-match-p "[Uu][Tt][Ff]-?8" lang) t))))
 
 ;;;; Path index
+
+(defun monk-watch-link-targets (nodes)
+  "Return ((LINK . TARGET) ...) for every owned symlink among local NODES.
+What `monk-watch-follow-links' adds to the index."
+  (let (out)
+    (dolist (node nodes)
+      (let ((m (monk-node-machine node))
+            (r (monk-node-resource node)))
+        (when (monk-machine-local-p m)
+          (dolist (p (mapcar (lambda (p) (monk-machine-expand m p (oref r sudo)))
+                             (monk-resource-paths r)))
+            (when (and (file-symlink-p (directory-file-name p)) (file-exists-p p))
+              (cl-pushnew (cons p (file-truename p)) out :test #'equal))))))
+    (nreverse out)))
 
 (defun monk-watch--node-paths (node)
   "Return the expanded target-side paths that NODE owns.
@@ -569,9 +603,55 @@ A partial path at the end of a chunk waits for the next one."
         (monk-watch--on-event (list proc 'changed path))))))
 
 (defun monk-watch--fswatch-sentinel (proc event)
-  "Log the end of PROC with EVENT; a dead watcher is worth noticing."
+  "PROC, an fswatch, ended with EVENT: log it and start it again after a delay.
+Only when PROC still belongs to the active watch; a process that was
+stopped on purpose (`monk-watch-stop', a repath) is not restarted."
   (unless (process-live-p proc)
-    (monk-watch--log "fswatch exited: %s" (string-trim event))))
+    (let ((w monk-watch--current))
+      (if (not (and w (memq proc (list (monk-watch-process w) (monk-watch-tree-process w)))))
+          (monk-watch--log "fswatch exited: %s" (string-trim event))
+        (let* ((n (monk-watch-restarts w))
+               (delays monk-watch-fswatch-restart-delays)
+               (delay (and delays (or (nth n delays) (car (last delays))))))
+          (monk-watch--log "fswatch exited: %s%s" (string-trim event)
+                           (if delay (format "; restarting in %ds" delay) "; not restarting"))
+          (run-hook-with-args 'monk-watch-functions 'backend-down
+                              (list :watch w :event (string-trim event)))
+          (when (and delay (null (monk-watch-restart-timer w)))
+            (setf (monk-watch-restart-timer w)
+                  (run-at-time delay nil #'monk-watch--fswatch-restart w))))))))
+
+(defun monk-watch--fswatch-restart (watch)
+  "Start WATCH's fswatch processes again after one died."
+  (setf (monk-watch-restart-timer watch) nil)
+  (when (eq watch monk-watch--current)
+    (cl-incf (monk-watch-restarts watch))
+    (dolist (proc (list (monk-watch-process watch) (monk-watch-tree-process watch)))
+      (when (process-live-p proc)
+        (set-process-sentinel proc #'ignore)
+        (delete-process proc)))
+    (setf (monk-watch-process watch) nil
+          (monk-watch-tree-process watch) nil
+          (monk-watch-watched watch) nil)
+    (if (monk-watch--fswatch-start watch)
+        (progn
+          (monk-watch--log "fswatch restarted (attempt %d) over %d dir%s"
+                           (monk-watch-restarts watch) (length (monk-watch-watched watch))
+                           (if (= 1 (length (monk-watch-watched watch))) "" "s"))
+          (run-hook-with-args 'monk-watch-functions 'backend-up (list :watch watch)))
+      (monk-watch--log "fswatch restart found nothing to watch"))))
+
+(defun monk-watch-backend-alive-p (&optional watch)
+  "Return non-nil when WATCH's local backend is running.
+For fswatch: at least one of its processes is live.  For filenotify
+and for a watch with no local machine: t.  Nil means events cannot
+arrive and the status must say so."
+  (let ((w (or watch monk-watch--current)))
+    (and w
+         (pcase (monk-watch-backend w)
+           ('fswatch (or (process-live-p (monk-watch-process w))
+                         (process-live-p (monk-watch-tree-process w))))
+           (_ t)))))
 
 (defun monk-watch--fswatch-paths (watch)
   "Return (FLAT . TREES) for WATCH: directories to watch flat, subtrees to walk.
@@ -705,7 +785,7 @@ machines get filesystem notifications; remote ones are polled every
           monk-watch--unmanaged-by-directory nil)
     (let ((remote (length (seq-remove #'monk-machine-local-p machines)))
           (local (length (seq-filter #'monk-machine-local-p machines))))
-      (monk-watch--log "started: %s, %s%s, mode %s"
+      (monk-watch--log "started: %s, %s%s, mode %s, %s"
                        (cond ((and (> local 0) (> remote 0))
                               (format "%d machines: %d local, %d remote" (length machines) local remote))
                              ((> remote 0) (format "%d remote machine%s" remote (if (= 1 remote) "" "s")))
@@ -719,7 +799,14 @@ machines get filesystem notifications; remote ones are polled every
                                               (if (monk-watch-file-watch-needed-p) ", dirs and files on kqueue" "")))
                          (_ (if (> local 0) "no local backend" "no local machine")))
                        (if (> remote 0) (format ", remote polled every %ds" monk-watch-poll-interval) "")
-                       monk-watch-mode))
+                       monk-watch-mode
+                       ;; how many link targets ride along: a 0 here with
+                       ;; symlinked dotfiles in the policy means the
+                       ;; following is off or this code is old (2026-10-19)
+                       (if monk-watch-follow-links
+                           (let ((n (length (monk-watch-link-targets nodes))))
+                             (format "%d link target%s" n (if (= 1 n) "" "s")))
+                         "links not followed")))
     (run-hook-with-args 'monk-watch-functions 'started (list :watch watch))
     watch))
 
@@ -750,6 +837,9 @@ machines get filesystem notifications; remote ones are polled every
       (when (monk-watch-poll-timer watch)
         (cancel-timer (monk-watch-poll-timer watch)))
       (monk-watch--cancel-repath watch)
+      (when (monk-watch-restart-timer watch)
+        (cancel-timer (monk-watch-restart-timer watch))
+        (setf (monk-watch-restart-timer watch) nil))
       (setq monk-watch--current nil)
       (monk-watch--log "stopped after %d event%s (%d unmanaged), %d run%s%s"
                        (monk-watch-events watch) (if (= 1 (monk-watch-events watch)) "" "s")
@@ -816,8 +906,9 @@ run is in progress; the next tick looks again."
   "Return a one-line description of the active watch, or nil."
   (when monk-watch--current
     (let ((w monk-watch--current))
-      (format "%s, %s, %d dir(s), %d event(s) (%d unmanaged), %d run(s), up %s%s"
+      (format "%s, %s%s, %d dir(s), %d event(s) (%d unmanaged), %d run(s), up %s%s"
               monk-watch-mode (or (monk-watch-backend w) "no local backend")
+              (if (monk-watch-backend-alive-p w) "" " DOWN (restart pending)")
               (length (monk-watch-watched w))
               (monk-watch-events w) monk-watch--unmanaged-count (monk-watch-runs w)
               (monk-format-duration (float-time (time-since (monk-watch-started w))) t)
