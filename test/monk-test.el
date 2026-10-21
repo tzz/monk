@@ -1974,7 +1974,11 @@ inside a walked tree is dropped, and ~ itself is never walked."
                      "-l" "/Users/x/policy.el" "-f" "monk-agent-main")
                    (alist-get 'ProgramArguments job)))
     (should (eq t (alist-get 'KeepAlive job)))
-    (should (string-suffix-p "agent.log" (alist-get 'StandardOutPath job)))))
+    (should (string-suffix-p "agent.log" (alist-get 'StandardOutPath job)))
+    ;; a policy file's own batch entry
+    (should (equal "my-local-agent"
+                   (car (last (alist-get 'ProgramArguments
+                                         (monk-agent-launchd-job "/Users/x/policy.el" 'my-local-agent))))))))
 
 ;;;; Salt bridge: high aggregation, import, completion, matchers
 

@@ -445,6 +445,7 @@ in use, nil when nothing could be watched."
   (let ((monk-agent--run-origin "SIGUSR1"))
     (monk-agent--full-converge monk-agent--policy t)))
 
+;;;###autoload
 (defun monk-agent-poke (&optional pid)
   "Make the agent of this user converge now, with a reload first.
 PID defaults to the one in the pid file; without a pid file, the
@@ -693,6 +694,7 @@ runs is remembered and served right after."
   "Make the agent loop return after the current iteration."
   (setq monk-agent--running nil))
 
+;;;###autoload
 (defun monk-agent-main (&optional policy)
   "Run the standalone agent until `monk-agent-stop', SIGTERM, or SIGINT.
 POLICY defaults to `monk-batch-policy', set by the policy file loaded
@@ -831,11 +833,14 @@ is already recorded."
           "StandardError=journal\n"
           "TimeoutStartSec=600\n"))
 
-(defun monk-agent-launchd-job (&optional policy-file)
-  "Return the launchd job alist that runs `monk-agent-main' from POLICY-FILE.
-KeepAlive restarts the loop when it exits; ThrottleInterval keeps a
-crash loop from spinning.  Output goes under the Monk state directory."
+(defun monk-agent-launchd-job (&optional policy-file function)
+  "Return the launchd job alist that runs FUNCTION from POLICY-FILE.
+FUNCTION defaults to `monk-agent-main'; a policy file can offer its
+own batch entry (one that picks the policy by host).  KeepAlive
+restarts the loop when it exits; ThrottleInterval keeps a crash loop
+from spinning.  Output goes under the Monk state directory."
   (let* ((policy (or policy-file monk-agent-policy-file load-file-name ""))
+         (function (if function (format "%s" function) "monk-agent-main"))
          (log (expand-file-name "agent.log" (if (fboundp 'monk-home-directory)
                                                 (funcall 'monk-home-directory)
                                               "~/.local/share/monk/"))))
@@ -845,7 +850,7 @@ crash loop from spinning.  Output goes under the Monk state directory."
                             (or monk-agent-load-path
                                 (file-name-directory (or load-file-name buffer-file-name default-directory))))
                       "-l" policy
-                      "-f" "monk-agent-main"))
+                      "-f" function))
           (cons 'RunAtLoad t)
           (cons 'KeepAlive t)
           (cons 'ThrottleInterval 30)
@@ -856,11 +861,12 @@ crash loop from spinning.  Output goes under the Monk state directory."
 
 (defun monk-agent-launchd-units (&rest args)
   "Policy fragment: install and load the agent as a launchd user agent.
-The macOS counterpart of `monk-agent-units'.  ARGS: :policy-file, and
-common keys.  Call inside a policy.  There is no socket endpoint on
-launchd; query the agent through its ledger or history."
+The macOS counterpart of `monk-agent-units'.  ARGS: :policy-file,
+:function (the batch entry, default `monk-agent-main'), and common
+keys.  Call inside a policy.  The agent serves its local socket from
+inside the loop, so `monk-connect' works on launchd too."
   (apply #'monk-launchd monk-agent-launchd-label
-         :plist (monk-agent-launchd-job (plist-get args :policy-file))
+         :plist (monk-agent-launchd-job (plist-get args :policy-file) (plist-get args :function))
          :loaded t
          (monk--common-initargs args)))
 

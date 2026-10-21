@@ -810,7 +810,6 @@ machines get filesystem notifications; remote ones are polled every
     (run-hook-with-args 'monk-watch-functions 'started (list :watch watch))
     watch))
 
-;;;###autoload
 (defun monk-watch--cancel-repath (watch)
   "Cancel the repath timer of WATCH, if any."
   (when (monk-watch-repath-timer watch)
@@ -820,6 +819,7 @@ machines get filesystem notifications; remote ones are polled every
     (cancel-timer (monk-watch-repath-soon-timer watch))
     (setf (monk-watch-repath-soon-timer watch) nil)))
 
+;;;###autoload
 (defun monk-watch-stop ()
   "Stop the active watch."
   (interactive)

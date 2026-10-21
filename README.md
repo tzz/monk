@@ -2,6 +2,18 @@
 
 Monk is a configuration management system. Policy is Emacs Lisp. Remote access is TRAMP. There is no server, no agent, and no template language.
 
+## Install
+
+Monk is one multi-file package; `monk.el` carries the headers (`Package-Requires: ((emacs "29.1"))`). From a checkout, `make package` builds `dist/monk-VERSION.tar` the way `package.el` and MELPA build it (every `lisp/*.el` flat, a generated `monk-pkg.el`), and `M-x package-install-file` on that tarball installs it; `make package-test` does that into a throwaway `package-user-dir` and fails when a file does not compile or an entry point lacks an autoload. Until Monk is on MELPA, the recipe it will use is
+
+```elisp
+(monk :fetcher github :repo "tzz/monk" :files ("lisp/*.el"))
+```
+
+and `package-vc-install` works with the same source: `(package-vc-install '(monk :url "https://github.com/tzz/monk" :lisp-dir "lisp"))`. Optional libraries stay optional: `monk-embark` loads only with Embark present, `monk-translate` asks a model only when `efrit` is loaded (or `monk-translate-ask-function` is set), `monk-history` needs an Emacs built with SQLite, `monk-etcd` an etcd. Nothing in Monk requires them.
+
+A second machine that runs only local policy needs the checkout (or the package), a policy file, and an agent: `emacs --batch -L PATH/TO/monk/lisp -l POLICY.el -f monk-agent-main` with `monk-batch-policy` set in the policy file, or a batch entry of the policy's own passed as `:function` to `monk-agent-launchd-units` / `monk-agent-units` so launchd or systemd keeps it running. The agent serves its socket on that host, so `monk-connect` from a session there works as on any other.
+
 ## Model
 
 A policy is a function of one argument, the machine. The function calls resource constructors. Monk collects the resources, then checks and repairs each one on the machine. This is the Chef compile and converge split.
@@ -398,7 +410,7 @@ Facts are cached when `monk-history` is loaded. A gather stores them in the hist
 
 ## Version
 
-`M-x monk-version` prints `Monk 0.8.4 build 2026-10-19.2 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
+`M-x monk-version` prints `Monk 0.8.5 build 2026-10-21.1 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
 
 ## Test drive, tour, tutorial
 

@@ -2190,6 +2190,7 @@ same machine in the new run, so the eye stays where it was."
                   (number-to-string (or (funcall get 'passes) 0))
                   note))))
 
+;;;###autoload
 (defun monk-ui-history (&rest filters)
   "Show past runs in `monk-ui-history-buffer-name'.
 FILTERS as for `monk-history-runs'.  Interactively, show everything."

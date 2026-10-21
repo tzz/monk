@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.8.4
+;; Version: 0.8.5
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -82,12 +82,12 @@
 
 ;;;; Version
 
-(defconst monk-version "0.8.4"
+(defconst monk-version "0.8.5"
   "Monk's version.  Patch for small work, minor for a large ask.
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-10-19.2"
+(defconst monk-build "2026-10-21.1"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -147,6 +147,7 @@ does not shift as the numbers grow."
                         (mapconcat (lambda (c) (format "%s +%ds" (car c) (round (cdr c)))) stale ", "))
               ""))))
 
+;;;###autoload
 (defun monk-version ()
   "Show Monk's version and build, and which libraries are older than their source."
   (interactive)
@@ -777,6 +778,7 @@ nil.")
            (run-hook-with-args 'monk-facts-ready-functions m)
            t))))))
 
+;;;###autoload
 (defun monk-facts-flush (&optional machines)
   "Forget the facts of MACHINES, default `monk-inventory', in memory and cache.
 The next compile gathers them again.  Ansible's --flush-cache."
@@ -3223,6 +3225,7 @@ overrides `monk-max-passes'.  Return a `monk-run'.")
 (cl-defmethod monk-converge ((m monk-machine) policy &rest options)
   (apply #'monk-orchestrate (list m) policy options))
 
+;;;###autoload
 (defun monk-orchestrate (machines policy &rest options)
   "Apply POLICY to MACHINES as one dependency graph.
 Requisites that point at other machines or groups resolve inside this
@@ -3304,6 +3307,7 @@ percent, the remaining batches are skipped with `monk-skip-batch'."
         (monk-run-end-time into) (monk-run-end-time run))
   into)
 
+;;;###autoload
 (defun monk-plan (machines policy &rest options)
   "Dry-run POLICY on MACHINES.  Return a `monk-run' with no changes made.
 MACHINES is a machine or a list.  OPTIONS are as for `monk-orchestrate'.
@@ -3312,6 +3316,7 @@ compare the outcome with what the plan said."
   (apply #'monk-orchestrate (if (listp machines) machines (list machines)) policy
          :dry-run t options))
 
+;;;###autoload
 (defun monk-apply (plan &rest options)
   "Run the policy of PLAN for real on the same machines.
 PLAN is a `monk-run' from `monk-plan'.  The returned run carries PLAN

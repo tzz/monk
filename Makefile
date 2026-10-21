@@ -4,7 +4,10 @@ BATCH = $(EMACS) --batch --no-init-file -L lisp -L test
 EL_FILES = $(wildcard lisp/*.el)
 ELC_FILES = $(EL_FILES:.el=.elc)
 
-.PHONY: all compile test check clean
+VERSION = $(shell sed -n 's/^;; Version: *//p' lisp/monk.el)
+PKG_DIR = dist/monk-$(VERSION)
+
+.PHONY: all compile test check clean package package-test
 
 all: compile
 
@@ -23,3 +26,19 @@ check: compile
 
 clean:
 	rm -f $(ELC_FILES)
+	rm -rf dist
+
+# A multi-file package tarball as package.el and MELPA build it: every
+# lisp/*.el flat in monk-VERSION/, a generated monk-pkg.el from the
+# headers of monk.el.  `make package-test' installs it into a throwaway
+# package-user-dir, which compiles every file and generates the
+# autoloads, and fails on a file that did not compile.
+package:
+	rm -rf $(PKG_DIR) && mkdir -p $(PKG_DIR)
+	cp $(EL_FILES) README.md $(PKG_DIR)/
+	$(BATCH) --eval '(progn (require (quote package)) (package-generate-description-file (with-temp-buffer (insert-file-contents "lisp/monk.el") (package-buffer-info)) "$(PKG_DIR)/monk-pkg.el"))'
+	cd dist && tar cf monk-$(VERSION).tar monk-$(VERSION)
+	@echo "dist/monk-$(VERSION).tar"
+
+package-test: package
+	$(BATCH) -l test/monk-package-check.el --eval '(monk-package-check "dist/monk-$(VERSION).tar")'
