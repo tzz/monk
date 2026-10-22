@@ -410,7 +410,7 @@ Facts are cached when `monk-history` is loaded. A gather stores them in the hist
 
 ## Version
 
-`M-x monk-version` prints `Monk 0.8.5 build 2026-10-21.1 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
+`M-x monk-version` prints `Monk 0.8.5 build 2026-10-22.1 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
 
 ## Test drive, tour, tutorial
 
@@ -433,6 +433,10 @@ make check     # checkdoc
 Monk reuses Emacs core where it exists: TRAMP and the `file-*` primitives for files, `file-attributes` for ownership, the `diff` library for diffs, VC (`vc-git`) for git, `filenotify` for watches, built-in SQLite for history. Shell commands remain only where core has nothing: `crontab`, `sysctl`, `systemctl`, `brew`, `apt-get`, `defaults`, `chown` by name, and `fswatch` on macOS where kqueue misses writes inside a directory. Every new feature gets a test drive step or a tour stop as well as ERT tests; batch tests never look at a window.
 
 Tests run against a temporary directory on the local host. Package, sudo, and bridge resources are tested through their pure helpers and a faked exec layer. Cross-machine tests use several local machine objects with different names.
+
+## Authorship
+
+This package was written with substantial assistance from Claude (Anthropic's AI model), directed, reviewed and tested by Teodor Zlatanov, who maintains it and is responsible for its contents. Because of that, it is not offered to GNU ELPA or NonGNU ELPA, whose policy excludes LLM-generated contributions.
 
 ## Not yet done
 
