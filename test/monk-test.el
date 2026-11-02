@@ -2323,7 +2323,7 @@ inside a walked tree is dropped, and ~ itself is never walked."
     (monk-test-with-tmpdir dir
       (let ((monk-launchd-agent-directory (concat dir "agents/"))
             (r (monk-launchd-resource :name "org.example.job" :plist job))
-            (loaded nil) (calls nil))
+            (loaded nil) (calls nil) (own-pid 4242))
         (make-directory (concat dir "agents"))
         (cl-letf (((symbol-function 'monk-exec)
                    (lambda (_m program &rest args)
@@ -2331,7 +2331,8 @@ inside a walked tree is dropped, and ~ itself is never walked."
                      (pcase program
                        ("launchctl"
                         (pcase (car args)
-                          ("print" (monk-exec-create :exit-code (if loaded 0 113) :output ""))
+                          ("print" (monk-exec-create :exit-code (if loaded 0 113)
+                                                     :output (if loaded (format "\tpid = %d\n" own-pid) "")))
                           ("bootstrap" (setq loaded t) (monk-exec-create :exit-code 0 :output ""))
                           ("bootout" (setq loaded nil) (monk-exec-create :exit-code 0 :output ""))))
                        ("id" (monk-exec-create :exit-code 0 :output "501\n"))
@@ -2353,7 +2354,15 @@ inside a walked tree is dropped, and ~ itself is never walked."
                            (delq nil (mapcar (lambda (c) (and (equal (car c) "launchctl")
                                                               (member (cadr c) '("bootout" "bootstrap"))
                                                               (cadr c)))
-                                             (reverse calls)))))))))))
+                                             (reverse calls)))))
+            ;; the job is this very Emacs: never bootout, the note says why
+            (setq calls nil own-pid (emacs-pid))
+            (oset r plist (cons '(Nice . 10) job))
+            (let ((note (monk-repair r m (monk-check r m))))
+              (should (string-match-p "own job" note))
+              (should-not (string-match-p "loaded" note)))
+            (should-not (member "bootout" (mapcar #'cadr calls)))
+            (should-not (member "bootstrap" (mapcar #'cadr calls)))))))))
 
 (ert-deftest monk-test-agent-launchd-job ()
   (require 'monk-agent)

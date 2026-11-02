@@ -358,7 +358,7 @@ Supervised and autopilot are `monk-watch-mode`. Standalone is `monk-agent.el`. T
 
 ### launchd
 
-On macOS, `(monk-agent-launchd-units :policy-file FILE)` in a policy installs and loads `org.monk.agent`, a user agent that runs `emacs --batch -l FILE -f monk-agent-main` with `KeepAlive`, so the loop restarts if it dies and `ThrottleInterval` keeps a crash from spinning. Output goes to `agent.log` under the Monk state directory. There is no socket endpoint on launchd; read the ledger or the history instead. `monk-host-reachable-p` is the probe `:reachable` uses: one TCP connect with `make-network-process`, cached per run.
+On macOS, `(monk-agent-launchd-units :policy-file FILE)` in a policy installs and loads `org.monk.agent`, a user agent that runs `emacs --batch -l FILE -f monk-agent-main` with `KeepAlive`, so the loop restarts if it dies and `ThrottleInterval` keeps a crash from spinning. When the agent repairs its own `org.monk.agent` job (the pid in `launchctl print` is its own), it writes the plist and notes that the change applies at its next start, instead of booting itself out. Output goes to `agent.log` under the Monk state directory. There is no socket endpoint on launchd; read the ledger or the history instead. `monk-host-reachable-p` is the probe `:reachable` uses: one TCP connect with `make-network-process`, cached per run.
 
 ### systemd units
 

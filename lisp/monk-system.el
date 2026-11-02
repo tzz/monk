@@ -477,6 +477,19 @@ numbers, t, nil (false), lists of strings (arrays), or alists (dicts)."
                              (format "%s/%s" (monk--launchd-domain r m) (oref r name))
                              :sudo (oref r daemon))))
 
+(cl-defmethod monk--launchd-own-job-p ((r monk-launchd-resource) (m monk-machine))
+  "Return non-nil when job R on M is the Emacs that runs this code.
+`launchctl print' lists the job's pid.  A local job whose pid is
+`emacs-pid' is the agent itself, and it must not boot itself out."
+  (and (monk-machine-local-p m)
+       (let ((exec (monk-exec m "launchctl" "print"
+                              (format "%s/%s" (monk--launchd-domain r m) (oref r name))
+                              :sudo (oref r daemon))))
+         (and (monk-exec-ok-p exec)
+              (string-match "^[ \t]*pid = \\([0-9]+\\)" (monk-exec-output exec))
+              (= (string-to-number (match-string 1 (monk-exec-output exec)))
+                 (emacs-pid))))))
+
 (cl-defmethod monk-check ((r monk-launchd-resource) (m monk-machine))
   (let ((changes nil)
         (sudo (oref r daemon)))
@@ -504,9 +517,14 @@ numbers, t, nil (false), lists of strings (arrays), or alists (dicts)."
       ;; launchd reads the file at load: write, then reload below.
       (monk-file-write m (monk--launchd-path r) (monk-launchd-plist (oref r name) (oref r plist)) sudo)
       (push "wrote plist" notes)
-      (when (monk--launchd-loaded-p r m)
+      (cond
+       ((monk--launchd-own-job-p r m)
+        ;; booting out this job would kill the agent that runs the repair
+        (push "this agent's own job: the new plist applies at its next start" notes)
+        (setf (plist-get changes :loaded) nil))
+       ((monk--launchd-loaded-p r m)
         (monk-exec m "launchctl" "bootout" (format "%s/%s" domain (oref r name)) :sudo sudo)
-        (setf (plist-get changes :loaded) (list nil (oref r loaded)))))
+        (setf (plist-get changes :loaded) (list nil (oref r loaded))))))
     (when (plist-get changes :loaded)
       (if (oref r loaded)
           (progn (monk-exec-string m "launchctl" "bootstrap" domain path :sudo sudo)
