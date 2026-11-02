@@ -441,3 +441,7 @@ This package was written with substantial assistance from Claude (Anthropic's AI
 ## Not yet done
 
 Docker containers. Package removal. A `monk-user` resource that creates accounts. Homebrew cask listing on older `brew`. Batched remote checks to cut TRAMP round trips. Parallel machines inside `monk-orchestrate`. A persistent ledger so a single-machine run can read results from an earlier run on another machine.
+
+## License
+
+Apache License 2.0; see `LICENSE`.
