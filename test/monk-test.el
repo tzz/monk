@@ -989,6 +989,166 @@ answers, consumed in order.  The log is stored in the symbol property
   (should-error (monk-inventory-define '(root :hosts ((a) (a)))) :type 'monk-inventory-error)
   (should-error (monk-inventory-define '("root" :hosts ((a)))) :type 'monk-inventory-error))
 
+(defconst monk-test-inventory-tree
+  '(world :vars ((observer . nil))
+          :children ((home :vars ((mine . t))
+                           :children ((macs :hosts ((foxy :vars ((home_leader . t)))
+                                                    (moi :address "moi.local")))
+                                      (unix :hosts ((kamen :address "kamen.local" :user "pi")))))))
+  "A small tree for the file and editor tests.")
+
+(ert-deftest monk-test-inventory-file-round-trip ()
+  "The tree saves to the inventory file, prints readably, and loads back the same."
+  (monk-test-with-tmpdir dir
+    (let ((process-environment (cons (concat monk-home-environment-variable "=" dir) process-environment))
+          (monk-inventory-file nil) (monk-inventory nil) (monk-inventory-tree nil)
+          (monk-inventory-tree-file nil) (monk-log-level nil))
+      ;; no file yet: load says so and returns nil
+      (should-not (monk-inventory-load))
+      (monk-inventory-define monk-test-inventory-tree "code.el")
+      (should (equal "code.el" monk-inventory-tree-file))
+      (let ((file (monk-inventory-save)))
+        (should (equal (expand-file-name "inventory.el" dir) file))
+        (should (equal file monk-inventory-tree-file))
+        (should (equal (cons file "foxy") (oref (monk-inventory-find 'foxy) origin)))
+        ;; one host per line, groups indented under their parent
+        (let ((text (with-temp-buffer (insert-file-contents file) (buffer-string))))
+          (should (string-match-p "^   ((macs\n     :hosts\n     ((foxy :vars ((home_leader \\. t)))\n      (moi :address \"moi.local\")))" text))
+          (should (string-match-p "mode: lisp-data" text))))
+      (setq monk-inventory nil monk-inventory-tree nil)
+      (should (= 3 (length (monk-inventory-load))))
+      (should (equal monk-test-inventory-tree monk-inventory-tree))
+      (should (equal '(unix home world) (oref (monk-inventory-find 'kamen) groups)))
+      ;; migrate refuses once the file exists
+      (should-error (monk-inventory-migrate) :type 'user-error))))
+
+(ert-deftest monk-test-inventory-tree-edits ()
+  "The pure tree edits: put, move, remove, vars, properties, groups, rename."
+  (let* ((tree monk-test-inventory-tree)
+         (t1 (monk-inventory-tree-put-host tree 'unix 'newbox :address "newbox.local")))
+    (should (equal '(newbox :address "newbox.local") (monk-inventory-host-entry 'newbox t1)))
+    (should (eq 'unix (monk-inventory-group-of 'newbox t1)))
+    ;; put again under another group moves it, plist replaced
+    (let ((t2 (monk-inventory-tree-put-host t1 'macs 'newbox :address "nb.local" :user "x")))
+      (should (eq 'macs (monk-inventory-group-of 'newbox t2)))
+      (should-not (assq 'newbox (plist-get (cdr (assq 'unix (plist-get (cdr (assq 'home (plist-get (cdr t2) :children))) :children))) :hosts)))
+      (should (equal "x" (plist-get (cdr (monk-inventory-host-entry 'newbox t2)) :user))))
+    ;; vars on a host and a group; :unset removes
+    (let* ((t3 (monk-inventory-tree-set-host-var t1 'newbox 'mine nil))
+           (t4 (monk-inventory-tree-set-host-var t3 'newbox 'mine :unset))
+           (t5 (monk-inventory-tree-set-group-var t1 'unix 'arm t)))
+      (should (equal '((mine)) (plist-get (cdr (monk-inventory-host-entry 'newbox t3)) :vars)))
+      (should-not (plist-member (cdr (monk-inventory-host-entry 'newbox t4)) :vars))
+      (should (equal '((arm . t)) (plist-get (cdr (assq 'unix (plist-get (cdr (assq 'home (plist-get (cdr t5) :children))) :children))) :vars))))
+    ;; properties, in place
+    (let ((t6 (monk-inventory-tree-set-host-property t1 'moi :method "rpc")))
+      (should (equal "rpc" (plist-get (cdr (monk-inventory-host-entry 'moi t6)) :method)))
+      (should (equal '(foxy moi) (mapcar #'car (plist-get (cdr (assq 'macs (plist-get (cdr (assq 'home (plist-get (cdr t6) :children))) :children))) :hosts))))
+      (should-not (plist-member (cdr (monk-inventory-host-entry 'moi (monk-inventory-tree-set-host-property t6 'moi :method nil))) :method)))
+    ;; groups
+    (let ((t7 (monk-inventory-tree-add-group t1 'home 'pis '((pi . t)))))
+      (should (memq 'pis (monk-inventory-group-names t7)))
+      (should-error (monk-inventory-tree-add-group t7 'home 'pis) :type 'monk-inventory-error)
+      (should-error (monk-inventory-tree-put-host t7 'nope 'x) :type 'monk-inventory-error))
+    ;; rename and remove
+    (should (monk-inventory-host-entry 'fox (monk-inventory-tree-rename-host t1 'foxy 'fox)))
+    (should-not (monk-inventory-host-entry 'kamen (monk-inventory-tree-remove-host t1 'kamen)))
+    ;; the source tree is untouched throughout
+    (should (equal tree monk-test-inventory-tree))))
+
+(ert-deftest monk-test-inventory-update-keeps-facts ()
+  "`monk-inventory-update' rebuilds machines but keeps facts already gathered."
+  (let ((monk-inventory nil) (monk-inventory-tree nil) (monk-inventory-tree-file nil)
+        (monk-inventory-derived nil) (monk-log-level nil))
+    (monk-inventory-define monk-test-inventory-tree "code.el")
+    (let ((foxy (monk-inventory-find 'foxy)))
+      (oset foxy facts monk-test-fake-facts)
+      (oset foxy facts-source 'cache)
+      (oset foxy classes (monk-hard-classes foxy)))
+    (monk-inventory-update (monk-inventory-tree-put-host monk-inventory-tree 'unix 'newbox))
+    (should (= 4 (length monk-inventory)))
+    (should (equal monk-test-fake-facts (oref (monk-inventory-find 'foxy) facts)))
+    (should (memq 'linux (oref (monk-inventory-find 'foxy) classes)))
+    (should-not (oref (monk-inventory-find 'newbox) facts))))
+
+(ert-deftest monk-test-inventory-editor-and-enroll ()
+  "The editor shows the tree and its keys change it; monk-enroll adds this host."
+  (require 'monk-enroll)
+  (monk-test-with-tmpdir dir
+    (let ((process-environment (cons (concat monk-home-environment-variable "=" dir) process-environment))
+          (monk-inventory-file nil) (monk-inventory nil) (monk-inventory-tree nil)
+          (monk-inventory-tree-file nil) (monk-inventory-derived nil) (monk-log-level nil)
+          (monk-ui-style 'text))
+      (monk-inventory-define monk-test-inventory-tree "code.el")
+      (save-window-excursion
+        (monk-inventory-edit)
+        (with-current-buffer monk-inventory-buffer-name
+          (should (derived-mode-p 'monk-inventory-mode))
+          (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+            (should (string-match-p "^. world (3 hosts, 1 group)" text))
+            (should (string-match-p "^    . macs (2 hosts)" text))
+            (should (string-match-p "^      foxy  local   home_leader " text))
+            (should (string-match-p "pi@kamen.local" text)))
+          ;; keys, with the prompts answered
+          (goto-char (point-min)) (monk-inventory-next-host)
+          (should (eq 'foxy (monk-inventory--host-at-point)))
+          (monk-inventory-set-var 'speedy t)
+          (should (equal '((home_leader . t) (speedy . t))
+                         (plist-get (cdr (monk-inventory-host-entry 'foxy)) :vars)))
+          (should (eq 'foxy (monk-inventory--host-at-point)))
+          (monk-inventory-unset-var 'speedy)
+          (should (equal '((home_leader . t)) (plist-get (cdr (monk-inventory-host-entry 'foxy)) :vars)))
+          (monk-inventory-set-property :method "rpc")
+          (should (equal "rpc" (oref (monk-inventory-find 'foxy) method)))
+          (monk-inventory-move-host 'unix)
+          (should (eq 'unix (monk-inventory-group-of 'foxy)))
+          (should (eq 'foxy (monk-inventory--host-at-point)))
+          (monk-inventory-add-host "newbox" 'macs "newbox.local")
+          (should (eq 'newbox (monk-inventory--host-at-point)))
+          (should (= 4 (length monk-inventory)))
+          (should-error (monk-inventory-add-host "newbox" 'macs "") :type 'user-error)
+          (monk-inventory-add-group "pis" 'home)
+          (should (memq 'pis (monk-inventory-group-names)))
+          (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+            (goto-char (monk-inventory--position-of '(host . moi)))
+            (monk-inventory-delete))
+          (should-not (monk-inventory-find 'moi))
+          (should monk-inventory--dirty)
+          (should (string-match-p "unsaved" (substring-no-properties (monk-inventory--header-line))))
+          (monk-inventory-save-command)
+          (should-not monk-inventory--dirty)
+          (should (file-exists-p (expand-file-name "inventory.el" dir)))))
+      ;; enroll this machine: facts from the fixture, group from the rules,
+      ;; prompts answered, no agent install
+      (let ((answers (list "macs" "nothing more")))
+        (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) (pop answers)))
+                  ((symbol-function 'monk-gather-facts)
+                   (lambda (m) (oset m facts (cons '(kernel . "Darwin") monk-test-fake-facts))
+                     (oset m classes (monk-hard-classes m)) m))
+                  ((symbol-function 'monk-local-machine) (lambda (&rest _) (monk-machine :name "enrollee.local"))))
+          (monk-enroll))
+        (should (monk-inventory-find 'enrollee))
+        (should (eq 'macs (monk-inventory-group-of 'enrollee)))
+        (should (oref (monk-inventory-find 'enrollee) facts))
+        ;; the file has it
+        (setq monk-inventory nil monk-inventory-tree nil)
+        (monk-inventory-load)
+        (should (monk-inventory-find 'enrollee))
+        (should-not (plist-get (cdr (monk-inventory-host-entry 'enrollee)) :address))))))
+
+(ert-deftest monk-test-enroll-group-proposal ()
+  "A Mac is proposed for the macs group, a Pi for pis, else the deepest group with hosts."
+  (require 'monk-enroll)
+  (let ((monk-inventory nil) (monk-inventory-tree nil) (monk-inventory-tree-file nil) (monk-inventory-derived nil))
+    (monk-inventory-define monk-test-inventory-tree "code.el")
+    (let ((mac (monk-machine :name "m")) (pi (monk-machine :name "p")) (other (monk-machine :name "o")))
+      (oset mac classes '(darwin)) (oset pi classes '(raspbian linux)) (oset other classes '(bsd))
+      (should (eq 'macs (monk-enroll-propose-group mac)))
+      ;; no pis group in this tree: raspbian rule skipped, linux -> unix
+      (should (eq 'unix (monk-enroll-propose-group pi)))
+      ;; no rule: deepest group holding hosts
+      (should (memq (monk-enroll-propose-group other) '(macs unix))))))
+
 (ert-deftest monk-test-symlink-tilde-target-expands ()
   "A ~ target is stored expanded, and a second run is kept."
   (monk-test-with-tmpdir dir

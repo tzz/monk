@@ -760,6 +760,7 @@ reuses it."
     (define-key map (kbd "i") #'monk-ui-inspect-machine)
     (define-key map (kbd "/") #'monk-ui-query)
     (define-key map (kbd "h") #'monk-ui-history)
+    (define-key map (kbd "I") #'monk-ui-inventory)
     (define-key map (kbd ".") #'monk-ui-find-definition)
     (define-key map (kbd "M-.") #'monk-ui-find-definition)
     (define-key map (kbd "<") #'monk-ui-import)
@@ -847,7 +848,7 @@ act on a machine take the machine of the heading or line at point.
       (message "%s" (substitute-command-keys
                      "AGENT: \\[monk-ui-rerun] plan on the agent  \\[monk-ui-apply] apply on the agent  \\[monk-ui-toggle-watch-mode] switch the agent's watch between assisted and autopilot  \\[monk-ui-show-watch-log] the agent's file-event log  \\[monk-ui-drop-request] drop the pending request  \\[monk-ui-disconnect] disconnect  |  \\[monk-ui-show-machine] detail  \\[monk-ui-inspect-machine] facts  \\[monk-ui-find-definition] source  \\[monk-ui-query] query  \\[monk-ui-history] history  \\[monk-ui-toggle-style] svg/text  \\[monk-ui-quit] quit"))
     (message "%s" (substitute-command-keys
-                 "\\[monk-ui-toggle-fold] fold  \\[monk-ui-fold-all] fold all  \\[monk-ui-next-machine]/\\[monk-ui-previous-machine] machines  \\[monk-ui-show-machine] detail  \\[monk-ui-inspect-machine] facts  \\[monk-ui-find-definition] source  \\[monk-ui-query] query  \\[monk-ui-history] history  \\[monk-ui-apply] apply plan  \\[monk-ui-show-plan] show plan  \\[monk-ui-show-watch-log] file-event log of the watch  \\[monk-ui-toggle-watch-mode] watch assisted/autopilot  \\[monk-ui-toggle-style] svg/text  \\[monk-ui-rerun] rerun (C-u: redraw only)  \\[monk-ui-import] import ansible/salt  \\[monk-ui-export] export  \\[monk-ui-quit] quit"))))
+                 "\\[monk-ui-toggle-fold] fold  \\[monk-ui-fold-all] fold all  \\[monk-ui-next-machine]/\\[monk-ui-previous-machine] machines  \\[monk-ui-show-machine] detail  \\[monk-ui-inspect-machine] facts  \\[monk-ui-find-definition] source  \\[monk-ui-query] query  \\[monk-ui-history] history  \\[monk-ui-inventory] inventory  \\[monk-ui-apply] apply plan  \\[monk-ui-show-plan] show plan  \\[monk-ui-show-watch-log] file-event log of the watch  \\[monk-ui-toggle-watch-mode] watch assisted/autopilot  \\[monk-ui-toggle-style] svg/text  \\[monk-ui-rerun] rerun (C-u: redraw only)  \\[monk-ui-import] import ansible/salt  \\[monk-ui-export] export  \\[monk-ui-quit] quit"))))
 
 (declare-function monk-watch-status "monk-watch")
 (declare-function monk-watch-toggle-mode "monk-watch")
@@ -1767,6 +1768,13 @@ M in the `monk-ui-machine' property, so `.' jumps to the inventory."
     (and run (seq-find (lambda (m) (equal (oref m name) name)) (monk-run-machines run)))))
 
 (declare-function monk-connect-inspect-machine "monk-connect")
+(declare-function monk-inventory-edit "monk-enroll")
+
+(defun monk-ui-inventory ()
+  "Open the inventory editor."
+  (interactive)
+  (require 'monk-enroll)
+  (monk-inventory-edit))
 
 (cl-defun monk-ui-inspect-machine (&optional machine-name machine)
   "Show classes, groups, facts, and vars of MACHINE-NAME, or the machine at point.

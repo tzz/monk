@@ -69,6 +69,7 @@
 (require 'monk-embark)
 (require 'monk-detach)
 (require 'monk-connect)
+(require 'monk-enroll)
 
 ;; The drive checks history when monk-history is loaded; it needs an
 ;; Emacs with SQLite, so it is not required here.
@@ -1367,6 +1368,58 @@ so `~' in the policy lands there."
          (cons (not (assq (emacs-pid) found)) "this Emacs listed")
          (cons (listp found) "not a list"))))))
 
+(defun monk-testdrive--section-inventory ()
+  "The inventory file round trip, the editor's edits, enrolling this host.
+Everything under the drive's own MONK_HOME; the real inventory is
+let-bound away."
+  (monk-testdrive--out "\n## Inventory file and enroll")
+  (let ((monk-inventory nil) (monk-inventory-tree nil) (monk-inventory-tree-file nil)
+        (monk-inventory-derived nil) (monk-inventory-file nil))
+    (monk-testdrive--step "inventory" "a tree saves to MONK_HOME/inventory.el and loads back"
+      (monk-inventory-define '(world :children ((macs :hosts ((drivemac :vars ((mine . t)))))
+                                                (unix :hosts ((drivebox :address "drivebox.invalid")))))
+                             "drive-code.el")
+      (let ((file (monk-inventory-save)))
+        (setq monk-inventory nil monk-inventory-tree nil)
+        (monk-inventory-load)
+        (monk-testdrive--checks
+         (cons (string-prefix-p monk-testdrive--home (file-truename file)) (format "file outside the drive home: %s" file))
+         (cons (= 2 (length monk-inventory)) "two hosts after reload")
+         (cons (equal '(macs world) (oref (monk-inventory-find 'drivemac) groups)) "groups")
+         (cons (equal (cons file "drivemac") (oref (monk-inventory-find 'drivemac) origin)) "origin is the file"))))
+    (monk-testdrive--step "inventory" "editor keys change the tree and mark it unsaved; s saves"
+      (save-window-excursion
+        (monk-inventory-edit)
+        (with-current-buffer monk-inventory-buffer-name
+          (goto-char (point-min)) (monk-inventory-next-host)
+          (monk-inventory-set-var 'speedy t)
+          (monk-inventory-move-host 'unix)
+          (monk-inventory-add-host "newbox" 'macs "")
+          (let ((dirty monk-inventory--dirty))
+            (monk-inventory-save-command)
+            (monk-testdrive--checks
+             (cons dirty "not marked unsaved after edits")
+             (cons (not monk-inventory--dirty) "still unsaved after s")
+             (cons (eq 'unix (monk-inventory-group-of 'drivemac)) "move")
+             (cons (equal '((mine . t) (speedy . t)) (plist-get (cdr (monk-inventory-host-entry 'drivemac)) :vars)) "var")
+             (cons (monk-inventory-find 'newbox) "add")
+             (cons (string-match-p "newbox" (with-temp-buffer (insert-file-contents (monk-inventory-file)) (buffer-string)))
+                   "file lacks newbox"))))))
+    (monk-testdrive--step "enroll" "monk-enroll adds this host under the proposed group and saves"
+      (let ((answers (list "macs" "nothing more")))
+        (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) (pop answers)))
+                  ((symbol-function 'monk-gather-facts)
+                   (lambda (m) (oset m facts '((kernel . "Darwin") (home . "/x") (user . "u")))
+                     (oset m classes (monk-hard-classes m)) m))
+                  ((symbol-function 'monk-local-machine) (lambda (&rest _) (monk-machine :name "enrollee"))))
+          (monk-enroll))
+        (setq monk-inventory nil monk-inventory-tree nil)
+        (monk-inventory-load)
+        (monk-testdrive--checks
+         (cons (monk-inventory-find 'enrollee) "enrollee not in the file")
+         (cons (eq 'macs (monk-inventory-group-of 'enrollee)) "group")
+         (cons (not (plist-get (cdr (monk-inventory-host-entry 'enrollee)) :address)) "a local host has no address"))))))
+
 (defun monk-testdrive--section-connect ()
   "Scopes on results, and a session connected to an agent's socket."
   (monk-testdrive--out "\n## Scopes and agent connect")
@@ -1523,6 +1576,7 @@ so `~' in the policy lands there."
     ("Index and Embark" monk-testdrive--section-embark)
     ("Detached jobs" monk-testdrive--section-detach)
     ("Scopes and agent connect" monk-testdrive--section-connect)
+    ("Inventory file and enroll" monk-testdrive--section-inventory)
     ("Watch" monk-testdrive--section-watch)
     ("Agent and events" monk-testdrive--section-agent))
   "The drive's sections: (TITLE FUNCTION).")
@@ -1767,6 +1821,20 @@ so `~' in the policy lands there."
         (monk-ui-next-machine)
         (monk-testdrive--ask "Point is on the drive row.  Press embark-act: does it say 'monk-machine' and offer . p i /?  Press i: does the inspector for drive open (q closes)?")))))
 
+(defun monk-testdrive--tour-inventory ()
+  "The inventory editor on a throwaway tree."
+  (monk-testdrive--step "tour" "inventory editor: groups fold, hosts carry pills, keys edit"
+    (let ((monk-inventory nil) (monk-inventory-tree nil) (monk-inventory-tree-file nil)
+          (monk-inventory-derived nil) (monk-inventory-file nil))
+      (monk-inventory-define '(world :vars ((observer . nil))
+                                     :children ((macs :vars ((mine . t)) :hosts ((tourmac :vars ((home_leader . t))) (othermac :address "othermac.invalid" :method "rpc")))
+                                                (unix :hosts ((tourbox :address "tourbox.invalid" :user "pi")))))
+                             "tour-code.el")
+      (monk-inventory-edit)
+      (delete-other-windows)
+      (prog1 (monk-testdrive--ask "An INVENTORY header naming '(not saved yet)'; 'world (3 hosts, 2 groups)' with an 'observer=nil' pill; under it 'macs' with a 'mine' pill and two host lines, 'tourmac' with a 'local' pill and 'home_leader', 'othermac' with 'othermac.invalid' and 'rpc' pills; 'tourbox' with 'pi@tourbox.invalid'.  TAB on macs: does it fold?  v on a host line: does it ask for a variable, and does the pill appear and the header say 'unsaved'?  ? lists the keys?  q closes?")
+        (when (get-buffer monk-inventory-buffer-name) (kill-buffer monk-inventory-buffer-name))))))
+
 (defun monk-testdrive--tour-connect ()
   "The AGENT badge and a run arriving from the agent."
   (monk-testdrive--step "tour" "connected to an agent: AGENT badge, then its plan arrives live in *monk*"
@@ -1825,6 +1893,7 @@ so `~' in the policy lands there."
     ("Translate" monk-testdrive--tour-translate)
     ("Embark" monk-testdrive--tour-embark)
     ("Agent connect" monk-testdrive--tour-connect)
+    ("Inventory editor" monk-testdrive--tour-inventory)
     ("Watch" monk-testdrive--tour-watch)
     ("Text fallback" monk-testdrive--tour-text))
   "The tour's stops: (TITLE FUNCTION).")

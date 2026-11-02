@@ -31,7 +31,8 @@
 (defconst monk-package-check-entry-points
   '(monk-plan monk-apply monk-version monk-watch-start monk-watch-stop monk-connect
     monk-reconnect monk-agent-main monk-agent-poke monk-reload monk-testdrive
-    monk-tutorial monk-ui-history monk-translate-import monk-embark-setup)
+    monk-tutorial monk-ui-history monk-translate-import monk-embark-setup
+    monk-inventory-edit monk-enroll)
   "Commands a user reaches before any Monk library is loaded; each needs an autoload.")
 
 (defun monk-package-check (tarball)

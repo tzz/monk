@@ -246,6 +246,14 @@ A host with no `:address` is the local machine. `self` selects the host whose na
 
 Derived groups follow the facts, like Salt's derived grains or Ansible's `group_by` and `keyed_groups`. `(monk-group 'big-disk "facts.disk > 100")` puts every machine whose guard is true into `big-disk`. `(monk-keyed-groups "facts.distribution" "distro")` makes one group per value, `distro_ubuntu`, `distro_macos`. Derived membership is recomputed whenever facts arrive, live or from the cache, and `monk-inventory-select` and `(group SYM)` see it like any other group. `monk-inventory-clear-derived` forgets the rules.
 
+### The inventory file, the editor, and enrolling
+
+The tree can live in a file of its own instead of a policy file: `MONK_HOME/inventory.el` (or `monk-inventory-file`), one readable form, written by Monk and fine to edit by hand. `(monk-inventory-load)` reads it; `M-x monk-inventory-migrate` writes a tree defined in code there once, after which the policy file calls `monk-inventory-load`. `monk-inventory-save` prints one host per line with groups indented under their parent, so a change is a one-line diff.
+
+`M-x monk-inventory-edit` (`I` in `*monk*`) opens `*monk-inventory*`: groups fold, each host is a line with its address (`user@host:port`), method, and vars as pills, then the classes its facts gave it. `a` adds a host to the group at point, `G` a group, `r` renames, `m` moves a host to another group, `v` sets a var (completing over the vars already used; the value is read as Lisp, `t` makes a class), `V` unsets one, `e` sets address, user, port, or method, `d` deletes, `f` gathers facts live, `i` inspects, `.` opens the file at the entry, `s` saves; the header says `unsaved` until then. Every edit rebuilds the machines at once, keeping facts already gathered, so a plan after an edit sees the new tree without a reload.
+
+`M-x monk-enroll` (`E` in the editor) adds the machine it runs on: it gathers facts, proposes a group from them (`monk-enroll-group-rules`: a Mac goes to `macs`, a Pi to `pis`, Debian and Ubuntu to `unix`; a group the tree lacks is skipped, else the deepest group that holds hosts), asks you to confirm the group, writes the entry (with `:address`, `:user`, `:method` for a remote machine; a local one gets none), saves the file, and offers the next steps: open the editor, plan the agent install for this machine (launchd on macOS, a systemd user unit elsewhere; the policy file and batch entry are asked), or, on Linux with [enroll](https://git.mig5.net/mig5/enroll) on `PATH`, harvest the machine's installed packages, changed `/etc` files, services, and users into an Ansible project and hand it to `monk-translate-import`, so a policy to start from lands in `*monk-import*`. macOS has no harvester; facts only. With a prefix argument `monk-enroll` asks for `user@host` and enrolls a machine it can reach from here.
+
 ## Plan and apply
 
 `monk-plan` is a dry run. It returns a run whose results say `would-repair` where a change is needed and `kept` where none is. Nothing on the machine changes. `monk-apply` takes that run, repeats its policy on its machines for real, and links the plan to the new run. `monk-run-compare` then gives one verdict per resource.
@@ -410,7 +418,7 @@ Facts are cached when `monk-history` is loaded. A gather stores them in the hist
 
 ## Version
 
-`M-x monk-version` prints `Monk 0.8.5 build 2026-10-22.1 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
+`M-x monk-version` prints `Monk 0.9.0 build 2026-11-02.1 from ~/.../monk/lisp/` and, when a loaded library's `.el` is newer than the moment it loaded, `STALE: monk-ui +312s (edited after load; run monk-reload)`. The drive and the tour print the same line first, so a report from old code says so. `monk-build` is bumped at every hand-over; `monk-version` gets a patch bump for small work and a minor bump for a large ask.
 
 ## Test drive, tour, tutorial
 

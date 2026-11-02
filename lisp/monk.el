@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.8.5
+;; Version: 0.9.0
 
 ;; Licensed under the Apache License, Version 2.0 (the "License");
 ;; you may not use this file except in compliance with the License.
@@ -81,12 +81,12 @@
 
 ;;;; Version
 
-(defconst monk-version "0.8.5"
+(defconst monk-version "0.9.0"
   "Monk's version.  Patch for small work, minor for a large ask.
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-10-22.1"
+(defconst monk-build "2026-11-02.1"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -94,7 +94,7 @@ apart.  Bumped with every change that reaches a hand-over.")
 (defconst monk-libraries
   '(monk monk-cell monk-file monk-system monk-package monk-sync monk-inventory
     monk-event monk-history monk-ui monk-watch monk-agent monk-cli monk-bridge
-    monk-translate monk-embark monk-detach monk-connect monk-etcd monk-reload monk-testdrive monk-tutorial)
+    monk-translate monk-embark monk-detach monk-connect monk-etcd monk-enroll monk-reload monk-testdrive monk-tutorial)
   "Every Monk library, for `monk-version'.")
 
 (defvar monk--load-times nil

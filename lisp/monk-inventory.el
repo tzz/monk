@@ -50,11 +50,39 @@
 
 ;;; Code:
 
+(require 'cl-lib)
+(require 'seq)
 (require 'monk)
 (require 'monk-cell)
 
 (defvar monk-inventory nil
   "The current inventory: a list of `monk-machine' objects.")
+
+(defvar monk-inventory-tree nil
+  "The group tree the current inventory was built from, as given to
+`monk-inventory-define'.  The editor and `monk-enroll' change this and
+rebuild the machines from it; `monk-inventory-save' writes it.")
+
+(defvar monk-inventory-tree-file nil
+  "The file `monk-inventory-tree' was read from, or nil when it came from code.")
+
+(defcustom monk-inventory-file nil
+  "Where the editable inventory lives.  Nil means MONK_HOME/inventory.el.
+`monk-inventory-load' reads it, `monk-inventory-save' writes it, and
+`monk-enroll' on a new machine appends to it.  A policy file that
+defines its inventory inline keeps working; `monk-inventory-migrate'
+writes that inline tree here once, after which the policy file can
+call `monk-inventory-load' instead."
+  :type '(choice (const nil) file)
+  :group 'monk)
+
+(defconst monk-inventory-file-name "inventory.el"
+  "File name under the Monk state directory for the inventory tree.")
+
+(defun monk-inventory-file ()
+  "Return the inventory file path: `monk-inventory-file' or the default."
+  (expand-file-name (or monk-inventory-file
+                        (expand-file-name monk-inventory-file-name (monk-home-directory)))))
 
 (defconst monk-inventory-self 'self
   "Selector for the machine whose name is the local host name.")
@@ -93,17 +121,269 @@
                   result))))
       result)))
 
-(defun monk-inventory-define (tree)
+(defun monk-inventory-define (tree &optional file)
   "Set `monk-inventory' from TREE.  Return the machine list.
-Signal `monk-inventory-error' on duplicate host names."
+FILE is where TREE came from, default the file being loaded; each
+machine remembers it as its origin.  Signal `monk-inventory-error' on
+duplicate host names."
   (let* ((machines (monk--inventory-walk tree nil nil))
          (names (mapcar (lambda (m) (oref m name)) machines))
-         (file (or load-file-name (buffer-file-name))))
+         (file (or file load-file-name (buffer-file-name))))
     (when (/= (length names) (length (delete-dups (copy-sequence names))))
       (signal 'monk-inventory-error (list "Duplicate host names" names)))
     (dolist (m machines)
       (oset m origin (cons file (oref m name))))
-    (setq monk-inventory (nreverse machines))))
+    (setq monk-inventory-tree tree
+          monk-inventory-tree-file file
+          monk-inventory (nreverse machines))))
+
+;;;; The inventory file
+;;
+;; The tree as data in a file of its own, so a machine can be added
+;; from a new host or from the editor without touching a policy file
+;; in a checkout.  The file holds one readable form, the tree; a
+;; header comment says who wrote it.
+
+(defun monk-inventory-load (&optional file)
+  "Read the inventory tree from FILE and define it.
+FILE defaults to `monk-inventory-file'.
+Return the machine list, or nil with a message when the file does
+not exist yet.  Derived group rules are kept; they are code, not data."
+  (let ((file (expand-file-name (or file (monk-inventory-file)))))
+    (if (not (file-readable-p file))
+        (progn (monk-log 'info "inventory file %s does not exist yet" (abbreviate-file-name file)) nil)
+      (let ((tree (with-temp-buffer
+                    (insert-file-contents file)
+                    (goto-char (point-min))
+                    (read (current-buffer)))))
+        (prog1 (monk-inventory-define tree file)
+          (monk-inventory-apply-derived))))))
+
+(defun monk-inventory-save (&optional file)
+  "Write `monk-inventory-tree' to FILE, default `monk-inventory-file'.
+Return the file.  The form is pretty-printed, one host per line."
+  (let ((file (expand-file-name (or file (monk-inventory-file)))))
+    (unless monk-inventory-tree
+      (signal 'monk-inventory-error (list "No inventory tree to save")))
+    (make-directory (file-name-directory file) t)
+    (with-temp-file file
+      (insert ";;; Monk inventory -*- mode: lisp-data; -*-\n"
+              ";; One form: the group tree.  Edited by monk-inventory-mode and monk-enroll;\n"
+              ";; hand edits are fine, the file is read back as data.\n"
+              (format ";; Written %s\n\n" (format-time-string "%F %T")))
+      (let ((print-length nil) (print-level nil))
+        (insert (monk-inventory--pp monk-inventory-tree) "\n")))
+    (setq monk-inventory-tree-file file)
+    (dolist (m monk-inventory) (oset m origin (cons file (oref m name))))
+    file))
+
+(defun monk-inventory--pp (tree)
+  "Return TREE printed with one host entry per line and groups indented."
+  (with-temp-buffer
+    (monk-inventory--insert-group tree)
+    (buffer-string)))
+
+(defun monk-inventory--insert-group (group)
+  "Insert GROUP at point; continuation lines align under the group's open paren."
+  (pcase-let* ((`(,name . ,plist) group)
+               (column (current-column))
+               (pad (make-string (1+ column) ?\s)))
+    (insert "(" (symbol-name name))
+    (when (plist-member plist :vars)
+      (insert "\n" pad ":vars " (prin1-to-string (plist-get plist :vars))))
+    (when (plist-get plist :children)
+      (insert "\n" pad ":children\n" pad "(")
+      (let ((first t))
+        (dolist (child (plist-get plist :children))
+          (unless first (insert "\n" pad " "))
+          (monk-inventory--insert-group child)
+          (setq first nil)))
+      (insert ")"))
+    (when (plist-get plist :hosts)
+      (insert "\n" pad ":hosts\n" pad "(")
+      (let ((first t))
+        (dolist (host (plist-get plist :hosts))
+          (unless first (insert "\n" pad " "))
+          (insert (prin1-to-string host))
+          (setq first nil)))
+      (insert ")"))
+    (insert ")")))
+
+(defun monk-inventory-migrate (&optional file)
+  "Write the inventory defined in code to FILE, once.
+FILE defaults to `monk-inventory-file'.
+Refuse when the file exists: the file is then the source, not the code."
+  (interactive)
+  (let ((file (expand-file-name (or file (monk-inventory-file)))))
+    (when (file-exists-p file)
+      (user-error "%s exists; the inventory lives there now" (abbreviate-file-name file)))
+    (monk-inventory-save file)
+    (message "Inventory written to %s; load it with (monk-inventory-load) instead of the inline define"
+             (abbreviate-file-name file))))
+
+;;;; Editing the tree
+;;
+;; Pure functions over the tree, each returning a new tree; the
+;; editor and `monk-enroll' call `monk-inventory-update' with one.
+
+(defun monk-inventory-group-names (&optional tree)
+  "Return every group name in TREE, default the current one, root first."
+  (let ((tree (or tree monk-inventory-tree)) out)
+    (cl-labels ((walk (g) (push (car g) out) (mapc #'walk (plist-get (cdr g) :children))))
+      (when tree (walk tree)))
+    (nreverse out)))
+
+(defun monk-inventory-group-of (host &optional tree)
+  "Return the name of the group that lists HOST, a symbol, in TREE, or nil."
+  (let ((tree (or tree monk-inventory-tree)) found)
+    (cl-labels ((walk (g)
+                  (when (assq host (plist-get (cdr g) :hosts)) (setq found (car g)))
+                  (mapc #'walk (plist-get (cdr g) :children))))
+      (when tree (walk tree)))
+    found))
+
+(defun monk-inventory-host-entry (host &optional tree)
+  "Return the (HOST . PLIST) entry for HOST, a symbol, in TREE, or nil."
+  (let ((tree (or tree monk-inventory-tree)) found)
+    (cl-labels ((walk (g)
+                  (let ((e (assq host (plist-get (cdr g) :hosts)))) (when e (setq found e)))
+                  (mapc #'walk (plist-get (cdr g) :children))))
+      (when tree (walk tree)))
+    found))
+
+(defun monk-inventory--map-groups (tree fn)
+  "Return TREE with FN applied to every group, children first."
+  (pcase-let ((`(,name . ,plist) tree))
+    (let* ((children (mapcar (lambda (c) (monk-inventory--map-groups c fn))
+                             (plist-get plist :children)))
+           (plist (copy-sequence plist)))
+      (when (plist-member plist :children)
+        (setq plist (plist-put plist :children children)))
+      (funcall fn (cons name plist)))))
+
+(defun monk-inventory-tree-put-host (tree group host &rest plist)
+  "Return TREE with HOST (a symbol) under GROUP, its entry set to PLIST.
+A host already elsewhere in the tree is moved.  Signal when GROUP does
+not exist."
+  (unless (memq group (monk-inventory-group-names tree))
+    (signal 'monk-inventory-error (list "No such group" group)))
+  (let ((tree (monk-inventory-tree-remove-host tree host)))
+    (monk-inventory--map-groups
+     tree
+     (lambda (g)
+       (if (not (eq (car g) group))
+           g
+         (cons (car g) (plist-put (copy-sequence (cdr g)) :hosts
+                                  (append (plist-get (cdr g) :hosts) (list (cons host plist))))))))))
+
+(defun monk-inventory-tree-remove-host (tree host)
+  "Return TREE without HOST."
+  (monk-inventory--map-groups
+   tree
+   (lambda (g)
+     (if (not (assq host (plist-get (cdr g) :hosts)))
+         g
+       (let ((plist (copy-sequence (cdr g))))
+         (setq plist (plist-put plist :hosts (assq-delete-all host (copy-sequence (plist-get plist :hosts)))))
+         (when (null (plist-get plist :hosts))
+           (setq plist (monk-inventory--plist-remove plist :hosts)))
+         (cons (car g) plist))))))
+
+(defun monk-inventory-tree-set-host-var (tree host var value)
+  "Return TREE with VAR set to VALUE on HOST; VALUE `:unset' removes it."
+  (let ((entry (or (monk-inventory-host-entry host tree)
+                   (signal 'monk-inventory-error (list "No such host" host)))))
+    (let* ((plist (copy-sequence (cdr entry)))
+           (vars (copy-alist (plist-get plist :vars))))
+      (setq vars (monk-inventory--vars-put vars var value))
+      (setq plist (if vars (plist-put plist :vars vars) (monk-inventory--plist-remove plist :vars)))
+      (apply #'monk-inventory-tree-put-host tree (monk-inventory-group-of host tree) host plist))))
+
+(defun monk-inventory-tree-set-host-property (tree host key value)
+  "Return TREE with KEY set to VALUE on HOST.
+KEY is one of :address :user :port :method.
+Nil VALUE removes the key.  Order is kept: the host stays in its group."
+  (let* ((entry (or (monk-inventory-host-entry host tree)
+                    (signal 'monk-inventory-error (list "No such host" host))))
+         (plist (copy-sequence (cdr entry))))
+    (setq plist (if value (plist-put plist key value) (monk-inventory--plist-remove plist key)))
+    (monk-inventory--map-groups
+     tree
+     (lambda (g)
+       (if (not (assq host (plist-get (cdr g) :hosts)))
+           g
+         (cons (car g) (plist-put (copy-sequence (cdr g)) :hosts
+                                  (mapcar (lambda (h) (if (eq (car h) host) (cons host plist) h))
+                                          (plist-get (cdr g) :hosts)))))))))
+
+(defun monk-inventory-tree-add-group (tree parent group &optional vars)
+  "Return TREE with GROUP, a new symbol, under PARENT, with VARS."
+  (when (memq group (monk-inventory-group-names tree))
+    (signal 'monk-inventory-error (list "Group exists" group)))
+  (monk-inventory--map-groups
+   tree
+   (lambda (g)
+     (if (not (eq (car g) parent))
+         g
+       (cons (car g) (plist-put (copy-sequence (cdr g)) :children
+                                (append (plist-get (cdr g) :children)
+                                        (list (if vars (list group :vars vars) (list group))))))))))
+
+(defun monk-inventory-tree-set-group-var (tree group var value)
+  "Return TREE with VAR set to VALUE on GROUP; VALUE `:unset' removes it."
+  (monk-inventory--map-groups
+   tree
+   (lambda (g)
+     (if (not (eq (car g) group))
+         g
+       (let* ((plist (copy-sequence (cdr g)))
+              (vars (copy-alist (plist-get plist :vars))))
+         (setq vars (monk-inventory--vars-put vars var value))
+         (cons (car g) (if vars (plist-put plist :vars vars) (monk-inventory--plist-remove plist :vars))))))))
+
+(defun monk-inventory--vars-put (vars var value)
+  "Return VARS with VAR set to VALUE in place, or appended; `:unset' removes it.
+The order a person wrote stays, so the file diff is one line."
+  (cond
+   ((eq value :unset) (assq-delete-all var (copy-alist vars)))
+   ((assq var vars) (mapcar (lambda (c) (if (eq (car c) var) (cons var value) c)) vars))
+   (t (append vars (list (cons var value))))))
+
+(defun monk-inventory-tree-rename-host (tree host new)
+  "Return TREE with HOST renamed to NEW, in place."
+  (monk-inventory--map-groups
+   tree
+   (lambda (g)
+     (if (not (assq host (plist-get (cdr g) :hosts)))
+         g
+       (cons (car g) (plist-put (copy-sequence (cdr g)) :hosts
+                                (mapcar (lambda (h) (if (eq (car h) host) (cons new (cdr h)) h))
+                                        (plist-get (cdr g) :hosts))))))))
+
+(defun monk-inventory--plist-remove (plist key)
+  "Return PLIST without KEY."
+  (let (out)
+    (while plist
+      (let ((k (pop plist)) (v (pop plist)))
+        (unless (eq k key) (setq out (append out (list k v))))))
+    out))
+
+(defun monk-inventory-update (tree &optional save)
+  "Make TREE the inventory: rebuild machines, keep facts, apply derived groups.
+With SAVE, write the file too.  Return the machine list."
+  (let ((old monk-inventory))
+    (monk-inventory-define tree (or monk-inventory-tree-file (monk-inventory-file)))
+    ;; facts and classes already gathered carry over by name
+    (dolist (m monk-inventory)
+      (let ((was (seq-find (lambda (o) (equal (oref o name) (oref m name))) old)))
+        (when (and was (oref was facts))
+          (oset m facts (oref was facts))
+          (oset m gathered (oref was gathered))
+          (oset m facts-source (oref was facts-source))
+          (oset m classes (monk-hard-classes m)))))
+    (monk-inventory-apply-derived)
+    (when save (monk-inventory-save))
+    monk-inventory))
 
 ;;;; Derived groups and tags
 ;;
