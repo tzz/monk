@@ -496,6 +496,10 @@ on `y', else signal `user-error'.  Return non-nil once connected."
      ((equal op "status")
       (setq monk-connect--status event)
       (monk-connect--refresh-header))
+     ((equal op "accept")
+      ;; the badge drops PROBATION at the next status; ask for one
+      (monk-connect--reply op event)
+      (monk-connect--send '((op . "status"))))
      ;; a failed reply settles the wait too; an op the agent does not
      ;; know (older build than this session) left the session "still
      ;; answering" forever (2026-10-12)
@@ -804,6 +808,10 @@ until a reconnect or `monk-disconnect'."
                                            (format "\nagent build %s, this session %s"
                                                    (or (alist-get 'build monk-connect--status) "?") monk-build)
                                            "\ng plan on the agent, a apply, W watch mode, w watch log, k drop the pending request, D disconnect"))
+            (if (eq t (alist-get 'probation monk-connect--status))
+                (propertize " PROBATION: dry runs until accepted " 'face 'monk-ui-partial
+                            'help-echo "The agent enrolled this host by itself; M-x monk-enroll-accept (or A in the inventory editor) lets it run for real")
+              "")
             (if monk-connect--waiting
                 (propertize (format " asked for %s… " (monk-connect-op-label (car monk-connect--waiting)))
                             'face 'monk-ui-partial

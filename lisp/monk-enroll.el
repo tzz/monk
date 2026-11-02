@@ -26,7 +26,7 @@
 ;; as pills, and the classes its facts gave it when they are known.
 ;; Keys add, move, rename, and remove hosts and groups and set vars;
 ;; every change rebuilds the machines at once and `s' writes the
-;; inventory file (`monk-inventory-file').  `.' jumps to the host's
+;; inventory (`monk-inventory-path').  `.' jumps to the host's
 ;; entry in that file.  The tree in memory is the one `monk-inventory'
 ;; was built from, so a policy file that defines its inventory in code
 ;; can be edited too, and then migrated with `monk-inventory-migrate'.
@@ -49,6 +49,7 @@
 (require 'monk)
 (require 'monk-inventory)
 (require 'monk-ui)
+(require 'monk-event)
 
 (declare-function monk-translate-import "monk-translate" (dialect source machine))
 (declare-function monk-agent-launchd-units "monk-agent" (&rest args))
@@ -114,6 +115,7 @@ project that `monk-translate-import' reads.  Nil never harvests."
     (define-key map (kbd "s") #'monk-inventory-save-command)
     (define-key map (kbd "g") #'monk-inventory-refresh)
     (define-key map (kbd "E") #'monk-enroll)
+    (define-key map (kbd "A") #'monk-enroll-accept)
     (define-key map (kbd "?") #'monk-inventory-help)
     (define-key map (kbd "q") #'monk-ui-quit)
     map)
@@ -151,12 +153,12 @@ project that `monk-translate-import' reads.  Nil never harvests."
   "Show the editor's keys."
   (interactive)
   (message "%s" (substitute-command-keys
-                 "\\[monk-inventory-add-host] add host  \\[monk-inventory-add-group] add group  \\[monk-inventory-rename] rename  \\[monk-inventory-move-host] move host  \\[monk-inventory-set-var] set var  \\[monk-inventory-unset-var] unset var  \\[monk-inventory-set-property] address/user/port/method  \\[monk-inventory-delete] delete  \\[monk-inventory-gather-facts] facts  \\[monk-inventory-inspect] inspect  \\[monk-inventory-find-definition] file  \\[monk-enroll] enroll this machine  \\[monk-inventory-save-command] save  \\[monk-ui-toggle-fold] fold  \\[monk-ui-quit] quit")))
+                 "\\[monk-inventory-add-host] add host  \\[monk-inventory-add-group] add group  \\[monk-inventory-rename] rename  \\[monk-inventory-move-host] move host  \\[monk-inventory-set-var] set var  \\[monk-inventory-unset-var] unset var  \\[monk-inventory-set-property] address/user/port/method  \\[monk-inventory-delete] delete  \\[monk-inventory-gather-facts] facts  \\[monk-inventory-inspect] inspect  \\[monk-inventory-find-definition] file  \\[monk-enroll] enroll this machine  \\[monk-enroll-accept] accept (lift probation)  \\[monk-inventory-save-command] save  \\[monk-ui-toggle-fold] fold  \\[monk-ui-quit] quit")))
 
 ;;;###autoload
 (defun monk-inventory-edit ()
   "Open the inventory editor on the current inventory.
-With no inventory loaded, read `monk-inventory-file' first; with no
+With no inventory loaded, read `monk-inventory-path' first; with no
 file either, start an empty tree named `world'."
   (interactive)
   (unless monk-inventory-tree
@@ -253,6 +255,8 @@ file either, start an empty tree named `world'."
     (when (and m (oref m classes))
       (insert "  " (propertize (mapconcat #'symbol-name (seq-take (oref m classes) 6) " ") 'face 'monk-ui-skipped)
               (if (> (length (oref m classes)) 6) (propertize " …" 'face 'monk-ui-skipped) "")))
+    (when (cdr (assq 'probation (plist-get plist :vars)))
+      (insert "  " (propertize " ON PROBATION: A accepts " 'face 'monk-ui-partial)))
     (when (and m (not (oref m facts)))
       (insert "  " (propertize "no facts yet (f)" 'face 'monk-ui-skipped)))
     (insert "\n")
@@ -314,10 +318,17 @@ THING is as `monk-inventory--thing-at-point' returns it."
 ;;;; Edits
 
 (defun monk-inventory--apply (tree)
-  "Make TREE the inventory, mark the buffer dirty, redraw."
-  (monk-inventory-update tree)
+  "Make TREE the inventory, mark the buffer dirty, redraw.
+In a directory inventory a host that lives in a file Monk did not
+write (a hand-written `.el' or `.json') cannot be changed here; the edit
+is refused with the file named, and the tree stays as it was."
+  (if (and monk-inventory-tree-file (file-directory-p monk-inventory-tree-file))
+      (condition-case err
+          (monk-inventory-update tree t)
+        (monk-inventory-error (user-error "%s" (cadr err))))
+    (monk-inventory-update tree))
   (with-current-buffer (get-buffer-create monk-inventory-buffer-name)
-    (setq monk-inventory--dirty t)
+    (setq monk-inventory--dirty (not (and monk-inventory-tree-file (file-directory-p monk-inventory-tree-file))))
     (monk-inventory-refresh)))
 
 (defun monk-inventory--read-group (prompt &optional default)
@@ -450,8 +461,15 @@ An empty VALUE removes the key."
 (defun monk-inventory-find-definition ()
   "Open the inventory file at the host or group at point."
   (interactive)
-  (let ((file (or monk-inventory-tree-file (user-error "The inventory has no file yet; s saves it")))
-        (thing (monk-inventory--thing-at-point)))
+  (let* ((thing (monk-inventory--thing-at-point))
+         (own (and (eq (car thing) 'host) (cdr (assq (cdr thing) monk-inventory-origins))))
+         (file (or own
+                   (and monk-inventory-tree-file (not (file-directory-p monk-inventory-tree-file))
+                        monk-inventory-tree-file)
+                   (and monk-inventory-tree-file (expand-file-name "groups.el" monk-inventory-tree-file))
+                   (user-error "The inventory has no file yet; s saves it"))))
+    (unless (file-exists-p file)
+      (user-error "%s is not written yet; s saves it" (abbreviate-file-name file)))
     (find-file-other-window file)
     (goto-char (point-min))
     (when thing
@@ -584,6 +602,68 @@ remote host name to enroll from here."
       ('agent (monk-enroll-plan-agent machine))
       ('harvest (monk-enroll-import-harvest machine))
       (_ nil))))
+
+(defconst monk-enroll-probation-var 'probation
+  "The variable an agent sets on a host it enrolled by itself.
+See `monk-agent-unknown-host'.")
+
+;;;###autoload
+(defun monk-enroll-accept (&optional host)
+  "Accept HOST, default the one at point or this machine: lift its probation.
+Removes the `probation' variable, saves the inventory, and when an
+agent for that host answers on this machine's socket, tells it, so
+its next run is real; an agent elsewhere notices at its next converge
+through the file."
+  (interactive)
+  (let* ((host (or host
+                   (and (derived-mode-p 'monk-inventory-mode)
+                        (pcase (monk-inventory--thing-at-point) (`(host . ,h) h)))
+                   (intern (downcase (car (split-string (system-name) "\\."))))))
+         (entry (or (monk-inventory-host-entry host)
+                    (user-error "%s is not in the inventory" host))))
+    (unless (cdr (assq monk-enroll-probation-var (plist-get (cdr entry) :vars)))
+      (user-error "%s is not on probation" host))
+    (monk-inventory-update
+     (monk-inventory-tree-set-host-var monk-inventory-tree host monk-enroll-probation-var :unset)
+     t)
+    (when (get-buffer monk-inventory-buffer-name)
+      (with-current-buffer monk-inventory-buffer-name
+        (setq monk-inventory--dirty nil)
+        (monk-inventory-refresh)))
+    ;; a local agent on probation for this very host: tell it now
+    (when (and (fboundp 'monk-agent-read-pid-file)
+               (equal (symbol-name host) (downcase (car (split-string (system-name) "\\."))))
+               (monk-agent-read-pid-file))
+      (condition-case err
+          (let ((reply (monk-enroll--ask-agent '((op . "accept")))))
+            (message "%s accepted; the agent answered %s" host (or (alist-get 'note reply) "and runs for real now")))
+        (error (message "%s accepted in the inventory; the agent could not be told (%s), it notices at its next converge"
+                        host (error-message-string err)))))
+    (unless (and (fboundp 'monk-agent-read-pid-file) (monk-agent-read-pid-file))
+      (message "%s accepted; saved to %s" host (abbreviate-file-name (monk-inventory-file))))))
+
+(declare-function monk-agent-read-pid-file "monk-agent")
+(declare-function monk-agent-local-socket-path "monk-agent")
+
+(defun monk-enroll--ask-agent (request)
+  "Send REQUEST to the local agent's socket and return its first reply alist."
+  (require 'monk-agent)
+  (let* ((socket (monk-agent-local-socket-path))
+         (reply nil)
+         (proc (make-network-process :name "monk-enroll-accept" :family 'local :service socket
+                                     :noquery t :coding 'utf-8-unix
+                                     :filter (lambda (_p chunk)
+                                               (unless reply
+                                                 (setq reply (monk-event-parse (car (split-string chunk "\n" t))))))
+                                     :sentinel #'ignore)))
+    (unwind-protect
+        (progn
+          (process-send-string proc (monk-event-line request))
+          (let ((deadline (+ (float-time) 5)))
+            (while (and (null reply) (< (float-time) deadline) (process-live-p proc))
+              (accept-process-output proc 0.1)))
+          (or reply (error "no answer within 5 s")))
+      (ignore-errors (delete-process proc)))))
 
 (defun monk-enroll-plan-agent (machine)
   "Plan the agent install for MACHINE: launchd on macOS, else systemd.

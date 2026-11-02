@@ -146,8 +146,33 @@ The first converge on start always runs.  See `monk-agent-policy-repo'."
 (defconst monk-agent-template-name "monk-agent@.service")
 
 (defconst monk-agent-ops '("status" "tail" "plan" "run" "history-runs" "history-results"
-                           "subscribe" "watch-mode" "watch-log" "machine")
+                           "subscribe" "watch-mode" "watch-log" "machine" "accept")
   "Operations the query endpoint accepts.")
+
+(defcustom monk-agent-unknown-host 'probation
+  "What the agent does on a host the inventory does not name.
+`probation': enroll the host into the inventory file under the group
+`monk-enroll' proposes, marked `(probation . t)', and run with every
+converge a dry run and the watch assisted, so the first runs show
+what the policy would do here and change nothing; a person accepts
+the host (`monk-enroll-accept', `A' in the editor, or the `accept'
+op) and the agent switches to real runs without a restart.  `abort':
+print why and exit 3.  `run': treat it as a bare local machine, as
+Monk did before 0.9.1; the policy runs for real with no inventory
+vars, which on a dotfile policy means symlinks, packages, and jobs
+on a machine nobody looked at.  With no inventory loaded at all the
+agent runs the bare machine whatever this says: there is nothing to
+enroll into."
+  :type '(choice (const probation) (const abort) (const run)))
+
+(defconst monk-agent-probation-var 'probation
+  "The inventory variable that marks a host as enrolled but not accepted.")
+
+(defconst monk-agent-unknown-host-exit 3
+  "Exit code when `monk-agent-unknown-host' is `abort' and the host is unknown.")
+
+(defvar monk-agent--probation nil
+  "Non-nil while this agent runs on probation: dry runs, assisted watch.")
 
 (defconst monk-agent-local-socket-name "agent.sock"
   "Socket file under the Monk state directory for a local, same-user agent.")
@@ -561,15 +586,98 @@ line, or nil when nothing was stale."
 (defvar monk-inventory)
 (declare-function monk-inventory-find "monk-inventory" (name))
 
+(defun monk-agent-inventory-machine ()
+  "Return this host's entry in the loaded inventory, or nil."
+  (and (bound-and-true-p monk-inventory)
+       (fboundp 'monk-inventory-find)
+       (monk-inventory-find (car (split-string (system-name) "\\.")))))
+
 (defun monk-agent-machine ()
   "Return the machine the agent manages: this host.
 When an inventory is loaded and names this host, that entry is used,
 so inventory variables, groups, and their classes apply, as they do
-from a controller.  Otherwise a bare local machine."
-  (or (and (bound-and-true-p monk-inventory)
-           (fboundp 'monk-inventory-find)
-           (monk-inventory-find (car (split-string (system-name) "\\."))))
+from a controller.  Otherwise a bare local machine; what the agent
+loop does with one is `monk-agent-unknown-host'."
+  (or (monk-agent-inventory-machine)
       (monk-local-machine)))
+
+(declare-function monk-enroll-propose-group "monk-enroll" (machine))
+(declare-function monk-inventory-tree-put-host "monk-inventory" (tree group host &rest plist))
+(declare-function monk-inventory-update "monk-inventory" (tree &optional save))
+(declare-function monk-inventory-load "monk-inventory" (&optional file))
+(declare-function monk-inventory-file "monk-inventory")
+(declare-function monk-inventory-find "monk-inventory" (name))
+(declare-function monk-inventory-define "monk-inventory" (tree &optional file))
+(declare-function monk-inventory-tree-set-host-var "monk-inventory" (tree host var value))
+(defvar monk-inventory-tree)
+(defvar monk-inventory-tree-file)
+(defvar monk-inventory)
+(defvar monk-agent--machine)
+
+(defun monk-agent-probation-p (&optional machine)
+  "Return non-nil when MACHINE, default the agent's, is enrolled on probation."
+  (let ((m (or machine monk-agent--machine (monk-agent-machine))))
+    (and m (cdr (assq monk-agent-probation-var (oref m vars))) t)))
+
+(defun monk-agent--settle-unknown-host (m)
+  "Apply `monk-agent-unknown-host' to M, a bare local machine.
+Return the machine the agent runs with.
+`probation' enrolls it and returns the inventory machine; `abort'
+exits; `run' returns M."
+  (pcase monk-agent-unknown-host
+    ('run m)
+    ('abort
+     (monk-cli-print-line
+      (format "%s %s is not in the inventory (%s); monk-agent-unknown-host is abort"
+              (monk-cli--color "31" "monk-agent") (oref m name)
+              (if (bound-and-true-p monk-inventory-tree)
+                  (abbreviate-file-name (or (bound-and-true-p monk-inventory-tree-file) "code"))
+                "no inventory loaded")))
+     (kill-emacs monk-agent-unknown-host-exit))
+    (_
+     (require 'monk-enroll)
+     (monk-gather-facts m)
+     (let* ((name (intern (downcase (car (split-string (oref m name) "\\.")))))
+            (group (monk-enroll-propose-group m)))
+       (monk-inventory-update
+        (monk-inventory-tree-put-host monk-inventory-tree group name
+                                      :vars (list (cons monk-agent-probation-var t)))
+        t)
+       (let ((in (monk-inventory-find name)))
+         (oset in facts (oref m facts))
+         (oset in gathered (oref m gathered))
+         (oset in facts-source 'live)
+         (oset in classes (monk-hard-classes in))
+         (monk-cli-print-line
+          (format "%s %s was not in the inventory: enrolled under %s ON PROBATION in %s; every run is a dry run until accepted (M-x monk-enroll-accept, A in the inventory editor)"
+                  (monk-cli--color "33" "monk-agent") name group
+                  (abbreviate-file-name (monk-inventory-file))))
+         in)))))
+
+(defun monk-agent--refresh-probation ()
+  "Re-read the inventory; set `monk-agent--probation' from this host's entry.
+Called before every converge, so an accept written by the editor or
+the socket takes effect at the next run with no restart."
+  (when (and (bound-and-true-p monk-inventory-tree-file)
+             (file-readable-p monk-inventory-tree-file))
+    (condition-case err
+        (let ((was monk-agent--machine))
+          (monk-inventory-load monk-inventory-tree-file)
+          (let ((now (monk-agent-inventory-machine)))
+            (when (and now was (oref was facts) (not (oref now facts)))
+              (oset now facts (oref was facts))
+              (oset now gathered (oref was gathered))
+              (oset now facts-source (oref was facts-source))
+              (oset now classes (monk-hard-classes now)))
+            (when now (setq monk-agent--machine now))))
+      (error (monk-log 'warn "inventory reload: %s" (error-message-string err)))))
+  (let ((before monk-agent--probation))
+    (setq monk-agent--probation (monk-agent-probation-p))
+    (when (and before (not monk-agent--probation))
+      (monk-cli-print-line (format "%s accepted: runs are real from now on" (monk-cli--color "32" "monk-agent")))
+      (setq monk-watch-mode 'autopilot))
+    (when (and (not before) monk-agent--probation)
+      (setq monk-watch-mode 'assisted))))
 
 (defvar monk-agent--machine nil
   "The machine of the running agent.")
@@ -666,9 +774,11 @@ runs is remembered and served right after."
         (load monk-agent-policy-file nil t)))
     (if (and timed monk-agent-only-if-changed monk-agent-policy-repo (not (eq update 'changed)))
         (monk-log 'info "policy repo unchanged; full converge skipped")
+      (monk-agent--refresh-probation)
       (let ((monk-watch--running t)
             (monk-agent--run-origin (or monk-agent--run-origin (if timed "timed" "start"))))
-        (monk-run-report (monk-converge (or monk-agent--machine (monk-agent-machine)) policy))))))
+        (monk-run-report (monk-converge (or monk-agent--machine (monk-agent-machine)) policy
+                                        :dry-run monk-agent--probation))))))
 
 (defun monk-agent--idle-text ()
   "Text of the watching line: paths, runs, uptime, next full converge."
@@ -678,7 +788,8 @@ runs is remembered and served right after."
                                                              (current-time))))))))
     (if (null w)
         "watching"
-      (format "%s %d dir(s) %d link(s)  %d run(s)  up %s%s  source: %s"
+      (format "%s%s %d dir(s) %d link(s)  %d run(s)  up %s%s  source: %s"
+              (if monk-agent--probation (monk-cli--color "33" "PROBATION ") "")
               (if (monk-watch-backend-alive-p w)
                   "watching"
                 (monk-cli--color "31" "WATCH DOWN, restart pending;"))
@@ -708,7 +819,15 @@ is already recorded."
         (monk-report-function #'monk-agent--report)
         (monk-log-level monk-agent-log-level)
         (monk-watch-mode 'autopilot)
-        (m (monk-agent-machine)))
+        ;; a host missing from a loaded inventory is the unknown-host
+        ;; case; with no inventory at all there is nothing to enroll
+        ;; into or abort against, and the bare machine runs as before
+        (m (or (monk-agent-inventory-machine)
+               (if (bound-and-true-p monk-inventory-tree)
+                   (monk-agent--settle-unknown-host (monk-local-machine))
+                 (monk-local-machine)))))
+    (setq monk-agent--probation (monk-agent-probation-p m))
+    (when monk-agent--probation (setq monk-watch-mode 'assisted))
     ;; The policy file is what defined the policy, unless told otherwise;
     ;; the agent reloads it when it changes.
     (unless monk-agent-policy-file
@@ -726,8 +845,9 @@ is already recorded."
     ;; leave a half-torn watch.
     (add-hook 'kill-emacs-hook #'monk-agent-stop)
     (monk-cli-print-line
-     (format "%s %s build %s start on %s as %s, ledger %s, socket %s, full converge every %ss%s"
+     (format "%s %s build %s start on %s%s as %s, ledger %s, socket %s, full converge every %ss%s"
              (monk-cli--color "1" "monk-agent") monk-version monk-build (oref m name)
+             (if monk-agent--probation (monk-cli--color "33" " ON PROBATION (dry runs)") "")
              (monk-owner-string (monk-owner))
              (abbreviate-file-name (monk-agent-ledger-path))
              (abbreviate-file-name (monk-agent-local-socket-path)) monk-agent-full-interval
@@ -931,6 +1051,7 @@ Host, owner, build, watch state, sudo state, last run."
     `((host . ,(system-name))
       (owner . ,(monk-owner-string (monk-owner)))
       (scope . ,(if (monk-root-p) "root" "user"))
+      (probation . ,(if monk-agent--probation t :false))
       (pid . ,(emacs-pid))
       (version . ,monk-version)
       (build . ,monk-build)
@@ -1179,6 +1300,20 @@ machine is of interest to a session."
        ;; the subscribe reply and whenever facts are gathered, so a
        ;; session never has to ask a busy agent (2026-10-12)
        (monk-agent--respond (append '((op . "machine") (ok . t)) (monk-agent-machine-alist))))
+      ("accept"
+       ;; a session, or monk-enroll-accept from anywhere, lifts the
+       ;; probation: the var goes, the file is written, the next run
+       ;; is real
+       (require 'monk-enroll)
+       (let ((name (intern (downcase (car (split-string (system-name) "\\."))))))
+         (if (not (monk-agent-probation-p))
+             (monk-agent--respond '((op . "accept") (ok . t) (note . "not on probation")))
+           (monk-inventory-update
+            (monk-inventory-tree-set-host-var monk-inventory-tree name monk-agent-probation-var :unset)
+            t)
+           (monk-agent--refresh-probation)
+           (monk-agent--respond '((op . "accept") (ok . t)))
+           (monk-agent--full-converge monk-agent--policy))))
       ("watch-log"
        (let ((lines (and (get-buffer monk-watch-log-buffer-name)
                          (with-current-buffer monk-watch-log-buffer-name
@@ -1223,7 +1358,9 @@ machine is of interest to a session."
                             (monk-agent--respond
                              (monk-event-result (plist-get data :result) live nil)))))
                        monk-progress-functions)))
-              (run (monk-converge (monk-agent-machine) policy :dry-run (equal op "plan"))))
+              (run (progn (monk-agent--refresh-probation)
+                          (monk-converge (monk-agent-machine) policy
+                                         :dry-run (or (equal op "plan") monk-agent--probation)))))
          (monk-run-report run)
          (unless subscribed
            (monk-agent--respond (monk-event-run 'run-end run)))

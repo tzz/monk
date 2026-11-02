@@ -1374,7 +1374,7 @@ Everything under the drive's own MONK_HOME; the real inventory is
 let-bound away."
   (monk-testdrive--out "\n## Inventory file and enroll")
   (let ((monk-inventory nil) (monk-inventory-tree nil) (monk-inventory-tree-file nil)
-        (monk-inventory-derived nil) (monk-inventory-file nil))
+        (monk-inventory-derived nil) (monk-inventory-path nil))
     (monk-testdrive--step "inventory" "a tree saves to MONK_HOME/inventory.el and loads back"
       (monk-inventory-define '(world :children ((macs :hosts ((drivemac :vars ((mine . t)))))
                                                 (unix :hosts ((drivebox :address "drivebox.invalid")))))
@@ -1405,6 +1405,32 @@ let-bound away."
              (cons (monk-inventory-find 'newbox) "add")
              (cons (string-match-p "newbox" (with-temp-buffer (insert-file-contents (monk-inventory-file)) (buffer-string)))
                    "file lacks newbox"))))))
+    (monk-testdrive--step "enroll" "an agent on an unknown host enrolls it on probation; accept lifts it"
+      (let ((monk-agent-unknown-host 'probation) (monk-agent--machine nil) (monk-agent--probation nil)
+            (made (monk-testdrive--path "probation-made")) (runs nil))
+        ;; the agent looks itself up by the system name; the drive is
+        ;; a host called stray for this step
+        (cl-letf (((symbol-function 'system-name) (lambda () "stray"))
+                  ((symbol-function 'monk-gather-facts)
+                   (lambda (m) (oset m facts '((kernel . "Darwin") (home . "/x") (user . "u")))
+                     (oset m classes (monk-hard-classes m)) m))
+                  ((symbol-function 'monk-run-report) (lambda (run &rest _) (push run runs) run)))
+          (let* ((m (monk-agent--settle-unknown-host (monk-machine :name "stray")))
+                 (name 'stray))
+            (setq monk-agent--machine m monk-agent--probation (monk-agent-probation-p m))
+            (let ((monk-agent--policy (lambda (_m) (monk-directory made))))
+              (monk-agent--full-converge monk-agent--policy)
+              (let ((dry (and runs (monk-run-dry-run (car runs)))) (before (file-directory-p made)))
+                (monk-enroll-accept name)
+                (monk-agent--refresh-probation)
+                (monk-agent--full-converge monk-agent--policy)
+                (monk-testdrive--checks
+                 (cons (eq 'macs (monk-inventory-group-of name)) "stray not under macs")
+                 (cons dry "first converge was not a dry run")
+                 (cons (not before) "probation run made the directory")
+                 (cons (not monk-agent--probation) "still on probation after accept")
+                 (cons (not (monk-run-dry-run (car runs))) "run after accept was still dry")
+                 (cons (file-directory-p made) "run after accept did not make the directory"))))))))
     (monk-testdrive--step "enroll" "monk-enroll adds this host under the proposed group and saves"
       (let ((answers (list "macs" "nothing more")))
         (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) (pop answers)))
@@ -1825,7 +1851,7 @@ let-bound away."
   "The inventory editor on a throwaway tree."
   (monk-testdrive--step "tour" "inventory editor: groups fold, hosts carry pills, keys edit"
     (let ((monk-inventory nil) (monk-inventory-tree nil) (monk-inventory-tree-file nil)
-          (monk-inventory-derived nil) (monk-inventory-file nil))
+          (monk-inventory-derived nil) (monk-inventory-path nil))
       (monk-inventory-define '(world :vars ((observer . nil))
                                      :children ((macs :vars ((mine . t)) :hosts ((tourmac :vars ((home_leader . t))) (othermac :address "othermac.invalid" :method "rpc")))
                                                 (unix :hosts ((tourbox :address "tourbox.invalid" :user "pi")))))

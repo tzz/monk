@@ -1001,7 +1001,7 @@ answers, consumed in order.  The log is stored in the symbol property
   "The tree saves to the inventory file, prints readably, and loads back the same."
   (monk-test-with-tmpdir dir
     (let ((process-environment (cons (concat monk-home-environment-variable "=" dir) process-environment))
-          (monk-inventory-file nil) (monk-inventory nil) (monk-inventory-tree nil)
+          (monk-inventory-path nil) (monk-inventory nil) (monk-inventory-tree nil)
           (monk-inventory-tree-file nil) (monk-log-level nil))
       ;; no file yet: load says so and returns nil
       (should-not (monk-inventory-load))
@@ -1021,6 +1021,138 @@ answers, consumed in order.  The log is stored in the symbol property
       (should (equal '(unix home world) (oref (monk-inventory-find 'kamen) groups)))
       ;; migrate refuses once the file exists
       (should-error (monk-inventory-migrate) :type 'user-error))))
+
+(ert-deftest monk-test-inventory-json-directory ()
+  "A directory of JSON fragments is the inventory: Ansible's shape, read with
+core json; written back by Monk for its own files, a new host as HOST.json."
+  (monk-test-with-tmpdir dir
+    (let ((inv (concat dir "inventory.d/"))
+          (monk-inventory nil) (monk-inventory-tree nil) (monk-inventory-tree-file nil)
+          (monk-inventory-origins nil) (monk-inventory-derived nil) (monk-log-level nil))
+      (make-directory inv)
+      (with-temp-file (concat inv "world.json")
+        (insert "{\"world\": {\"vars\": {\"observer\": false},\n  \"children\": {\"home\": {\"vars\": {\"mine\": true}, \"children\": {\"macs\": {}, \"unix\": {}}}}}}\n"))
+      (with-temp-file (concat inv "home.json")
+        (insert "{\"macs\": {\"hosts\": {\"foxy\": {\"home_leader\": true}, \"boxy\": {}, \"moi\": {\"ansible_host\": \"moi.local\", \"monk_method\": \"rpc\"}}},\n"
+                " \"unix\": {\"hosts\": {\"kamen\": {\"ansible_host\": \"kamen.local\", \"ansible_user\": \"pi\", \"ansible_port\": 2222}}}}\n"))
+      (let ((monk-inventory-path inv))
+        (should (= 4 (length (monk-inventory-load))))
+        (let ((kamen (monk-inventory-find 'kamen)) (moi (monk-inventory-find 'moi)) (foxy (monk-inventory-find 'foxy)))
+          (should (equal "kamen.local" (oref kamen address)))
+          (should (equal "pi" (oref kamen user)))
+          (should (equal 2222 (oref kamen port)))
+          (should (equal "rpc" (oref moi method)))
+          (should (equal '(unix home world) (oref kamen groups)))
+          (should (eq t (cdr (assq 'home_leader (oref foxy vars)))))
+          (should (eq nil (cdr (assq 'observer (oref foxy vars)))))
+          (should (string-suffix-p "home.json" (car (oref kamen origin)))))
+        ;; a new host: its own .json with the _monk marker; hand-written files untouched
+        (let ((home-before (with-temp-buffer (insert-file-contents (concat inv "home.json")) (buffer-string))))
+          (monk-inventory-update (monk-inventory-tree-put-host monk-inventory-tree 'macs 'newmac
+                                                              :address "newmac.local" :vars '((probation . t)))
+                                 t)
+          (should (file-exists-p (concat inv "newmac.json")))
+          (should-not (file-exists-p (concat inv "groups.json")))
+          (should (equal home-before (with-temp-buffer (insert-file-contents (concat inv "home.json")) (buffer-string))))
+          (let ((text (with-temp-buffer (insert-file-contents (concat inv "newmac.json")) (buffer-string))))
+            (should (string-match-p "\"_monk\"" text))
+            (should (string-match-p "\"probation\": *true" text))
+            ;; valid JSON that core parses
+            (should (json-parse-string text :object-type 'alist))))
+        ;; lift the probation: the Monk file is rewritten
+        (monk-inventory-update (monk-inventory-tree-set-host-var monk-inventory-tree 'newmac 'probation :unset) t)
+        (should-not (string-match-p "probation" (with-temp-buffer (insert-file-contents (concat inv "newmac.json")) (buffer-string))))
+        ;; a hand-written host is read-only from here
+        (should-error (monk-inventory-update (monk-inventory-tree-set-host-var monk-inventory-tree 'foxy 'x t) t)
+                      :type 'monk-inventory-error)
+        (should-not (assq 'x (oref (monk-inventory-find 'foxy) vars)))
+        ;; a reload gives the same tree
+        (let ((tree monk-inventory-tree))
+          (setq monk-inventory nil monk-inventory-tree nil)
+          (monk-inventory-load)
+          (should (equal tree monk-inventory-tree)))
+        ;; a broken JSON file is an error naming it
+        (with-temp-file (concat inv "bad.json") (insert "{\"x\": [1, 2,]}\n"))
+        (condition-case e (progn (monk-inventory-load) (ert-fail "bad json accepted"))
+          (monk-inventory-error (should (string-match-p "bad.json" (cadr e)))))
+        (delete-file (concat inv "bad.json"))))))
+
+(ert-deftest monk-test-inventory-directory-fragments ()
+  "A directory of .el and .json fragments merges by group name; saves write
+per-host files; hand-written and YAML hosts are read-only from Monk."
+  (monk-test-with-tmpdir dir
+    (let ((inv (concat dir "inventory/"))
+          (monk-inventory nil) (monk-inventory-tree nil) (monk-inventory-tree-file nil)
+          (monk-inventory-origins nil) (monk-inventory-derived nil) (monk-log-level nil))
+      (make-directory inv)
+      (let ((monk-inventory-path inv))
+        ;; empty directory: nothing yet
+        (should-not (monk-inventory-load))
+        (with-temp-file (concat inv "groups.el")
+          (insert "(world :vars ((observer . nil)) :children ((home :vars ((mine . t)) :children ((macs) (unix)))))\n"))
+        (with-temp-file (concat inv "macs.el")
+          (insert ";; hand-written\n(macs :hosts ((foxy :vars ((home_leader . t))) (moi :address \"moi.local\")))\n"))
+        (with-temp-file (concat inv "kamen.el")
+          (insert "(unix :hosts ((kamen :address \"kamen.local\" :user \"pi\")))\n"))
+        ;; a list of group forms in one file is fine too
+        (with-temp-file (concat inv "links.el")
+          (insert "(world :children ((office)))\n(office :vars ((mine . nil)))\n"))
+        (should (= 3 (length (monk-inventory-load))))
+        (should (equal '(unix home world) (oref (monk-inventory-find 'kamen) groups)))
+        (should (equal (concat inv "kamen.el") (car (oref (monk-inventory-find 'kamen) origin))))
+        (should (equal (concat inv "macs.el") (cdr (assq 'foxy monk-inventory-origins))))
+        (should (memq 'office (monk-inventory-group-names)))
+        ;; JSON beside the Lisp fragments
+        (progn
+          (with-temp-file (concat inv "work.json")
+            (insert "{\"office\": {\"children\": {\"officemacs\": {\"hosts\": {\"lappy\": {\"ansible_host\": \"lappy.example\", \"ansible_user\": \"tzz\", \"office_laptop\": true}, \"deskie\": {}}}}}}\n"))
+          (should (= 5 (length (monk-inventory-load))))
+          (let ((lappy (monk-inventory-find 'lappy)))
+            (should (equal "lappy.example" (oref lappy address)))
+            (should (equal "tzz" (oref lappy user)))
+            (should (equal '(officemacs office world) (oref lappy groups)))
+            (should (eq t (cdr (assq 'office_laptop (oref lappy vars)))))
+            (should (eq nil (cdr (assq 'mine (oref lappy vars)))))
+            ;; a t var becomes a class once facts are in
+            (oset lappy facts monk-test-fake-facts)
+            (should (memq 'office_laptop (monk-hard-classes lappy)))
+            (should (string-suffix-p "work.json" (car (oref lappy origin)))))
+          ;; a JSON host written by hand cannot be changed from the editor side
+          (should-error (monk-inventory-update (monk-inventory-tree-set-host-var monk-inventory-tree 'lappy 'x t) t)
+                        :type 'monk-inventory-error)
+          ;; and the refusal left memory as it was
+          (should-not (assq 'x (oref (monk-inventory-find 'lappy) vars))))
+        ;; a new host saves as its own file; macs.el (hand-written) untouched
+        (let ((macs-before (with-temp-buffer (insert-file-contents (concat inv "macs.el")) (buffer-string))))
+          (monk-inventory-update (monk-inventory-tree-put-host monk-inventory-tree 'macs 'newbox :address "newbox.local") t)
+          (should (file-exists-p (concat inv "newbox.el")))
+          (should (equal macs-before (with-temp-buffer (insert-file-contents (concat inv "macs.el")) (buffer-string))))
+          (should (string-match-p "\\`;;; Monk inventory fragment" (with-temp-buffer (insert-file-contents (concat inv "newbox.el")) (buffer-string)))))
+        ;; changing a hand-written host is refused, naming the file
+        (should-error (monk-inventory-update (monk-inventory-tree-set-host-var monk-inventory-tree 'foxy 'speedy t) t)
+                      :type 'monk-inventory-error)
+        (condition-case e
+            (monk-inventory-update (monk-inventory-tree-set-host-var monk-inventory-tree 'foxy 'speedy t) t)
+          (monk-inventory-error (should (string-match-p "foxy changed.*macs.el.*edit it by hand" (cadr e)))))
+        ;; moving the Monk-owned host rewrites its file; a reload agrees
+        (monk-inventory-update (monk-inventory-tree-put-host monk-inventory-tree 'unix 'newbox :address "newbox.local") t)
+        (let ((tree monk-inventory-tree))
+          (setq monk-inventory nil monk-inventory-tree nil)
+          (monk-inventory-load)
+          (should (equal tree monk-inventory-tree))
+          (should (equal '(unix home world) (oref (monk-inventory-find 'newbox) groups))))
+        ;; the skeleton groups.el was hand-written: left alone
+        (should-not (string-match-p "Monk" (with-temp-buffer (insert-file-contents (concat inv "groups.el")) (buffer-string))))
+        ;; a host in two files is an error that names both
+        (with-temp-file (concat inv "dup.el") (insert "(unix :hosts ((kamen)))\n"))
+        (condition-case e (progn (monk-inventory-load) (ert-fail "duplicate accepted"))
+          (monk-inventory-error (should (string-match-p "kamen is in both .*dup.el and .*kamen.el\\|kamen is in both .*kamen.el and .*dup.el" (cadr e)))))
+        (delete-file (concat inv "dup.el"))
+        ;; two roots is an error
+        (with-temp-file (concat inv "stray.el") (insert "(elsewhere :hosts ((x)))\n"))
+        (should-error (monk-inventory-load) :type 'monk-inventory-error)
+        (delete-file (concat inv "stray.el"))
+        (should (monk-inventory-load))))))
 
 (ert-deftest monk-test-inventory-tree-edits ()
   "The pure tree edits: put, move, remove, vars, properties, groups, rename."
@@ -1076,7 +1208,7 @@ answers, consumed in order.  The log is stored in the symbol property
   (require 'monk-enroll)
   (monk-test-with-tmpdir dir
     (let ((process-environment (cons (concat monk-home-environment-variable "=" dir) process-environment))
-          (monk-inventory-file nil) (monk-inventory nil) (monk-inventory-tree nil)
+          (monk-inventory-path nil) (monk-inventory nil) (monk-inventory-tree nil)
           (monk-inventory-tree-file nil) (monk-inventory-derived nil) (monk-log-level nil)
           (monk-ui-style 'text))
       (monk-inventory-define monk-test-inventory-tree "code.el")
@@ -1135,6 +1267,97 @@ answers, consumed in order.  The log is stored in the symbol property
         (monk-inventory-load)
         (should (monk-inventory-find 'enrollee))
         (should-not (plist-get (cdr (monk-inventory-host-entry 'enrollee)) :address))))))
+
+(ert-deftest monk-test-agent-unknown-host-probation ()
+  "An agent on a host the inventory lacks enrolls it on probation: dry
+runs, assisted watch, a PROBATION status; `accept' over the socket lifts
+it and the next run is real.  `abort' exits 3; `run' is the old
+behaviour."
+  (require 'monk-agent) (require 'monk-enroll) (require 'monk-connect)
+  (skip-unless (featurep 'make-network-process))
+  (monk-test-with-tmpdir dir
+    (let* ((home (concat dir "home"))
+           (process-environment (cons (concat monk-home-environment-variable "=" home) process-environment))
+           (monk-log-level nil)
+           (monk-inventory nil) (monk-inventory-tree nil) (monk-inventory-tree-file nil)
+           (monk-inventory-derived nil) (monk-inventory-path nil)
+           (monk-agent--server nil) (monk-agent--subscribers nil)
+           (monk-agent--machine nil) (monk-agent--probation nil) (monk-agent--policy nil)
+           (monk-connect--process nil) (monk-connect--status nil)
+           (made (concat dir "made"))
+           (monk-batch-policy (lambda (_m) (monk-directory made)))
+           (reports nil))
+      ;; an inventory that does not name this host
+      (monk-inventory-define '(world :children ((macs :hosts ((someone-else))))) "code.el")
+      (monk-inventory-save)
+      (cl-letf (((symbol-function 'monk-gather-facts)
+                 (lambda (m) (oset m facts (cons '(kernel . "Darwin") monk-test-fake-facts))
+                   (oset m classes (monk-hard-classes m)) m))
+                ((symbol-function 'monk-agent--sudo-state) (lambda () "cached"))
+                ((symbol-function 'monk-run-report) (lambda (run &rest _) (push run reports) run)))
+        ;; abort: exit 3
+        (let ((monk-agent-unknown-host 'abort) (exited nil))
+          (cl-letf (((symbol-function 'kill-emacs) (lambda (&optional code) (setq exited code) (signal 'quit nil))))
+            (should-error (monk-agent--settle-unknown-host (monk-local-machine)) :type 'quit)
+            (should (= 3 exited))))
+        ;; run: the bare machine, nothing enrolled
+        (let ((monk-agent-unknown-host 'run))
+          (should (monk-machine-local-p (monk-agent--settle-unknown-host (monk-local-machine))))
+          (should-not (monk-inventory-find (car (split-string (system-name) "\\.")))))
+        ;; probation: enrolled under macs with the var, in the file
+        (let* ((monk-agent-unknown-host 'probation)
+               (m (monk-agent--settle-unknown-host (monk-local-machine)))
+               (name (intern (downcase (car (split-string (system-name) "\\."))))))
+          (should (monk-inventory-find name))
+          (should (eq 'macs (monk-inventory-group-of name)))
+          (should (monk-agent-probation-p m))
+          (should (string-match-p "probation" (with-temp-buffer (insert-file-contents (monk-inventory-file)) (buffer-string))))
+          (setq monk-agent--machine m monk-agent--probation t monk-agent--policy monk-batch-policy)
+          ;; a converge on probation is a dry run: the directory is not made
+          (monk-agent--full-converge monk-batch-policy)
+          (should (monk-run-dry-run (car reports)))
+          (should-not (file-directory-p made))
+          (should (eq t (alist-get 'probation (monk-agent-status-alist))))
+          ;; accept over the socket: the var goes, the file is rewritten,
+          ;; the agent converges for real
+          (unwind-protect
+              (progn
+                (should (monk-agent-serve-local))
+                (let ((reply (monk-enroll--ask-agent '((op . "accept")))))
+                  (should (eq t (alist-get 'ok reply))))
+                (accept-process-output nil 0.3)
+                (should-not monk-agent--probation)
+                (should-not (monk-agent-probation-p))
+                (should-not (string-match-p "probation" (with-temp-buffer (insert-file-contents (monk-inventory-file)) (buffer-string))))
+                (should (file-directory-p made))
+                (should-not (monk-run-dry-run (car reports)))
+                (should (eq :false (alist-get 'probation (monk-agent-status-alist))))
+                ;; accepting again is a no-op with a note
+                (should (equal "not on probation" (alist-get 'note (monk-enroll--ask-agent '((op . "accept")))))))
+            (monk-agent-stop-local)))))))
+
+(ert-deftest monk-test-enroll-accept-from-editor ()
+  "`monk-enroll-accept' on a host line lifts the probation and saves; no agent needed."
+  (require 'monk-enroll)
+  (monk-test-with-tmpdir dir
+    (let ((process-environment (cons (concat monk-home-environment-variable "=" dir) process-environment))
+          (monk-inventory nil) (monk-inventory-tree nil) (monk-inventory-tree-file nil)
+          (monk-inventory-derived nil) (monk-inventory-path nil) (monk-log-level nil))
+      (monk-inventory-define '(world :children ((macs :hosts ((newmac :vars ((probation . t))) (oldmac))))) "code.el")
+      (monk-inventory-save)
+      (cl-letf (((symbol-function 'monk-agent-read-pid-file) (lambda () nil)))
+        (save-window-excursion
+          (monk-inventory-edit)
+          (with-current-buffer monk-inventory-buffer-name
+            (should (string-match-p "ON PROBATION" (buffer-substring-no-properties (point-min) (point-max))))
+            (goto-char (monk-inventory--position-of '(host . oldmac)))
+            (should-error (monk-enroll-accept) :type 'user-error)
+            (goto-char (monk-inventory--position-of '(host . newmac)))
+            (monk-enroll-accept)
+            (should-not (string-match-p "ON PROBATION" (buffer-substring-no-properties (point-min) (point-max))))
+            (should-not monk-inventory--dirty))))
+      (should-not (plist-member (cdr (monk-inventory-host-entry 'newmac)) :vars))
+      (should-not (string-match-p "probation" (with-temp-buffer (insert-file-contents (monk-inventory-file)) (buffer-string)))))))
 
 (ert-deftest monk-test-enroll-group-proposal ()
   "A Mac is proposed for the macs group, a Pi for pis, else the deepest group with hosts."
