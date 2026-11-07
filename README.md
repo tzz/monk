@@ -2,6 +2,26 @@
 
 Monk is a configuration management system. Policy is Emacs Lisp. Remote access is TRAMP. There is no server, no agent, and no template language.
 
+## Getting started
+
+Monk needs three things: the code (a checkout or the package, see [Install](#install)), a policy file, and an inventory. The policy file is Lisp that defines a policy function and sets `monk-batch-policy` to it. The inventory is `monk-inventory-path`: one `.el` file, or a directory of `.el` and `.json` fragments. Keep the policy and the inventory in one git repository. Each case below ends with the machine in the inventory, a plan you have read, and, when the machine must enforce itself, an agent.
+
+**First machine, nothing exists yet.** Clone Monk. Write `policy.el` with a policy function and `(setq monk-batch-policy #'my-policy)`. Set `monk-inventory-path` in the same file. Run `M-x monk-enroll`: it gathers facts, proposes a group, writes the host entry, and saves the inventory. Run `(monk-run-report (monk-plan (monk-local-machine) #'my-policy))` and read the plan. Press `a` in `*monk*` to apply. To keep the machine enforced, answer `plan the agent install` when `monk-enroll` asks, or run `M-x monk-enroll-plan-agent` later. Commit the policy and the inventory.
+
+**New machine, repository checkout present.** Clone Monk and the policy repository. Start the agent: `emacs --batch -L monk/lisp -l policy.el -f monk-agent-main` (or install it through `monk-enroll-plan-agent`). The host is not in the inventory, so the agent enrolls it `ON PROBATION`: every converge is a dry run. Read its plans with `M-x monk-connect` → `local`. When the plan is right, run `M-x monk-enroll-accept`. The next converge is real. Commit the new inventory fragment (`HOST.el` or `HOST.json`).
+
+**Remote machine, local checkout.** The remote machine needs ssh and nothing else. From your Emacs, run `C-u M-x monk-enroll` and type `user@host`. Monk gathers facts over TRAMP and writes the entry with `:address` and `:user`. Plan and apply from here: `(monk-plan (monk-inventory-find 'host) #'my-policy)`, then `a`. `monk-watch-start` polls remote hosts for drift. There is no agent on the remote machine, so nothing is enforced while your Emacs is closed.
+
+**Remote machine, remote checkout.** Clone Monk and the policy repository on the remote machine, then start the agent there as in the second case. Accept the host from the machine itself, or from here: `monk-enroll-accept` on its line in `M-x monk-inventory-edit` after the fragment arrived in the repository. Connect from here with `M-x monk-connect` and pick the host. The connection goes over TRAMP to the agent's socket. `g`, `a`, `i`, `W` steer that agent. Set `monk-agent-policy-repo` in the policy file so the agent fast-forwards the checkout before each full converge.
+
+**Other cases.**
+
+- An inventory defined in code: run `M-x monk-inventory-migrate` once. It writes the tree to `monk-inventory-path`. Then delete the `monk-inventory-define` form.
+- A machine that must never enroll itself: set `monk-agent-unknown-host` to `abort` in the policy file. The agent exits with code 3 and names the host.
+- A machine with no inventory at all: do not set `monk-inventory-path`. The agent runs the policy on the bare machine, with facts and classes but no vars or groups.
+- An existing Linux machine: with [enroll](https://git.mig5.net/mig5/enroll) on `PATH`, `monk-enroll` offers to harvest the installed packages, changed `/etc` files, services, and users into a starting policy in `*monk-import*`.
+- A fleet: one fragment per host in the inventory directory. Each new machine adds one file. Edit groups and vars in `M-x monk-inventory-edit`, then commit.
+
 ## Install
 
 Monk is one multi-file package; `monk.el` carries the headers (`Package-Requires: ((emacs "29.1"))`). From a checkout, `make package` builds `dist/monk-VERSION.tar` the way `package.el` and MELPA build it (every `lisp/*.el` flat, a generated `monk-pkg.el`), and `M-x package-install-file` on that tarball installs it; `make package-test` does that into a throwaway `package-user-dir` and fails when a file does not compile or an entry point lacks an autoload. Until Monk is on MELPA, the recipe it will use is
