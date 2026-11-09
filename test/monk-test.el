@@ -1336,6 +1336,38 @@ behaviour."
                 (should (equal "not on probation" (alist-get 'note (monk-enroll--ask-agent '((op . "accept")))))))
             (monk-agent-stop-local)))))))
 
+(ert-deftest monk-test-agent-probation-in-empty-inventory-directory ()
+  "A policy that points at an empty inventory directory (what bootstrap.sh
+writes) is an inventory without this host: the agent enrolls on probation
+under a new `world' root and the fragment lands in the directory."
+  (require 'monk-agent) (require 'monk-enroll)
+  (monk-test-with-tmpdir dir
+    (let* ((inventory (concat dir "inventory.d/"))
+           (monk-log-level nil)
+           (monk-inventory nil) (monk-inventory-tree nil) (monk-inventory-tree-file nil)
+           (monk-inventory-derived nil) (monk-inventory-origins nil)
+           (monk-inventory-path inventory)
+           (monk-agent-unknown-host 'probation)
+           (name (intern (downcase (car (split-string (system-name) "\\."))))))
+      (make-directory inventory)
+      (should-not (monk-inventory-load))
+      (should (monk-agent--empty-inventory-directory-p))
+      (cl-letf (((symbol-function 'monk-gather-facts)
+                 (lambda (m) (oset m facts (cons '(kernel . "Linux") monk-test-fake-facts))
+                   (oset m classes (monk-hard-classes m)) m)))
+        (let ((m (monk-agent--settle-unknown-host (monk-local-machine))))
+          (should (monk-agent-probation-p m))
+          (should (eq 'world (monk-inventory-group-of name)))
+          (should (equal (list (format "%s.el" name))
+                         (mapcar #'file-name-nondirectory (monk-inventory--fragment-files inventory))))
+          ;; the written fragment reads back as the same host on probation
+          (setq monk-inventory nil monk-inventory-tree nil)
+          (should (= 1 (length (monk-inventory-load))))
+          (should (monk-agent-probation-p (monk-inventory-find name)))))
+      ;; no directory, no tree: nothing to enroll into
+      (let ((monk-inventory-path (concat dir "absent.d/")) (monk-inventory-tree nil))
+        (should-not (monk-agent--empty-inventory-directory-p))))))
+
 (ert-deftest monk-test-enroll-accept-from-editor ()
   "`monk-enroll-accept' on a host line lifts the probation and saves; no agent needed."
   (require 'monk-enroll)

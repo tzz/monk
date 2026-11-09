@@ -619,11 +619,25 @@ loop does with one is `monk-agent-unknown-host'."
   (let ((m (or machine monk-agent--machine (monk-agent-machine))))
     (and m (cdr (assq monk-agent-probation-var (oref m vars))) t)))
 
+(defun monk-agent--empty-inventory-directory-p ()
+  "Return non-nil when `monk-inventory-path' is a directory with no fragments.
+A fresh checkout (bootstrap.sh writes `inventory.d/' empty) is an
+inventory that exists and lacks this host, not the absence of one: the
+first agent there must enroll on probation, not run bare."
+  (and (bound-and-true-p monk-inventory-path)
+       (not (bound-and-true-p monk-inventory-tree))
+       (file-directory-p monk-inventory-path)))
+
 (defun monk-agent--settle-unknown-host (m)
   "Apply `monk-agent-unknown-host' to M, a bare local machine.
 Return the machine the agent runs with.
 `probation' enrolls it and returns the inventory machine; `abort'
-exits; `run' returns M."
+exits; `run' returns M.  With no tree loaded (an empty inventory
+directory), probation defines the root group `world' first."
+  (when (and (eq monk-agent-unknown-host 'probation)
+             (not (bound-and-true-p monk-inventory-tree)))
+    (require 'monk-inventory)
+    (monk-inventory-define '(world) (monk-inventory-file)))
   (pcase monk-agent-unknown-host
     ('run m)
     ('abort
@@ -823,7 +837,8 @@ is already recorded."
         ;; case; with no inventory at all there is nothing to enroll
         ;; into or abort against, and the bare machine runs as before
         (m (or (monk-agent-inventory-machine)
-               (if (bound-and-true-p monk-inventory-tree)
+               (if (or (bound-and-true-p monk-inventory-tree)
+                       (monk-agent--empty-inventory-directory-p))
                    (monk-agent--settle-unknown-host (monk-local-machine))
                  (monk-local-machine)))))
     (setq monk-agent--probation (monk-agent-probation-p m))

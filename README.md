@@ -4,11 +4,18 @@ Monk is a configuration management system. Policy is Emacs Lisp. Remote access i
 
 ## Getting started
 
-Monk needs three things: the code (a checkout or the package, see [Install](#install)), a policy file, and an inventory. The policy file is Lisp that defines a policy function and sets `monk-batch-policy` to it. The inventory is `monk-inventory-path`: one `.el` file, or a directory of `.el` and `.json` fragments. Keep the policy and the inventory in one git repository. Each case below ends with the machine in the inventory, a plan you have read, and, when the machine must enforce itself, an agent.
+Monk needs three things: the code (a checkout or the package, see [Install](#install)), a policy file, and an inventory. `bootstrap.sh` fetches the first and writes the other two when you have none:
+
+```sh
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/tzz/monk/main/bootstrap.sh)"
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/tzz/monk/main/bootstrap.sh)" -- POLICY_REPO_URL [POLICY_FILE]
+```
+
+It checks for git and Emacs 29, clones Monk into `./monk` (and the policy repository beside it when given), writes `./monk-policy/policy.el` with one harmless resource and an empty `inventory.d/` when no repository is given, and prints the plan, agent, and connect commands with the real paths filled in. It runs no Emacs and installs nothing. Running it again clones nothing twice. `MONK_REPO`, `MONK_BRANCH`, and `EMACS` in the environment override the defaults. The policy file is Lisp that defines a policy function and sets `monk-batch-policy` to it. The inventory is `monk-inventory-path`: one `.el` file, or a directory of `.el` and `.json` fragments. Keep the policy and the inventory in one git repository. Each case below ends with the machine in the inventory, a plan you have read, and, when the machine must enforce itself, an agent.
 
 **First machine, nothing exists yet.** Clone Monk. Write `policy.el` with a policy function and `(setq monk-batch-policy #'my-policy)`. Set `monk-inventory-path` in the same file. Run `M-x monk-enroll`: it gathers facts, proposes a group, writes the host entry, and saves the inventory. Run `(monk-run-report (monk-plan (monk-local-machine) #'my-policy))` and read the plan. Press `a` in `*monk*` to apply. To keep the machine enforced, answer `plan the agent install` when `monk-enroll` asks, or run `M-x monk-enroll-plan-agent` later. Commit the policy and the inventory.
 
-**New machine, repository checkout present.** Clone Monk and the policy repository. Start the agent: `emacs --batch -L monk/lisp -l policy.el -f monk-agent-main` (or install it through `monk-enroll-plan-agent`). The host is not in the inventory, so the agent enrolls it `ON PROBATION`: every converge is a dry run. Read its plans with `M-x monk-connect` → `local`. When the plan is right, run `M-x monk-enroll-accept`. The next converge is real. Commit the new inventory fragment (`HOST.el` or `HOST.json`).
+**New machine, repository checkout present.** Run `bootstrap.sh` with the policy repository URL, or clone Monk and the policy repository by hand. Start the agent: `emacs --batch -L monk/lisp -l policy.el -f monk-agent-main` (or install it through `monk-enroll-plan-agent`). The host is not in the inventory, so the agent enrolls it `ON PROBATION`: every converge is a dry run. Read its plans with `M-x monk-connect` → `local`. When the plan is right, run `M-x monk-enroll-accept`. The next converge is real. Commit the new inventory fragment (`HOST.el` or `HOST.json`).
 
 **Remote machine, local checkout.** The remote machine needs ssh and nothing else. From your Emacs, run `C-u M-x monk-enroll` and type `user@host`. Monk gathers facts over TRAMP and writes the entry with `:address` and `:user`. Plan and apply from here: `(monk-plan (monk-inventory-find 'host) #'my-policy)`, then `a`. `monk-watch-start` polls remote hosts for drift. There is no agent on the remote machine, so nothing is enforced while your Emacs is closed.
 
@@ -18,7 +25,7 @@ Monk needs three things: the code (a checkout or the package, see [Install](#ins
 
 - An inventory defined in code: run `M-x monk-inventory-migrate` once. It writes the tree to `monk-inventory-path`. Then delete the `monk-inventory-define` form.
 - A machine that must never enroll itself: set `monk-agent-unknown-host` to `abort` in the policy file. The agent exits with code 3 and names the host.
-- A machine with no inventory at all: do not set `monk-inventory-path`. The agent runs the policy on the bare machine, with facts and classes but no vars or groups.
+- A machine with no inventory at all: do not set `monk-inventory-path`. The agent runs the policy on the bare machine, with facts and classes but no vars or groups. An inventory directory that exists but is empty is not that case: the agent enrolls the host there, on probation, under a new root group `world`.
 - An existing Linux machine: with [enroll](https://git.mig5.net/mig5/enroll) on `PATH`, `monk-enroll` offers to harvest the installed packages, changed `/etc` files, services, and users into a starting policy in `*monk-import*`.
 - A fleet: one fragment per host in the inventory directory. Each new machine adds one file. Edit groups and vars in `M-x monk-inventory-edit`, then commit.
 
