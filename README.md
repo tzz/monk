@@ -201,6 +201,12 @@ emacs --batch -L lisp -l my-policy.el --eval '(monk-batch-converge "my-policy.el
 
 The policy file must set `monk-batch-policy` to the policy function.
 
+### Naming policies
+
+A policy file soon holds more than one policy function: the user part, the sudo part, both together for the agent, a sync, something run on request. Name them `PREFIX-policy/NAME`, with a slash before the part that says which: `tzz-policy/user`, `tzz-policy/sudo`, `tzz-policy/all`, `tzz-policy/install-emacs`. A function that returns a policy takes the same shape with a suffix: `tzz-policy/sync-for`. The slash is an ordinary symbol character in Emacs Lisp, so nothing special is needed to define or call them.
+
+Why that and not `tzz-emacs-policy`: with the word `policy` in the middle, `tzz-emacs-policy` reads as "the policy about Emacs", and `tzz-agent-policy` as "the policy the agent runs", and the reader has to know which. With the slash the prefix says what kind of thing it is and the suffix says which one, every policy sorts together in `apropos` and completion, and `M-x` completion on `tzz-policy/` lists them all. Resources, facts, and helper functions keep the usual hyphenated names; the slash marks policies only.
+
 ## Resources
 
 Every constructor accepts these keywords. `:only-if FN` runs the resource only when `(funcall FN machine)` is non-nil. `:not-if FN` skips it when non-nil. `:classes LIST` runs it only when the machine has every class in the list. `:when GUARD` runs it only when the CELL form or CEL string GUARD is true. `:require`, `:watch`, `:onchanges`, and `:onfail` are described above. `:sudo BOOL` performs the resource as root through a TRAMP sudo hop.
