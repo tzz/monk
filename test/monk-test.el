@@ -30,6 +30,7 @@
 (require 'monk-system)
 (require 'monk-package)
 (require 'monk-inventory)
+(require 'monk-repo)
 
 (defconst monk-test-fake-facts
   '((kernel . "Linux") (arch . "x86_64") (nodename . "testbox.local")
@@ -715,6 +716,287 @@ This is the Salt execution model.  Only dependents skip."
                                 (plist-get (monk-result-changes (monk-test-result run clone)) :behind))))
       (let ((run (monk-test-converge (lambda (_m) (monk-git clone origin :branch "main" :update nil)))))
         (should (eq 'kept (monk-test-status run clone)))))))
+
+;;;; Repository deploys: monk-repo-file and monk-repo-tree
+
+(defun monk-test-repo-seed (dir)
+  "Make a git repository under DIR with a few files and two commits.
+Return (ORIGIN . FIRST-COMMIT): the repository path and the id of
+the first commit, whose `conf' says 1 and which lacks `bin/tool'."
+  (let ((origin (concat dir "origin"))
+        (process-environment (append '("GIT_AUTHOR_NAME=t" "GIT_AUTHOR_EMAIL=t@t"
+                                       "GIT_COMMITTER_NAME=t" "GIT_COMMITTER_EMAIL=t@t")
+                                     process-environment)))
+    (make-directory (concat origin "/etc") t)
+    (let ((default-directory origin))
+      (call-process "git" nil nil nil "init" "-q" "-b" "main")
+      (with-temp-file "etc/conf" (insert "level=1\n"))
+      (with-temp-file "etc/other" (insert "other\n"))
+      (call-process "git" nil nil nil "add" "-A")
+      (call-process "git" nil nil nil "commit" "-q" "-m" "one")
+      (let ((first (string-trim (shell-command-to-string "git rev-parse HEAD"))))
+        (make-directory "bin")
+        (with-temp-file "bin/tool" (insert "#!/bin/sh\necho tool\n"))
+        (set-file-modes "bin/tool" #o755)
+        (with-temp-file "etc/conf" (insert "level=2\n"))
+        (make-symbolic-link "conf" "etc/link")
+        (call-process "git" nil nil nil "add" "-A")
+        (call-process "git" nil nil nil "commit" "-q" "-m" "two")
+        (call-process "git" nil nil nil "tag" "v2")
+        (cons origin first)))))
+
+(ert-deftest monk-test-repo-parse-url ()
+  "Hosted URLs in the three common spellings give host, owner, name."
+  (require 'monk-repo)
+  (dolist (url '("https://github.com/o/n" "https://github.com/o/n.git" "https://github.com/o/n/"
+                 "git@github.com:o/n.git" "ssh://git@github.com/o/n.git" "https://x@github.com:443/o/n"))
+    (should (equal '("github.com" "o" "n") (monk-repo--parse-url url))))
+  (should (equal '("gitlab.example" "group/sub" "proj") (monk-repo--parse-url "https://gitlab.example/group/sub/proj.git")))
+  (should-not (monk-repo--parse-url "/srv/git/repo.git"))
+  (should-not (monk-repo--parse-url "file:///srv/git/repo.git"))
+  (let ((monk-repo-prefer-api t))
+    (should (eq 'github (monk-repo--api-flavor "git@github.com:o/n.git")))
+    (should-not (monk-repo--api-flavor "https://git.example/o/n.git")))
+  (let ((monk-repo-prefer-api nil))
+    (should-not (monk-repo--api-flavor "git@github.com:o/n.git"))))
+
+(ert-deftest monk-test-repo-file-from-checkout ()
+  "A working tree is read as it is: uncommitted edits deploy, the git mode sets the file mode."
+  (skip-unless (executable-find "git"))
+  (require 'monk-repo)
+  (monk-test-with-tmpdir dir
+    (let* ((origin (car (monk-test-repo-seed dir)))
+           (dest (concat dir "out/conf"))
+           (tool (concat dir "out/tool"))
+           (policy (lambda (_m)
+                     (monk-repo-file dest :checkout origin :path "etc/conf")
+                     (monk-repo-file tool :checkout origin :path "bin/tool"))))
+      (let ((run (monk-test-converge policy)))
+        (should (eq 'repaired (monk-test-status run dest)))
+        (should (equal "level=2\n" (with-temp-buffer (insert-file-contents dest) (buffer-string))))
+        (should (eq 'repaired (monk-test-status run tool)))
+        (should (= #o755 (logand (file-modes tool) #o7777)))
+        (should (string-match-p "checkout" (plist-get (plist-get (monk-result-changes (monk-test-result run dest)) :evidence) :source))))
+      (should (eq 'kept (monk-test-status (monk-test-converge policy) dest)))
+      ;; an edit on disk, not committed, is what deploys
+      (with-temp-file (concat origin "/etc/conf") (insert "level=3\n"))
+      (let ((run (monk-test-converge policy)))
+        (should (eq 'repaired (monk-test-status run dest)))
+        (should (equal "level=3\n" (with-temp-buffer (insert-file-contents dest) (buffer-string)))))
+      ;; a path that is a symlink or missing is an error naming it
+      (let ((run (monk-test-converge (lambda (_m) (monk-repo-file (concat dir "out/l") :checkout origin :path "etc/link")))))
+        (should (eq 'failed (monk-test-status run (concat dir "out/l"))))
+        (should (string-match-p "etc/link is not a file" (monk-result-comment (monk-test-result run (concat dir "out/l")))))))))
+
+(ert-deftest monk-test-repo-file-from-mirror ()
+  "No checkout: a bare mirror under MONK_HOME is cloned once, fetched per run,
+read with cat-file; a revision pins; the mirror follows new commits."
+  (skip-unless (executable-find "git"))
+  (require 'monk-repo)
+  (monk-test-with-tmpdir dir
+    (let* ((seed (monk-test-repo-seed dir))
+           (origin (car seed)) (first (cdr seed))
+           (home (concat dir "home/"))
+           (process-environment (cons (concat monk-home-environment-variable "=" home) process-environment))
+           (monk-repo-prefer-api t)
+           (dest (concat dir "out/conf"))
+           (pinned (concat dir "out/conf-v1"))
+           (tool (concat dir "out/tool"))
+           (policy (lambda (_m)
+                     (monk-repo-file dest :repo origin :path "etc/conf")
+                     (monk-repo-file pinned :repo origin :path "etc/conf" :rev first)
+                     (monk-repo-file tool :repo origin :path "bin/tool" :rev "v2"))))
+      (let ((run (monk-test-converge policy)))
+        (should (eq 'repaired (monk-test-status run dest)))
+        (should (equal "level=2\n" (with-temp-buffer (insert-file-contents dest) (buffer-string))))
+        (should (equal "level=1\n" (with-temp-buffer (insert-file-contents pinned) (buffer-string))))
+        (should (= #o755 (logand (file-modes tool) #o7777)))
+        ;; the mirror lives under MONK_HOME/repos, bare
+        (let ((mirror (monk-repo-mirror-path origin)))
+          (should (string-prefix-p (expand-file-name "repos" home) mirror))
+          (should (file-directory-p mirror))
+          (should (file-exists-p (expand-file-name "HEAD" mirror)))
+          (should-not (file-directory-p (expand-file-name ".git" mirror)))))
+      (should (eq 'kept (monk-test-status (monk-test-converge policy) dest)))
+      ;; a new commit upstream reaches HEAD through the per-run fetch; the pin stays
+      (let ((default-directory origin)
+            (process-environment (append '("GIT_AUTHOR_NAME=t" "GIT_AUTHOR_EMAIL=t@t"
+                                           "GIT_COMMITTER_NAME=t" "GIT_COMMITTER_EMAIL=t@t")
+                                         process-environment)))
+        (with-temp-file "etc/conf" (insert "level=4\n"))
+        (call-process "git" nil nil nil "commit" "-q" "-am" "three"))
+      (let ((run (monk-test-converge policy)))
+        (should (eq 'repaired (monk-test-status run dest)))
+        (should (equal "level=4\n" (with-temp-buffer (insert-file-contents dest) (buffer-string))))
+        (should (eq 'kept (monk-test-status run pinned))))
+      ;; an unknown revision and a missing path fail with the reason
+      (let* ((bad (concat dir "out/bad"))
+             (run (monk-test-converge (lambda (_m)
+                                        (monk-repo-file bad :repo origin :path "etc/conf" :rev "nope")
+                                        (monk-repo-file (concat bad "2") :repo origin :path "etc/nothing")))))
+        (should (eq 'failed (monk-test-status run bad)))
+        (should (string-match-p "revision nope is not in" (monk-result-comment (monk-test-result run bad))))
+        (should (string-match-p "etc/nothing is not a file" (monk-result-comment (monk-test-result run (concat bad "2")))))))))
+
+(ert-deftest monk-test-repo-tree-mirrors-a-directory ()
+  "A tree deploys every regular file under the path with git's modes, reports a
+degree, and with :delete removes strangers; symlinks in the repo are skipped."
+  (skip-unless (executable-find "git"))
+  (require 'monk-repo)
+  (monk-test-with-tmpdir dir
+    (let* ((origin (car (monk-test-repo-seed dir)))
+           (home (concat dir "home/"))
+           (process-environment (cons (concat monk-home-environment-variable "=" home) process-environment))
+           (dest (concat dir "deploy"))
+           (policy (lambda (_m) (monk-repo-tree dest :repo origin :delete t))))
+      (let ((run (monk-test-converge policy)))
+        (should (eq 'repaired (monk-test-status run dest)))
+        (should (equal "wrote 3" (monk-result-comment (monk-test-result run dest))))
+        (should (equal '("bin/tool" "etc/conf" "etc/other") (monk-repo--local-files dest)))
+        (should (= #o755 (logand (file-modes (concat dest "/bin/tool")) #o7777)))
+        (should (= #o644 (logand (file-modes (concat dest "/etc/conf")) #o7777)))
+        (should-not (file-exists-p (concat dest "/etc/link"))))
+      (should (eq 'kept (monk-test-status (monk-test-converge policy) dest)))
+      ;; drift: one file edited, one stranger added, one mode wrong -> degree 3/4 wrong...
+      (with-temp-file (concat dest "/etc/conf") (insert "edited\n"))
+      (with-temp-file (concat dest "/etc/stranger") (insert "x\n"))
+      (set-file-modes (concat dest "/bin/tool") #o644)
+      (let* ((plan (let ((monk-log-level nil)) (monk-plan (monk-test-machine) policy)))
+             (result (monk-test-result plan dest))
+             (changes (monk-result-changes result)))
+        (should (eq 'would-repair (monk-result-status result)))
+        (should (equal '("etc/conf") (plist-get changes :write)))
+        (should (equal '("bin/tool") (plist-get changes :mode)))
+        (should (equal '("etc/stranger") (plist-get changes :delete)))
+        ;; 4 files in scope (3 + stranger), 3 wrong
+        (should (= 0.25 (plist-get changes :degree)))
+        (should (= 2 (length (monk-diff-entries (monk-result-diff result))))))
+      (let ((run (monk-test-converge policy)))
+        (should (eq 'repaired (monk-test-status run dest)))
+        (should (equal "wrote 1, mode on 1, deleted 1" (monk-result-comment (monk-test-result run dest))))
+        (should-not (file-exists-p (concat dest "/etc/stranger"))))
+      ;; without :delete the stranger stays and a subtree path works
+      (with-temp-file (concat dest "/etc/stranger") (insert "x\n"))
+      (let ((run (monk-test-converge (lambda (_m) (monk-repo-tree (concat dir "etc-only") :repo origin :path "etc")))))
+        (should (equal '("conf" "other") (monk-repo--local-files (concat dir "etc-only")))))
+      (should (eq 'kept (monk-test-status (monk-test-converge (lambda (_m) (monk-repo-tree dest :repo origin))) dest)))
+      (should (file-exists-p (concat dest "/etc/stranger"))))))
+
+(defun monk-test-repo-fake-api (routes)
+  "Return a stand-in for `url-retrieve-synchronously' answering ROUTES.
+ROUTES is an alist of URL to (STATUS . BODY); an unknown URL is 404.
+Records every URL asked in `monk-test-repo-api-calls'."
+  (lambda (url &rest _)
+    (push url monk-test-repo-api-calls)
+    (let* ((hit (cdr (assoc url routes)))
+           (status (if hit (car hit) 404))
+           (body (if hit (cdr hit) "{\"message\":\"Not Found\"}"))
+           (buffer (generate-new-buffer " *fake-http*")))
+      (with-current-buffer buffer
+        (set-buffer-multibyte nil)
+        (insert (format "HTTP/1.1 %d X\r\nContent-Type: x\r\n\r\n" status))
+        (insert (if (multibyte-string-p body) (encode-coding-string body 'utf-8) body))
+        (setq-local url-http-response-status status))
+      buffer)))
+
+(defvar monk-test-repo-api-calls nil)
+
+(ert-deftest monk-test-repo-file-from-github-api ()
+  "A github.com URL reads through the contents API: one metadata call, one raw
+call, a token header from auth-source when present, 404 as a clear error,
+and no mirror is made."
+  (require 'monk-repo)
+  (monk-test-with-tmpdir dir
+    (let* ((home (concat dir "home/"))
+           (process-environment (cons (concat monk-home-environment-variable "=" home) process-environment))
+           (monk-repo-prefer-api t)
+           (monk-test-repo-api-calls nil)
+           (headers-seen nil)
+           (dest (concat dir "out/conf"))
+           (tool (concat dir "out/tool"))
+           (meta "https://api.github.com/repos/o/n/contents/etc/conf?ref=main")
+           (routes `((,meta 200 . "{\"path\":\"etc/conf\",\"type\":\"file\",\"sha\":\"abc\"}")
+                     ("https://api.github.com/repos/o/n/contents/etc/sub/deep?ref=main" 200 .
+                      "{\"path\":\"etc/sub/deep\",\"type\":\"file\"}")
+                     ("https://api.github.com/repos/o/n/contents/etc?ref=main" 200 .
+                      "[{\"path\":\"etc/conf\",\"type\":\"file\"},{\"path\":\"etc/sub\",\"type\":\"dir\"},{\"path\":\"etc/lnk\",\"type\":\"symlink\"}]")
+                     ("https://api.github.com/repos/o/n/contents/etc/sub?ref=main" 200 .
+                      "[{\"path\":\"etc/sub/deep\",\"type\":\"file\"}]")
+                     ("https://api.github.com/repos/o/n/contents/bin/tool?ref=v2" 200 .
+                      "{\"path\":\"bin/tool\",\"type\":\"file\"}"))))
+      ;; the same route answers metadata (JSON) and raw (bytes) by Accept header
+      (cl-letf (((symbol-function 'url-retrieve-synchronously)
+                 (lambda (url &rest rest)
+                   (push url-request-extra-headers headers-seen)
+                   (let ((raw (assoc "Accept" url-request-extra-headers)))
+                     (funcall (monk-test-repo-fake-api
+                               (if (and raw (string-match-p "raw" (cdr raw)))
+                                   (append `((,meta 200 . "level=\303\251\n")
+                                             ("https://api.github.com/repos/o/n/contents/etc/sub/deep?ref=main" 200 . "deep\n")
+                                             ("https://api.github.com/repos/o/n/contents/bin/tool?ref=v2" 200 . "#!/bin/sh\n"))
+                                           routes)
+                                 routes))
+                              url rest))))
+                ((symbol-function 'monk-repo-api-token) (lambda (host) (and (equal host "github.com") "tok123"))))
+        (let ((run (monk-test-converge
+                    (lambda (_m)
+                      (monk-repo-file dest :repo "git@github.com:o/n.git" :path "etc/conf" :rev "main")
+                      (monk-repo-file tool :repo "https://github.com/o/n" :path "bin/tool" :rev "v2" :mode #o700)
+                      (monk-repo-tree (concat dir "tree") :repo "https://github.com/o/n" :path "etc" :rev "main")))))
+          (should (eq 'repaired (monk-test-status run dest)))
+          ;; UTF-8 bytes decoded once, written once
+          (should (equal "level=é\n" (with-temp-buffer (insert-file-contents dest) (buffer-string))))
+          (should (= #o700 (logand (file-modes tool) #o7777)))
+          (should (equal '("conf" "sub/deep") (monk-repo--local-files (concat dir "tree"))))
+          (should (string-match-p "github API" (plist-get (plist-get (monk-result-changes (monk-test-result run dest)) :evidence) :source)))
+          (should (seq-every-p (lambda (h) (equal "Bearer tok123" (cdr (assoc "Authorization" h)))) headers-seen))
+          (should-not (file-directory-p (expand-file-name "repos" home))))
+        ;; 404 names the path and the source
+        (let ((run (monk-test-converge (lambda (_m) (monk-repo-file dest :repo "https://github.com/o/n" :path "etc/gone" :rev "main")))))
+          (should (eq 'failed (monk-test-status run dest)))
+          (should (string-match-p "etc/gone is not a file in https://github.com/o/n at main" (monk-result-comment (monk-test-result run dest)))))
+        ;; a non-404 failure says so, with a hint when no token was found
+        (cl-letf (((symbol-function 'monk-repo-api-token) #'ignore))
+          ;; no token, same content: kept, and no Authorization header went out
+          (setq headers-seen nil)
+          (let ((run (monk-test-converge (lambda (_m) (monk-repo-file dest :repo "https://github.com/o/n" :path "etc/conf" :rev "main")))))
+            (should (eq 'kept (monk-test-status run dest)))
+            (should-not (seq-some (lambda (h) (assoc "Authorization" h)) headers-seen)))
+          (let ((run (cl-letf (((symbol-function 'url-retrieve-synchronously)
+                                (lambda (url &rest rest) (funcall (monk-test-repo-fake-api `((,meta 403 . "{}"))) url rest))))
+                       (monk-test-converge (lambda (_m) (monk-repo-file dest :repo "https://github.com/o/n" :path "etc/conf" :rev "main"))))))
+            (should (eq 'failed (monk-test-status run dest)))
+            (should (string-match-p "HTTP 403 (no token" (monk-result-comment (monk-test-result run dest))))))))))
+
+(ert-deftest monk-test-repo-api-routes-per-flavor ()
+  "GitLab, Gitea, and Bitbucket routes: project encoding, file endpoints, and
+the executable bit where the API reports it."
+  (require 'monk-repo)
+  (let ((monk-repo-api-hosts '(("gitlab.com" . gitlab) ("codeberg.org" . gitea) ("bitbucket.org" . bitbucket)))
+        (monk-test-repo-api-calls nil))
+    (cl-letf (((symbol-function 'monk-repo-api-token) #'ignore)
+              ((symbol-function 'url-retrieve-synchronously)
+               (monk-test-repo-fake-api
+                '(("https://gitlab.com/api/v4/projects/g%2Fsub%2Fp/repository/tree?path=bin&ref=main&per_page=100" 200 .
+                   "[{\"path\":\"bin/x\",\"type\":\"blob\",\"mode\":\"100755\"},{\"path\":\"bin/d\",\"type\":\"tree\",\"mode\":\"040000\"}]")
+                  ("https://gitlab.com/api/v4/projects/g%2Fsub%2Fp/repository/tree?path=bin/d&ref=main&per_page=100" 200 . "[]")
+                  ("https://gitlab.com/api/v4/projects/g%2Fsub%2Fp/repository/tree?path=bin/x&ref=main&per_page=100" 200 . "[]")
+                  ("https://gitlab.com/api/v4/projects/g%2Fsub%2Fp/repository/files/bin%2Fx?ref=main" 200 .
+                   "{\"file_name\":\"x\",\"execute_filemode\":true}")
+                  ("https://gitlab.com/api/v4/projects/g%2Fsub%2Fp/repository/files/bin%2Fx/raw?ref=main" 200 . "gl\n")
+                  ("https://codeberg.org/api/v1/repos/o/n/contents/f?ref=HEAD" 200 . "{\"path\":\"f\",\"type\":\"file\"}")
+                  ("https://codeberg.org/api/v1/repos/o/n/raw/f?ref=HEAD" 200 . "gt\n")
+                  ("https://api.bitbucket.org/2.0/repositories/o/n/src/HEAD/f?format=meta&pagelen=100" 200 .
+                   "{\"path\":\"f\",\"type\":\"commit_file\",\"attributes\":[\"executable\"]}")
+                  ("https://api.bitbucket.org/2.0/repositories/o/n/src/HEAD/f" 200 . "bb\n")))))
+      (let ((gl (monk-repo-source nil "https://gitlab.com/g/sub/p.git"))
+            (gt (monk-repo-source nil "git@codeberg.org:o/n.git"))
+            (bb (monk-repo-source nil "https://bitbucket.org/o/n")))
+        (should (equal '(("x" . t)) (monk-repo-source-files gl "bin" "main")))
+        (should (equal (cons "gl\n" t) (monk-repo-source-blob gl "bin/x" "main")))
+        (should (equal (cons "gt\n" nil) (monk-repo-source-blob gt "f" "HEAD")))
+        (should (equal (cons "bb\n" t) (monk-repo-source-blob bb "f" "HEAD")))
+        (should-not (monk-repo-source-blob gt "missing" "HEAD"))))))
 
 ;;;; Package helpers
 
