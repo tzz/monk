@@ -437,6 +437,8 @@ Subclass `monk-resource`. Implement `monk-check`, which inspects the machine and
 
 Use `monk-exec` for commands. It returns a struct with exit code and output. `monk-exec-string` signals `monk-exec-error` on non-zero exit. Trailing keyword pairs: `:sudo t` to run as root, `:input STRING` for standard input, `:directory PATH` to run in a directory on the target. Use `monk-machine-path` to turn a target path into a controller-side path for file primitives.
 
+A repair that must not happen in this process (a build that replaces the running Emacs, work a person must do) signals `monk-deferred-error` with one string, the reason. The result is `skipped` with that comment, the run stays ok, and nothing flaps; a repair that returned without changing anything would be counted as a repair and flagged as flapping on the next pass, since the check still finds the gap.
+
 A set resource, one that manages several members, returns `:degree` in its change plist: the fraction of members that already hold. A failed repair then reports `partial` with that degree, and requisites with `:degree` can accept it. Implement `monk-default-watch-action` to give the resource an action for `:watch`.
 
 ## Facts

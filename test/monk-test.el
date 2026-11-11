@@ -4187,6 +4187,31 @@ refuses to run from a side window."
                                              :passes 1)
                          "f"))))))
 
+(ert-deftest monk-test-deferred-repair-is-skipped-not-flapping ()
+  "A repair that signals `monk-deferred-error' reports skipped with its
+reason; the run converges in one pass (no change counted), nothing flaps,
+and :verify is not run against an unchanged machine.  An `emacs rebuild
+due' notice that changed nothing read as `1 repaired, flapping' every
+hour (2026-11-10)."
+  (let* ((verified nil)
+         (repairs 0)
+         (policy (lambda (_m)
+                   (monk-command "due" "true" :creates "~/never-made"
+                                 :verify (lambda (_m) (setq verified t) nil))))
+         (run (cl-letf (((symbol-function 'monk-repair)
+                         (lambda (_r _m _changes)
+                           (cl-incf repairs)
+                           (signal 'monk-deferred-error (list "not done here: needs a person")))))
+                (monk-test-converge policy))))
+    (should (eq 'skipped (monk-test-status run "due")))
+    (should (equal "not done here: needs a person" (monk-result-comment (monk-test-result run "due"))))
+    (should (= 1 repairs))
+    (should (= 1 (monk-run-passes run)))
+    (should-not (monk-run-flapping run))
+    (should (monk-run-converged-p run))
+    (should-not verified)
+    (should (monk-run-ok-p run))))
+
 (ert-deftest monk-test-command-failed-when ()
   "failed-when replaces the exit-code rule in both directions."
   (let ((run (monk-test-converge

@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.9.6
+;; Version: 0.9.7
 ;; URL: https://github.com/tzz/monk
 
 ;; Licensed under the Apache License, Version 2.0 (the "License");
@@ -82,12 +82,12 @@
 
 ;;;; Version
 
-(defconst monk-version "0.9.6"
+(defconst monk-version "0.9.7"
   "Monk's version.  Patch for small work, minor for a large ask.
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-11-07.1"
+(defconst monk-build "2026-11-10.1"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -293,6 +293,10 @@ Each is called with two arguments: EVENT, one of `run-start',
 (define-error 'monk-guard-error "Monk guard error" 'monk-error)
 (define-error 'monk-command-unchanged "Monk command ran without change" 'monk-error)
 (define-error 'monk-interrupted-error "Monk resource interrupted" 'monk-error)
+(define-error 'monk-deferred-error "Monk repair deferred" 'monk-error)
+;; Signal `monk-deferred-error' from `monk-repair' with one string, the
+;; reason, when the repair must not happen in this process: the result
+;; is `skipped' with that comment, the run stays ok, nothing flaps.
 (define-error 'monk-cel-error "Monk CEL error" 'monk-guard-error)
 
 ;;;; Scopes and owners
@@ -2722,8 +2726,20 @@ report only.  After a repair, `monk-resource-verify' can still fail it."
              (setf (monk-result-status result) monk-status-kept
                    (monk-result-degree result) monk-degree-satisfied
                    (monk-result-comment result) (cadr unchanged)
-                   (monk-result-changes result) nil)))
-          (let ((reason (monk-resource-verify resource machine)))
+                   (monk-result-changes result) nil))
+            ;; The repair knows what is wrong and declines to do it here
+            ;; (a build that replaces the running process, work that
+            ;; needs a person): skipped, with its reason, as an
+            ;; interrupted resource is.  Not repaired: the check still
+            ;; finds the gap next pass, and a repair that changed
+            ;; nothing reads as flapping.  Not would-repair: in a real
+            ;; run that counts as a change and drives another pass.
+            (monk-deferred-error
+             (setf (monk-result-status result) monk-status-skipped
+                   (monk-result-comment result) (cadr unchanged)
+                   (monk-result-changes result) changes)))
+          (let ((reason (and (not (eq (monk-result-status result) monk-status-skipped))
+                             (monk-resource-verify resource machine))))
             (when reason
               ;; The repair ran, but the verification says the system is
               ;; still wrong: that is a failure, whatever the degree.
