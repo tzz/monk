@@ -156,19 +156,62 @@ fall back to `brew list', which knows no aliases."
   (monk-with-run-cache (list 'brew-installed (oref m name))
     (monk--brew-installed-names-uncached m)))
 
+(defconst monk-brew-orphan-regexp
+  "No available \\(?:formula with the name\\|cask with the token\\) \"\\([^\"]+\\)\""
+  "Matches brew naming an installed keg whose formula or cask no longer exists.
+A rename brew forgot (`mobile-shell' became `mosh') or a tap that went
+away leaves such a keg; `brew info --installed' then fails as a whole.")
+
+(defconst monk-brew-orphan-retries 5
+  "How many orphaned kegs `monk--brew-installed-names' drops before giving up.")
+
+(defun monk--brew-json-installed-names (output)
+  "Return every installed name in OUTPUT, the JSON of `brew info --json=v2'."
+  (let ((parsed (json-parse-string output)))
+    (append (mapcan (lambda (e) (monk--brew-json-names e nil))
+                    (append (gethash "formulae" parsed) nil))
+            (mapcan (lambda (e) (monk--brew-json-names e t))
+                    (append (gethash "casks" parsed) nil)))))
+
 (defun monk--brew-installed-names-uncached (m)
-  "Ask brew on M for installed names.  See `monk--brew-installed-names'."
+  "Ask brew on M for installed names.  See `monk--brew-installed-names'.
+When `brew info --installed' fails because of a keg brew has no
+formula or cask for, ask again by name without it, up to
+`monk-brew-orphan-retries' times, and say which kegs to remove.  Any
+other failure falls back to `brew list', which knows no aliases."
   (let ((exec (monk-exec m monk-brew-program "info" "--json=v2" "--installed")))
     (if (monk-exec-ok-p exec)
-        (let ((parsed (json-parse-string (monk-exec-output exec))))
-          (append (mapcan (lambda (e) (monk--brew-json-names e nil))
-                          (append (gethash "formulae" parsed) nil))
-                  (mapcan (lambda (e) (monk--brew-json-names e t))
-                          (append (gethash "casks" parsed) nil))))
-      (monk-log 'warn "%s: brew info --installed failed, aliases unknown: %s"
-                (oref m name) (string-trim (monk-exec-output exec)))
-      (append (monk-exec-lines m monk-brew-program "list" "-1" "--formula")
-              (monk-exec-lines m monk-brew-program "list" "-1" "--cask")))))
+        (monk--brew-json-installed-names (monk-exec-output exec))
+      (let ((orphans nil) (names nil) (tries 0))
+        (while (and exec (not (monk-exec-ok-p exec))
+                    (string-match monk-brew-orphan-regexp (monk-exec-output exec))
+                    (< tries monk-brew-orphan-retries))
+          (push (match-string 1 (monk-exec-output exec)) orphans)
+          (cl-incf tries)
+          (let ((formulae (seq-difference (monk-exec-lines m monk-brew-program "list" "-1" "--formula") orphans))
+                (casks (seq-difference (monk-exec-lines m monk-brew-program "list" "-1" "--cask") orphans)))
+            (setq names nil exec nil)
+            (dolist (part (list (cons "--formula" formulae) (cons "--cask" casks)))
+              (when (and (cdr part) (null exec))
+                (let ((one (apply #'monk-exec m monk-brew-program "info" "--json=v2" (car part) (cdr part))))
+                  (if (monk-exec-ok-p one)
+                      (setq names (append names (monk--brew-json-installed-names (monk-exec-output one))))
+                    (setq exec one)))))))
+        (cond
+         ((and orphans (null exec))
+          ;; plain `brew uninstall NAME' looks the formula up first and
+          ;; fails the same way; --force skips that, and when brew
+          ;; still refuses, the keg directory itself is the thing to remove
+          (monk-log 'warn "%s: brew has no formula for installed keg%s %s; aliases read without %s.  Remove with: brew uninstall --force --ignore-dependencies %s  (or delete %s under $(brew --cellar))"
+                    (oref m name) (if (cdr orphans) "s" "") (string-join (reverse orphans) " ")
+                    (if (cdr orphans) "them" "it") (string-join (reverse orphans) " ")
+                    (string-join (reverse orphans) " "))
+          names)
+         (t
+          (monk-log 'warn "%s: brew info --installed failed, aliases unknown: %s"
+                    (oref m name) (string-trim (monk-exec-output exec)))
+          (append (monk-exec-lines m monk-brew-program "list" "-1" "--formula")
+                  (monk-exec-lines m monk-brew-program "list" "-1" "--cask"))))))))
 
 (cl-defmethod monk-check ((r monk-brew-resource) (m monk-machine))
   (let* ((installed (monk--brew-installed-names m))

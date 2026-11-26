@@ -1104,6 +1104,38 @@ Found live: all three installed on every pass and the run flapped."
                  (if (member "--formula" args) '("ripgrep" "jq") nil))))
       (should (equal '("rg") (plist-get (monk-check r m) :install))))))
 
+(ert-deftest monk-test-brew-check-skips-orphaned-kegs ()
+  "An installed keg brew has no formula for (mobile-shell after its rename to
+mosh) makes `brew info --installed' fail as a whole.  Monk reads the rest
+by name, keeps the aliases, names the orphan and the uninstall command."
+  (let ((m (monk-test-machine))
+        (r (monk-brew-resource :name "b" :packages '("rg" "mosh" "jq")))
+        (monk-log-level 'warn)
+        (calls nil) (warned nil))
+    (cl-letf (((symbol-function 'monk-exec)
+               (lambda (_m _p &rest args)
+                 (push args calls)
+                 (cond
+                  ((equal args '("info" "--json=v2" "--installed"))
+                   (monk-exec-create :command args :exit-code 1
+                                     :output "Error: No available formula with the name \"mobile-shell\"."))
+                  ((and (equal (car args) "info") (member "--formula" args) (not (member "mobile-shell" args)))
+                   (monk-exec-create :command args :exit-code 0
+                                     :output "{\"formulae\":[{\"name\":\"ripgrep\",\"full_name\":\"ripgrep\",\"aliases\":[\"rg\"],\"oldnames\":[]},{\"name\":\"mosh\",\"full_name\":\"mosh\",\"aliases\":[],\"oldnames\":[\"mobile-shell\"]}],\"casks\":[]}"))
+                  (t (monk-exec-create :command args :exit-code 1 :output "unexpected")))))
+              ((symbol-function 'monk-exec-lines)
+               (lambda (_m _p &rest args)
+                 (if (member "--formula" args) '("ripgrep" "mosh" "mobile-shell") nil)))
+              ((symbol-function 'monk-log)
+               (lambda (_level fmt &rest args) (push (apply #'format fmt args) warned))))
+      ;; rg resolved through its alias, mosh present, jq missing
+      (should (equal '("jq") (plist-get (monk-check r m) :install)))
+      (should (seq-find (lambda (w) (string-match-p "no formula for installed keg mobile-shell" w)) warned))
+      (should (seq-find (lambda (w) (string-match-p "brew uninstall --force --ignore-dependencies mobile-shell" w)) warned))
+      ;; the retry asked by name, without the orphan
+      (should (seq-find (lambda (c) (and (equal (car c) "info") (member "ripgrep" c) (not (member "mobile-shell" c))))
+                        calls)))))
+
 (ert-deftest monk-test-fact-probe-order ()
   "A new probe runs after the existing ones; re-registering keeps the slot."
   (let ((monk-fact-probes (copy-alist monk-fact-probes)))
