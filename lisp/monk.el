@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.10.2
+;; Version: 0.10.3
 ;; URL: https://github.com/tzz/monk
 
 ;; Licensed under the Apache License, Version 2.0 (the "License");
@@ -82,12 +82,12 @@
 
 ;;;; Version
 
-(defconst monk-version "0.10.2"
+(defconst monk-version "0.10.3"
   "Monk's version.  Patch for small work, minor for a large ask.
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-11-25.4"
+(defconst monk-build "2026-11-25.5"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -1321,7 +1321,7 @@ the probe costs one round trip.  Ansible's pkg_mgr and service_mgr."
           (setf (alist-get (car fact) (oref m facts)) (cdr fact)))
       (error
        ;; A machine that does not answer is not a broken probe.
-       (when (monk-unreachable-error-p err)
+       (when (monk-unreachable-error-p err m)
          (signal (car err) (cdr err)))
        (monk-log 'warn "%s: fact probe %s failed: %s"
                  (oref m name) (car probe) (error-message-string err)))))
@@ -2504,16 +2504,28 @@ cycle or a bad ref."
           "nodename nor servname provided" "Name or service not known"))
   "Error text that means the machine, not the resource, is the problem.")
 
-(defun monk-unreachable-error-p (err)
-  "Return non-nil when error condition ERR says the machine did not answer.
-TRAMP signals `file-error' with the ssh text; `monk-exec-error' from a
-remote command carries exit 255 from ssh."
-  (or (and (eq (car err) 'monk-exec-error) (eql 255 (nth 3 err)))
-      ;; `remote-file-error' and TRAMP's own conditions derive from
-      ;; `file-error'; test the hierarchy, not the exact symbol.
-      (and (or (memq 'file-error (get (car err) 'error-conditions))
-               (eq (car err) 'monk-exec-error))
-           (string-match-p monk-unreachable-error-regexp (error-message-string err)))))
+(defconst monk-exec-ssh-exit 255
+  "Exit code ssh returns when it could not reach or log in to the host.")
+
+(defun monk-unreachable-error-p (err &optional machine)
+  "Return non-nil when error condition ERR says MACHINE did not answer.
+TRAMP signals `file-error' with the ssh text.  A `monk-exec-error'
+counts only with ssh's own exit 255 on a remote MACHINE: a command
+that ran and exited otherwise proves the machine answered, whatever it
+printed (`git ls-remote' refused by a key on another host said
+`Permission denied (publickey)' with exit 128 and took the whole
+machine down, 2026-11-25), and on the local machine there is no ssh in
+the path at all, so 255 is the program's own (a batch Emacs that died
+on an error).  With no MACHINE, a 255 is taken as ssh's."
+  (cond
+   ((eq (car err) 'monk-exec-error)
+    (and (eql monk-exec-ssh-exit (nth 3 err))
+         (not (and machine (monk-machine-local-p machine)))))
+   ;; `remote-file-error' and TRAMP's own conditions derive from
+   ;; `file-error'; test the hierarchy, not the exact symbol.
+   ((memq 'file-error (get (car err) 'error-conditions))
+    (string-match-p monk-unreachable-error-regexp (error-message-string err)))
+   (t nil)))
 
 (defun monk--machine-unreachable-p (machine)
   "Return the reason MACHINE was found unreachable in the current run, or nil."
@@ -2560,7 +2572,7 @@ execution model."
                         (reason (and (not dark) (monk-node-selected node)
                                      (or (condition-case err
                                              (monk-resource-skip-reason resource machine)
-                                           (error (if (monk-unreachable-error-p err)
+                                           (error (if (monk-unreachable-error-p err machine)
                                                       (progn (monk--mark-unreachable machine (error-message-string err))
                                                              (setq dark (error-message-string err))
                                                              nil)
@@ -2748,7 +2760,7 @@ report only.  After a repair, `monk-resource-verify' can still fail it."
                       (list (format "repaired, but verify failed: %s" reason))))))))
     (error
      (cond
-      ((monk-unreachable-error-p err)
+      ((monk-unreachable-error-p err machine)
        (monk--mark-unreachable machine (error-message-string err))
        (setf (monk-result-status result) monk-status-unreachable
              (monk-result-degree result) 0.0
@@ -3214,7 +3226,7 @@ unreachable, and requisites elsewhere can name it."
           (condition-case err
               (monk-gather-facts m)
             (error
-             (if (monk-unreachable-error-p err)
+             (if (monk-unreachable-error-p err m)
                  (progn
                    (push (cons (oref m name) (error-message-string err)) monk--unreachable-at-compile)
                    (let ((monk-fact-ttl most-positive-fixnum))

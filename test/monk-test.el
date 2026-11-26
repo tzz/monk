@@ -4696,7 +4696,20 @@ hour (2026-11-10)."
   (should (monk-unreachable-error-p '(file-error "ssh: connect to host h port 22: Connection refused")))
   (should-not (monk-unreachable-error-p '(monk-exec-error "h" ("brew") 1 "Error: nope")))
   (should-not (monk-unreachable-error-p '(file-error "Opening" "Permission denied" "/x")))
-  (should-not (monk-unreachable-error-p '(monk-resource-error "bad"))))
+  (should-not (monk-unreachable-error-p '(monk-resource-error "bad")))
+  ;; a command that ran on the machine and talked to some other host:
+  ;; the machine answered, whatever the far side said (git ls-remote
+  ;; refused by a key, exit 128, took 60 resources down with it)
+  (should-not (monk-unreachable-error-p
+               '(monk-exec-error "h" ("git" "ls-remote" "origin" "refs/heads/master") 128
+                                 "git@example.org: Permission denied (publickey).")))
+  (should-not (monk-unreachable-error-p
+               '(monk-exec-error "h" ("curl" "x") 7 "curl: (7) Failed to connect: Connection refused")))
+  ;; exit 255 is ssh's own and stays unreachable: a remote command's
+  ;; hop failed (rsync turns its own transport 255 into a resource
+  ;; error before it gets here)
+  (should (monk-unreachable-error-p
+           '(monk-exec-error "h" ("uname" "-s") 255 "ssh: connect to host h port 22: Connection timed out"))))
 
 (ert-deftest monk-test-unreachable-machine-marks-all-its-nodes ()
   "A machine that does not answer gets unreachable results, once per resource,
