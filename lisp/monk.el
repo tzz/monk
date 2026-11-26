@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.10.0
+;; Version: 0.10.1
 ;; URL: https://github.com/tzz/monk
 
 ;; Licensed under the Apache License, Version 2.0 (the "License");
@@ -82,12 +82,12 @@
 
 ;;;; Version
 
-(defconst monk-version "0.10.0"
+(defconst monk-version "0.10.1"
   "Monk's version.  Patch for small work, minor for a large ask.
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-11-11.1"
+(defconst monk-build "2026-11-25.1"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")

@@ -58,10 +58,27 @@ a reason string.  For formulae built from a moving branch, where
 brew's version never changes but the source does."))
   "A set of Homebrew formulae or casks that must be installed.")
 
+(defcustom monk-brew-build-timeout 0
+  "Seconds a `brew install' or `brew reinstall' may run; 0 for no limit.
+A source build (emacs-plus) takes as long as it takes; the general
+`monk-exec-timeout' (ten minutes) stopped one mid-build on 2026-11-25
+and the fallback started the build over.  Downloads and reads keep
+the general timeout."
+  :type 'natnum :group 'monk)
+
+(defun monk--brew-build-timeout ()
+  "Return the :timeout value for a brew install or reinstall."
+  (if (zerop monk-brew-build-timeout) nil monk-brew-build-timeout))
+
 (defun monk--brew-rebuild-reason (r m name)
-  "Return why R must rebuild installed NAME on M, or nil."
+  "Return why R must rebuild installed NAME on M, or nil.
+A formula rebuilt earlier in this run is not due again: a reason such
+as \"does not know its source commit\" holds after any build, so
+without this the next pass would build it a second time and the run
+would read as flapping."
   (let ((rebuild (oref r rebuild)))
     (cond ((null rebuild) nil)
+          ((member name (monk-run-context-get (list 'brew-rebuilt (oref m name)))) nil)
           ((eq rebuild t) "rebuild requested")
           ((functionp rebuild) (funcall rebuild m name))
           (t (format "%s" rebuild)))))
@@ -69,16 +86,20 @@ brew's version never changes but the source does."))
 (cl-defmethod monk-resource-available-p ((_r monk-brew-resource) (m monk-machine))
   (monk-program-available-p m monk-brew-program))
 
-(defun monk--brew-failure-summary (exec)
-  "Return the telling lines of a failed brew EXEC.
+(defun monk--brew-failure-summary-string (output)
+  "Return the telling lines of failed brew OUTPUT.
 The Error:, Warning:, fatal:, ssh: and curl: lines, else the last
 line.  Brew prints a lot; the reason is in those.  Capped at four."
-  (let* ((lines (split-string (monk-exec-output exec) "\n" t))
+  (let* ((lines (split-string output "\n" t))
          (telling (seq-filter (lambda (l) (string-match-p "\\`\\(Error\\|Warning\\|fatal\\|error\\|ssh\\|curl\\):" (string-trim l)))
                               lines))
          (picked (or telling (last lines))))
-    (format "exit %d: %s" (monk-exec-exit-code exec)
-            (mapconcat #'string-trim (seq-take picked 4) " | "))))
+    (mapconcat #'string-trim (seq-take picked 4) " | ")))
+
+(defun monk--brew-failure-summary (exec)
+  "Return the exit code and the telling lines of a failed brew EXEC."
+  (format "exit %d: %s" (monk-exec-exit-code exec)
+          (monk--brew-failure-summary-string (monk-exec-output exec))))
 
 (cl-defmethod monk-resource-class-init ((_r monk-brew-resource) (m monk-machine))
   "Update Homebrew on M once per run, so no install call does it noisily.
@@ -191,15 +212,16 @@ this returns nil, and the caller proceeds as before."
 Return the tap trusted, or nil.  Homebrew refuses formulae from a tap
 nobody ran `brew trust' on.  Trust it and retry; a second refusal
 propagates."
-  (condition-case err
-      (progn (apply #'monk-exec-string m monk-brew-program arguments) nil)
-    (monk-exec-error
-     (let ((output (format "%s" (car (last err)))))
-       (unless (and (string-match monk-brew-untrusted-tap-regexp output)
-                    (monk--brew-trust m (match-string 1 output)))
-         (signal (car err) (cdr err)))
-       (apply #'monk-exec-string m monk-brew-program arguments)
-       (match-string 1 output)))))
+  (let ((call (append arguments (list :timeout (monk--brew-build-timeout)))))
+    (condition-case err
+        (progn (apply #'monk-exec-string m monk-brew-program call) nil)
+      (monk-exec-error
+       (let ((output (format "%s" (car (last err)))))
+         (unless (and (string-match monk-brew-untrusted-tap-regexp output)
+                      (monk--brew-trust m (match-string 1 output)))
+           (signal (car err) (cdr err)))
+         (apply #'monk-exec-string m monk-brew-program call)
+         (match-string 1 output))))))
 
 (defun monk--brew-rebuild-call (m name)
   "Build installed formula NAME on M again.
@@ -208,11 +230,18 @@ build fails.  When reinstall itself refuses, as it does for a keg
 brew no longer recognizes, `brew install --overwrite' is the way
 through; that is what the old Makefile spelled by hand."
   (condition-case err
-      (monk-exec-string m monk-brew-program "reinstall" name)
+      (monk-exec-string m monk-brew-program "reinstall" name
+                        :timeout (monk--brew-build-timeout))
     (monk-exec-error
+     ;; A build Monk stopped is not a refusal: starting it over with
+     ;; --overwrite would run the whole build a second time.
+     (when (monk-exec-timed-out-p (monk-exec-create :exit-code (nth 3 err)
+                                                    :output (format "%s" (car (last err)))))
+       (signal (car err) (cdr err)))
      (monk-log 'warn "%s: brew reinstall %s failed (%s); trying install --overwrite"
-               (oref m name) name (car (last err)))
-     (monk-exec-string m monk-brew-program "install" "--overwrite" name))))
+               (oref m name) name (monk--brew-failure-summary-string (format "%s" (car (last err)))))
+     (monk-exec-string m monk-brew-program "install" "--overwrite" name
+                       :timeout (monk--brew-build-timeout)))))
 
 (cl-defmethod monk-repair ((r monk-brew-resource) (m monk-machine) changes)
   (let ((process-environment (cons "HOMEBREW_NO_AUTO_UPDATE=1" process-environment))
@@ -224,7 +253,9 @@ through; that is what the old Makefile spelled by hand."
                                                        (and (oref r cask) '("--cask"))
                                                        install))))
     (dolist (cell rebuild)
-      (monk--brew-rebuild-call m (car cell)))
+      (monk--brew-rebuild-call m (car cell))
+      (monk-run-context-put (list 'brew-rebuilt (oref m name))
+                            (cons (car cell) (monk-run-context-get (list 'brew-rebuilt (oref m name))))))
     (monk-run-context-clear (list 'brew-installed (oref m name)))
     (string-join
      (delq nil (list (and install (format "installed %s%s" (string-join install " ")

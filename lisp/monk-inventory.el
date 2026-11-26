@@ -847,6 +847,27 @@ while inventories are written in lower case."
   (let ((name (format "%s" name)))
     (seq-find (lambda (m) (string-equal-ignore-case (oref m name) name)) monk-inventory)))
 
+(defun monk-inventory--unknown-local-host-message (host)
+  "Return the error text for HOST, this machine, missing from the inventory.
+Names where the inventory was read from, the directory and the
+fragment that a new host would land in, and the two ways to add it."
+  (let* ((source (or monk-inventory-tree-file (monk-inventory-file)))
+         (directory-p (file-directory-p source))
+         (groups (mapconcat #'symbol-name
+                            (seq-remove (lambda (g) (eq g (car monk-inventory-tree)))
+                                        (monk-inventory-group-names))
+                            " ")))
+    (format (concat "Local host %s is not in the inventory at %s.  "
+                    "Add it with M-x monk-enroll (interactive, proposes a group), "
+                    "or by hand: %s"
+                    (if (string-empty-p groups) "" "  Groups: %s."))
+            host (abbreviate-file-name source)
+            (if directory-p
+                (format "a new file %s%s.el holding (GROUP :hosts ((%s))), or a host entry in one of the fragments there."
+                        (abbreviate-file-name (file-name-as-directory source)) host host)
+              (format "a host entry (%s) under a group in that file." host))
+            groups)))
+
 (defun monk-inventory-select (selector)
   "Return the machines that SELECTOR matches.
 SELECTOR is a host name, a group symbol, `self', or a list of those."
@@ -860,8 +881,7 @@ SELECTOR is a host name, a group symbol, `self', or a list of those."
            (found (monk-inventory-find host)))
       (unless found
         (signal 'monk-inventory-error
-                (list (format "Local host %s is not in the inventory; add it, or pass a machine"
-                              host))))
+                (list (monk-inventory--unknown-local-host-message host))))
       (list found)))
    (t
     (let* ((name (format "%s" selector))

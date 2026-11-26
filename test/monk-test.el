@@ -1146,7 +1146,12 @@ SCRIPT maps the first brew argument to a list of (EXIT-CODE OUTPUT)
 answers, consumed in order.  The log is stored in the symbol property
 `calls' of `monk-test-fake-brew'."
   (put 'monk-test-fake-brew 'calls nil)
+  (put 'monk-test-fake-brew 'timeouts nil)
   (lambda (_m program &rest args)
+    ;; the log keeps the words; :timeout goes to its own property
+    (when (plist-member args :timeout)
+      (push (cons (car args) (plist-get args :timeout)) (get 'monk-test-fake-brew 'timeouts)))
+    (setq args (seq-take-while (lambda (a) (not (keywordp a))) args))
     (push (cons program args) (get 'monk-test-fake-brew 'calls))
     (let* ((answers (assoc (car args) script))
            (answer (or (cadr answers) '(0 ""))))
@@ -1166,7 +1171,13 @@ answers, consumed in order.  The log is stored in the symbol property
       (should (equal '(("brew" "install" "DimitarPetrov/stegify/stegify")
                        ("brew" "trust" "dimitarpetrov/stegify")
                        ("brew" "install" "DimitarPetrov/stegify/stegify"))
-                     (reverse (get 'monk-test-fake-brew 'calls)))))))
+                     (reverse (get 'monk-test-fake-brew 'calls))))
+      ;; an install may build from source: no timeout by default
+      (should (equal '(("install" . nil) ("install" . nil))
+                     (reverse (get 'monk-test-fake-brew 'timeouts))))
+      (let ((monk-brew-build-timeout 7200))
+        (monk-repair r m '(:install ("DimitarPetrov/stegify/stegify")))
+        (should (equal 7200 (cdar (get 'monk-test-fake-brew 'timeouts))))))))
 
 (ert-deftest monk-test-brew-install-other-failure-propagates ()
   "A failure that is not an untrusted tap signals without a retry."
@@ -6384,9 +6395,16 @@ the run is not ok, and the exit code says 4."
         (should (equal '(("brew" "reinstall" "emacs-plus@32") ("brew" "install" "--overwrite" "emacs-plus@32"))
                        (reverse calls)))
         (setq reinstall-ok t))
-      ;; t means always
+      ;; the formula was rebuilt in this run: a reason that holds after
+      ;; any build ("does not know its source commit") must not make the
+      ;; next pass build it again (emacs-plus was built twice in one run, 2026-11-25)
       (let ((r (monk-brew-resource :name "e" :packages '("emacs-plus@32") :rebuild t)))
+        (should-not (monk-check r m)))
+      ;; a fresh run: t means always
+      (let ((monk--current-run (monk-run-create))
+            (r (monk-brew-resource :name "e" :packages '("emacs-plus@32") :rebuild t)))
         (should (equal "rebuild requested" (cdar (plist-get (monk-check r m) :rebuild)))))
+      (setq monk--current-run (monk-run-create))
       ;; missing and rebuild in one resource: install first, then rebuild the other
       (let* ((r (monk-brew-resource :name "two" :packages '("jq" "emacs-plus@32") :rebuild t))
              (changes (monk-check r m)))
@@ -6402,6 +6420,67 @@ the run is not ok, and the exit code says 4."
         (should-not (monk-resource-aggregate plain (list reb) m))
         (should-not (monk-resource-aggregate reb (list plain) m))
         (should (monk-resource-aggregate plain (list (monk-brew-resource :name "c" :packages '("z"))) m))))))
+
+(ert-deftest monk-test-brew-rebuild-timeout-does-not-restart-the-build ()
+  "A reinstall that Monk stopped at its timeout is not retried with
+install --overwrite: that ran a second full build of emacs-plus on
+2026-11-25.  The timeout propagates as the failure, and the build call
+itself carries `monk-brew-build-timeout' (none by default)."
+  (let* ((m (monk-test-machine))
+         (monk-log-level nil)
+         (monk--current-run (monk-run-create))
+         (calls nil))
+    (cl-letf (((symbol-function 'monk-exec)
+               (lambda (_m program &rest args)
+                 (push (cons program args) calls)
+                 (pcase (car args)
+                   ("reinstall" (monk-exec-create :command (cons program args)
+                                                  :exit-code monk-exec-timeout-exit
+                                                  :output "==> Installing emacs-plus@32\nmonk: brew stopped after 600s (monk-exec-timeout)\n"))
+                   (_ (monk-exec-create :exit-code 0 :output "ok"))))))
+      (let ((err (should-error (monk--brew-rebuild-call m "emacs-plus@32") :type 'monk-exec-error)))
+        (should (string-match-p "monk-exec-timeout" (format "%s" (car (last err))))))
+      (should (equal '(("brew" "reinstall" "emacs-plus@32" :timeout nil)) calls))
+      ;; and a refusal still falls back, with the long timeout on both
+      (setq calls nil)
+      (cl-letf (((symbol-function 'monk-exec)
+                 (lambda (_m program &rest args)
+                   (push (cons program args) calls)
+                   (pcase (car args)
+                     ("reinstall" (monk-exec-create :exit-code 1 :output "Error: emacs-plus@32 is not installed"))
+                     (_ (monk-exec-create :exit-code 0 :output "ok")))))
+                (monk-brew-build-timeout 3600))
+        (monk--brew-rebuild-call m "emacs-plus@32")
+        (should (equal '(("brew" "reinstall" "emacs-plus@32" :timeout 3600)
+                         ("brew" "install" "--overwrite" "emacs-plus@32" :timeout 3600))
+                       (reverse calls)))))))
+
+(ert-deftest monk-test-inventory-unknown-local-host-message ()
+  "The error for a host missing from the inventory names the file or
+directory it was read from, the enroll command, and the groups."
+  (monk-test-with-tmpdir dir
+    (let ((monk-inventory nil) (monk-inventory-tree nil) (monk-inventory-tree-file nil)
+          (monk-inventory-derived nil) (monk-inventory-origins nil)
+          (monk-inventory-path (concat dir "inv.d/"))
+          (monk-log-level nil))
+      (make-directory monk-inventory-path)
+      (with-temp-file (concat monk-inventory-path "groups.el")
+        (insert "(world :children ((macs :hosts ((someone-else))) (unix)))"))
+      (monk-inventory-load)
+      (let ((err (should-error (monk-inventory-select 'self) :type 'monk-inventory-error)))
+        (let ((text (cadr err))
+              (host (car (split-string (system-name) "\\."))))
+          (should (string-match-p (format "Local host %s is not in the inventory at .*inv.d/" host) text))
+          (should (string-match-p "M-x monk-enroll" text))
+          (should (string-match-p (format "inv.d/%s.el holding (GROUP :hosts ((%s)))" host host) text))
+          (should (string-match-p "Groups: macs unix" text))))
+      ;; a single file: the entry goes in that file
+      (let ((monk-inventory-path (concat dir "inv.el")))
+        (with-temp-file monk-inventory-path (insert "(world :hosts ((other)))"))
+        (monk-inventory-load)
+        (let ((text (cadr (should-error (monk-inventory-select 'self) :type 'monk-inventory-error))))
+          (should (string-match-p "inv.el\\." text))
+          (should (string-match-p "under a group in that file" text)))))))
 
 (ert-deftest monk-test-check-evidence-kept ()
   "A check's notes ride along with a kept result, into the history and events."
