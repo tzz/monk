@@ -688,6 +688,52 @@ This is the Salt execution model.  Only dependents skip."
         (should (eq 'kept (monk-test-status run "u")))
         (should (eq 'kept (monk-test-status run "bare")))))))
 
+(ert-deftest monk-test-git-remote-head-ignores-banners ()
+  "Only a `SHA<TAB>refs/heads/BRANCH' line is a remote head.  An ssh warning
+in the same stream (OpenSSH's post-quantum notice, 2026-11-25) made the
+first word the commit: `Args out of range: \"**\"' on one checkout and
+`fast-forwarded to @@@@@@@@' on another."
+  (let ((sha (make-string 40 ?a)))
+    (should (equal sha (monk--git-remote-head (format "%s\trefs/heads/main\n" sha) "main")))
+    (should (equal sha (monk--git-remote-head
+                        (format "** WARNING: connection is not using a post-quantum key exchange algorithm.\n** This session may be vulnerable.\n%s\trefs/heads/main\n" sha)
+                        "main")))
+    ;; another branch, a short id, a banner alone, nothing: nil
+    (should-not (monk--git-remote-head (format "%s\trefs/heads/master\n" sha) "main"))
+    (should-not (monk--git-remote-head "abc1234\trefs/heads/main\n" "main"))
+    (should-not (monk--git-remote-head "** WARNING: something\n" "main"))
+    (should-not (monk--git-remote-head "" "main"))
+    ;; a branch name with regexp characters
+    (should (equal sha (monk--git-remote-head (format "%s\trefs/heads/release/1.2\n" sha) "release/1.2")))))
+
+(ert-deftest monk-test-git-fetch-prunes-stale-tracking-refs ()
+  "A fetch refused because a remote branch became a namespace (`cannot lock
+ref') prunes origin and fetches again; other fetch failures propagate."
+  (require 'monk-system)
+  (let* ((m (monk-test-machine))
+         (r (monk-git-resource :name "~/co" :repo "x"))
+         (calls nil) (fail-first t))
+    (cl-letf (((symbol-function 'monk--git)
+               (lambda (_r _m &rest args)
+                 (push args calls)
+                 (when (and fail-first (equal (car args) "fetch"))
+                   (setq fail-first nil)
+                   (signal 'monk-exec-error
+                           (list "co" '("git" "fetch") 1
+                                 "error: cannot lock ref 'refs/remotes/origin/scratch/igc/x': 'refs/remotes/origin/scratch/igc' exists\nerror: some local refs could not be updated; try running\n 'git remote prune origin'")))
+                 "")))
+      (monk--git-fetch r m)
+      (should (equal '(("fetch" "--quiet" "origin") ("remote" "prune" "origin") ("fetch" "--quiet" "origin"))
+                     (reverse calls)))
+      ;; a different failure is not pruned away
+      (setq calls nil)
+      (cl-letf (((symbol-function 'monk--git)
+                 (lambda (_r _m &rest args)
+                   (push args calls)
+                   (signal 'monk-exec-error (list "co" '("git" "fetch") 128 "fatal: could not read from remote repository")))))
+        (should-error (monk--git-fetch r m) :type 'monk-exec-error)
+        (should (equal '(("fetch" "--quiet" "origin")) calls))))))
+
 (ert-deftest monk-test-git-clone-and-update ()
   (skip-unless (executable-find "git"))
   (monk-test-with-tmpdir dir

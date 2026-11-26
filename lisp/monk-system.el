@@ -165,11 +165,39 @@ non-zero exit."
                         (string-trim (buffer-string)))))
         (string-trim (buffer-string))))))
 
+(defun monk--git-remote-head (output branch)
+  "Return the commit id for BRANCH in OUTPUT of `git ls-remote', or nil.
+Only a line of the form `SHA<TAB>refs/heads/BRANCH' counts.  A server
+banner or an ssh warning in the same stream (Savannah prints one) is
+not a commit; one such banner once became `:behind \"**\"'."
+  (let ((case-fold-search nil))
+    (and (string-match (format "^\\([0-9a-f]\\{40\\}\\)\t%s$"
+                               (regexp-quote (concat "refs/heads/" branch)))
+                       output)
+         (match-string 1 output))))
+
 (cl-defgeneric monk--git (resource machine &rest args)
   "Run git with ARGS inside the checkout of RESOURCE on MACHINE.")
 
 (cl-defmethod monk--git ((r monk-git-resource) (m monk-machine) &rest args)
   (apply #'monk--git-in (monk-machine-path m (oref r name) (oref r sudo)) args))
+
+(defconst monk-git-stale-ref-regexp
+  "cannot lock ref\\|some local refs could not be updated"
+  "What `git fetch' says when a remote branch became a namespace, or the reverse.
+Emacs renamed `scratch/igc' to `scratch/igc/...' on 2026-11-25; the old
+tracking ref blocks the new ones until `git remote prune origin'.")
+
+(cl-defmethod monk--git-fetch ((r monk-git-resource) (m monk-machine))
+  "Fetch origin for R on M.
+When stale tracking refs block the fetch, prune origin and fetch once more."
+  (condition-case err
+      (monk--git r m "fetch" "--quiet" "origin")
+    (monk-exec-error
+     (unless (string-match-p monk-git-stale-ref-regexp (format "%s" (car (last err))))
+       (signal (car err) (cdr err)))
+     (monk--git r m "remote" "prune" "origin")
+     (monk--git r m "fetch" "--quiet" "origin"))))
 
 (cl-defmethod monk-check ((r monk-git-resource) (m monk-machine))
   (let ((full (monk-machine-path m (oref r name) (oref r sudo)))
@@ -190,10 +218,12 @@ non-zero exit."
         (when (oref r update)
           ;; ls-remote reads the remote without touching the checkout,
           ;; so check stays side-effect free.
-          (let* ((remote-head (car (split-string
-                                    (monk--git r m "ls-remote" "origin"
-                                               (format "refs/heads/%s" branch)))))
+          (let* ((remote-head (monk--git-remote-head
+                               (monk--git r m "ls-remote" "origin" (format "refs/heads/%s" branch))
+                               branch))
                  (local-head (monk--git r m "rev-parse" "HEAD")))
+            ;; no such branch on the remote, or only a banner came back:
+            ;; nothing to compare, leave the checkout alone
             (when (and remote-head (not (equal remote-head local-head)))
               (setq changes (plist-put changes :behind remote-head)))))
         changes)))))
@@ -218,7 +248,7 @@ non-zero exit."
       (monk--git r m "checkout" "--quiet" branch)
       (push (format "checked out %s" branch) notes))
     (when (plist-get changes :behind)
-      (monk--git r m "fetch" "--quiet" "origin")
+      (monk--git-fetch r m)
       (monk--git r m "merge" "--quiet" "--ff-only" (format "origin/%s" branch))
       (push (format "fast-forwarded to %s"
                     (substring (plist-get changes :behind) 0 8))
