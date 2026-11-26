@@ -4709,7 +4709,30 @@ hour (2026-11-10)."
   ;; hop failed (rsync turns its own transport 255 into a resource
   ;; error before it gets here)
   (should (monk-unreachable-error-p
-           '(monk-exec-error "h" ("uname" "-s") 255 "ssh: connect to host h port 22: Connection timed out"))))
+           '(monk-exec-error "h" ("uname" "-s") 255 "ssh: connect to host h port 22: Connection timed out")))
+  ;; on the local machine no ssh is in the path: 255 is the program's
+  ;; own exit (a batch Emacs that died on an error took the machine
+  ;; "unreachable" with it, 2026-11-25); on a remote one it is ssh's
+  (let ((local (monk-test-machine))
+        (remote (monk-machine :name "far" :address "far.example")))
+    (should-not (monk-unreachable-error-p
+                 '(monk-exec-error "testbox" ("emacs" "--batch" "-l" "x") 255 "Cannot open load file: x") local))
+    (should (monk-unreachable-error-p
+             '(monk-exec-error "far" ("emacs" "--batch" "-l" "x") 255 "ssh: connect to host far port 22: Connection timed out") remote))))
+
+(ert-deftest monk-test-local-command-exit-255-is-a-failure-not-unreachable ()
+  "A local command that exits 255 fails its own resource and nothing else runs dark."
+  (monk-test-with-tmpdir dir
+    (let* ((after (concat dir "after-it"))
+           (policy (lambda (_m)
+                     (monk-command "dies" "sh" :args '("-c" "echo boom >&2; exit 255") :creates "~/never-made-1")
+                     (monk-directory after)))
+           (run (monk-test-converge policy)))
+      (should (eq 'failed (monk-test-status run "dies")))
+      (should (string-match-p "boom" (monk-result-comment (monk-test-result run "dies"))))
+      (should (eq 'repaired (monk-test-status run after)))
+      (should-not (monk-run-unreachable run))
+      (should (= 0 (monk-run-count run monk-status-unreachable))))))
 
 (ert-deftest monk-test-unreachable-machine-marks-all-its-nodes ()
   "A machine that does not answer gets unreachable results, once per resource,

@@ -87,7 +87,7 @@
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-11-25.5"
+(defconst monk-build "2026-11-25.6"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -2582,7 +2582,7 @@ execution model."
                                          (and (not mock) (not dark)
                                               (condition-case err
                                                   (monk-resource-available-p resource machine)
-                                                (error (if (monk-unreachable-error-p err)
+                                                (error (if (monk-unreachable-error-p err machine)
                                                            (progn (monk--mark-unreachable machine (error-message-string err))
                                                                   (setq dark (error-message-string err))
                                                                   nil)
