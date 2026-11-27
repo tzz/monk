@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.10.3
+;; Version: 0.12.0
 ;; URL: https://github.com/tzz/monk
 
 ;; Licensed under the Apache License, Version 2.0 (the "License");
@@ -82,12 +82,12 @@
 
 ;;;; Version
 
-(defconst monk-version "0.10.3"
+(defconst monk-version "0.12.0"
   "Monk's version.  Patch for small work, minor for a large ask.
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-11-25.6"
+(defconst monk-build "2026-11-26.2"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -985,28 +985,8 @@ Signal `monk-exec-error' on non-zero exit.")
   "Run PROGRAM with ARGS on MACHINE and return output lines.")
 
 (cl-defmethod monk-exec ((m monk-machine) program &rest args)
-  (let ((sudo nil) (input nil) (directory nil) (timeout monk-exec-timeout))
-    (when (and args (keywordp (car (last args))))
-      (signal 'monk-exec-error (list "Keyword without a value" (car (last args)))))
-    (while (and (>= (length args) 2) (keywordp (car (last args 2))))
-      (let ((value (car (last args)))
-            (key (car (last args 2))))
-        (setq args (butlast args 2))
-        (pcase key
-          (:sudo (setq sudo value))
-          (:input (setq input value))
-          (:directory (setq directory value))
-          (:timeout (setq timeout value))
-          (_ (signal 'monk-exec-error (list "Unknown keyword" key))))))
-    (let ((default-directory (cond
-                              (directory
-                               (monk-machine-path m (file-name-as-directory directory) sudo))
-                              ;; A local command needs a directory that
-                              ;; exists; the machine's home may not yet.
-                              ((and (monk-machine-local-p m) (not sudo)
-                                    (not (file-directory-p (monk-machine-default-directory m))))
-                               (file-name-as-directory (expand-file-name temporary-file-directory)))
-                              (t (monk-machine-default-directory m sudo))))
+  (pcase-let ((`(,args ,sudo ,input ,directory ,timeout) (monk-exec--split-args args)))
+    (let ((default-directory (monk-exec--default-directory m directory sudo))
           (process-file-side-effects t))
       (monk-log 'debug "%s: exec %s %s" (oref m name) program
                 (mapconcat #'shell-quote-argument args " "))
@@ -1112,6 +1092,179 @@ runs through TRAMP on a remote `default-directory'."
     ;; a last drain: output that arrived with the exit
     (accept-process-output proc 0)
     (process-exit-status proc)))
+
+(defcustom monk-parallel-jobs 4
+  "How many resources run at once in one wave of a pass.
+Resources whose dependencies are all done form a wave; those whose
+class allows it (`monk-resource-parallel-p') run together, this many
+at a time, each in a Lisp thread where this Emacs has them, else
+through `monk-exec-batch' for classes that prepare their commands.
+`monk-parallel-class-limits' and a machine's `parallel' inventory
+variable lower the count for a class or a host.  1 is serial, the
+old behaviour."
+  :type 'natnum)
+
+(defcustom monk-parallel-threads t
+  "When non-nil, run a wave's resources in Lisp threads where Emacs has them.
+Nil keeps every resource on the main thread; classes that prepare
+their commands (git) still overlap through `monk-exec-batch', the
+rest run one after another.  Turn it off to rule threads out when
+something misbehaves; the results are the same either way."
+  :type 'boolean)
+
+(defun monk-parallel-threads-p ()
+  "Return non-nil when waves may use Lisp threads here."
+  (and monk-parallel-threads (featurep 'threads) (fboundp 'make-thread)))
+
+(defcustom monk-parallel-class-limits
+  '(("brew" . 1) ("apt" . 1) ("osx-default" . 1) ("command" . 1)
+    ("launchd" . 1) ("systemd-unit" . 1) ("cron" . 1))
+  "How many resources of one type may run at once on one machine.
+An alist of (TYPE . LIMIT), TYPE as `monk-resource-type' returns it.
+Package managers hold one lock, defaults and units and crontabs are
+one database each, and a command is opaque: those run one at a time
+unless the policy says otherwise.  A type not listed takes
+`monk-parallel-jobs'.  0 or 1 means serial."
+  :type '(alist :key-type string :value-type natnum))
+
+(defconst monk-parallel-machine-var 'parallel
+  "Inventory variable that caps the resources running at once on a machine.
+`(kamen :vars ((parallel . 1)))' keeps a small board to one command at
+a time whatever the policy and the global setting say.")
+
+(defun monk-parallel-limit (resource machine)
+  "Return how many resources like RESOURCE may run at once on MACHINE.
+The lowest of `monk-parallel-jobs', the class limit, and the
+machine's `parallel' variable; 1 when the class does not run in
+parallel at all (`monk-resource-parallel-p')."
+  (if (not (monk-resource-parallel-p resource))
+      1
+    (let* ((class (cdr (assoc (monk-resource-type resource) monk-parallel-class-limits)))
+           (host (monk-machine-var machine monk-parallel-machine-var))
+           (limits (delq nil (list monk-parallel-jobs
+                                   (and (natnump class) class)
+                                   (and (natnump host) host)))))
+      (max 1 (apply #'min limits)))))
+
+(defun monk-exec--start (m program args input)
+  "Start PROGRAM with ARGS for M as a process writing to a fresh buffer.
+INPUT goes to its standard input.  Return (PROCESS . BUFFER); the
+caller waits and reads.  `default-directory' must already be M's."
+  (let* ((buffer (generate-new-buffer (concat " *monk-exec " program "*") t))
+         (process-connection-type nil)
+         (proc (make-process :name (concat "monk-" (file-name-nondirectory program))
+                             :buffer buffer
+                             :command (cons program args)
+                             :connection-type 'pipe
+                             :noquery t
+                             :file-handler t
+                             :sentinel #'ignore)))
+    (ignore m)
+    (condition-case nil
+        (progn (when input (process-send-string proc input))
+               (process-send-eof proc))
+      (error nil))
+    (cons proc buffer)))
+
+(defun monk-exec-batch (m commands)
+  "Run COMMANDS for M together and return their `monk-exec' results in order.
+Each command is (PROGRAM . ARGS), ARGS as `monk-exec' takes them,
+keyword pairs included.  Up to `monk-parallel-jobs' run at once; the
+wait is the same stepping loop as one command's, so timers, the
+agent's socket, and sleep detection keep working, and a command that
+overruns its timeout is stopped with `monk-exec-timeout-exit' and the
+note.  Remote sudo commands cannot run this way (TRAMP's password
+path is synchronous); they run one by one through `monk-exec'."
+  (let* ((jobs (max 1 monk-parallel-jobs))
+         (slots nil)                    ; (INDEX PROC BUFFER DEADLINE PROGRAM TIMEOUT)
+         (results (make-vector (length commands) nil))
+         (pending (cl-loop for c in commands for i from 0 collect (cons i c))))
+    (cl-flet ((finish (slot &optional exit)
+                ;; EXIT overrides the process's own: a command Monk
+                ;; stopped reports `monk-exec-timeout-exit', not SIGKILL
+                (pcase-let ((`(,i ,proc ,buffer ,_deadline ,_program ,_timeout) slot))
+                  (accept-process-output proc 0)
+                  (aset results i
+                        (monk-exec-create :command (process-command proc)
+                                          :exit-code (or exit (process-exit-status proc))
+                                          :output (with-current-buffer buffer (buffer-string))))
+                  (kill-buffer buffer)))
+              (start-one (entry)
+                (pcase-let* ((`(,i ,program . ,args) entry)
+                             (`(,plain ,sudo ,input ,directory ,timeout) (monk-exec--split-args args)))
+                  (if (and sudo (not (monk-machine-local-p m)))
+                      ;; synchronous by necessity: run it here, in turn
+                      (progn (aset results i (apply #'monk-exec m program args)) nil)
+                    (let ((default-directory (monk-exec--default-directory m directory sudo))
+                          (process-file-side-effects t))
+                      (monk-log 'debug "%s: exec (batch) %s %s" (oref m name) program
+                                (mapconcat #'shell-quote-argument plain " "))
+                      (condition-case err
+                          (pcase-let ((`(,proc . ,buffer) (monk-exec--start m program plain input)))
+                            (list i proc buffer (and timeout (+ (float-time) timeout)) program timeout))
+                        (file-missing
+                         (aset results i (monk-exec-create :command (cons program plain) :exit-code 127
+                                                           :output (error-message-string err)))
+                         nil)))))))
+      (while (or pending slots)
+        ;; fill the free slots
+        (while (and pending (< (length slots) jobs))
+          (let ((slot (start-one (pop pending))))
+            (when slot (push slot slots))))
+        (when slots
+          (let ((before (float-time)))
+            ;; one wait for whichever speaks first; the others are polled after
+            (accept-process-output (nth 1 (car slots)) monk-exec-poll-seconds)
+            (let ((gap (- (float-time) before)))
+              (when (> gap monk-exec-sleep-gap-seconds)
+                (monk-log 'info "batch: machine slept %ds during the commands" (round gap))
+                (dolist (slot slots)
+                  (when (nth 3 slot) (setf (nth 3 slot) (+ (nth 3 slot) gap)))))))
+          (run-hooks 'monk-exec-yield-functions)
+          (dolist (slot (copy-sequence slots))
+            (pcase-let ((`(,_i ,proc ,buffer ,deadline ,program ,timeout) slot))
+              (cond
+               ((not (process-live-p proc))
+                (finish slot)
+                (setq slots (delq slot slots)))
+               ((and deadline (> (float-time) deadline))
+                (delete-process proc)
+                (with-current-buffer buffer
+                  (goto-char (point-max))
+                  (insert (format "\nmonk: %s stopped after %ds (monk-exec-timeout)\n" program timeout)))
+                (finish slot monk-exec-timeout-exit)
+                (setq slots (delq slot slots))))))))
+      (append results nil))))
+
+(defun monk-exec--split-args (args)
+  "Return (PLAIN SUDO INPUT DIRECTORY TIMEOUT) from ARGS.
+ARGS end with the keyword pairs `monk-exec' takes."
+  (let ((sudo nil) (input nil) (directory nil) (timeout monk-exec-timeout))
+    (when (and args (keywordp (car (last args))))
+      (signal 'monk-exec-error (list "Keyword without a value" (car (last args)))))
+    (while (and (>= (length args) 2) (keywordp (car (last args 2))))
+      (let ((value (car (last args)))
+            (key (car (last args 2))))
+        (setq args (butlast args 2))
+        (pcase key
+          (:sudo (setq sudo value))
+          (:input (setq input value))
+          (:directory (setq directory value))
+          (:timeout (setq timeout value))
+          (_ (signal 'monk-exec-error (list "Unknown keyword" key))))))
+    (list args sudo input directory timeout)))
+
+(defun monk-exec--default-directory (m directory sudo)
+  "Return the `default-directory' a command for M runs in.
+DIRECTORY is the :directory argument; SUDO the :sudo one."
+  (cond
+   (directory (monk-machine-path m (file-name-as-directory directory) sudo))
+   ;; A local command needs a directory that exists; the machine's
+   ;; home may not yet.
+   ((and (monk-machine-local-p m) (not sudo)
+         (not (file-directory-p (monk-machine-default-directory m))))
+    (file-name-as-directory (expand-file-name temporary-file-directory)))
+   (t (monk-machine-default-directory m sudo))))
 
 (cl-defmethod monk-exec-string ((m monk-machine) program &rest args)
   (let ((exec (apply #'monk-exec m program args)))
@@ -1564,6 +1717,51 @@ every scratch file under ~/.ssh a drift event (2026-10-01).")
 (cl-defmethod monk-resource-owns-subtree-p ((_r monk-resource))
   nil)
 
+(cl-defgeneric monk-resource-parallel-p (resource)
+  "Return non-nil when RESOURCE can run beside other resources of its class.
+Such resources with no requisite between them form a batch: each
+prepares one command (`monk-check-prepare', `monk-repair-prepare'),
+the commands run together through `monk-exec-batch', and each reads
+its own result back (`monk-check-finish', `monk-repair-finish').
+A git checkout is the model: one `ls-remote', one `fetch', no shared
+state.  Nil, the default, runs the resource on its own.")
+
+(cl-defmethod monk-resource-parallel-p ((r monk-resource))
+  "Return non-nil unless R escalates with sudo.
+Most resources can run beside others: each acts on its own paths or
+asks its own question.  Classes with one shared database are held to
+one at a time through `monk-parallel-class-limits' instead.  A sudo
+resource stays serial: TRAMP's sudo hop answers the password prompt
+synchronously, and two hops at once would ask twice."
+  (not (oref r sudo)))
+
+(cl-defgeneric monk-check-prepare-p (resource)
+  "Return non-nil when RESOURCE's class implements `monk-check-prepare'.
+Such classes batch their commands through `monk-exec-batch' even in an
+Emacs without threads; the others run side by side only with threads.
+A class that defines `monk-check-prepare' defines this as t too.")
+
+(cl-defmethod monk-check-prepare-p ((_r monk-resource))
+  nil)
+
+(cl-defgeneric monk-check-prepare (resource machine)
+  "Return the command that decides RESOURCE's check on MACHINE, or nil.
+A command is (PROGRAM . ARGS) as `monk-exec' takes them.  Nil means
+this check has no single command (nothing installed, nothing to ask):
+`monk-check' runs on its own instead.  Must not change MACHINE.")
+
+(cl-defgeneric monk-check-finish (resource machine exec)
+  "Return RESOURCE's changes on MACHINE from EXEC, the prepared command's result.
+Same contract as `monk-check'.")
+
+(cl-defgeneric monk-repair-prepare (resource machine changes)
+  "Return the command that repairs CHANGES of RESOURCE on MACHINE, or nil.
+Nil means `monk-repair' runs on its own.")
+
+(cl-defgeneric monk-repair-finish (resource machine changes exec)
+  "Finish RESOURCE's repair of CHANGES on MACHINE after EXEC.  Return a comment.
+Same contract as `monk-repair'; signal on a failed EXEC.")
+
 (cl-defgeneric monk-default-watch-action (resource)
   "Return the action RESOURCE performs when a watched ref changed.
 Nil means the resource only re-checks.")
@@ -1589,7 +1787,6 @@ Cached per run and machine."
                      key (if (monk-exec-ok-p (monk-exec m "sh" "-c" (concat "command -v " program)))
                              'yes 'no)))))
     (and (eq state 'no) (format "%s is not on this machine" program))))
-
 
 (cl-defgeneric monk-resource-class-init (resource machine)
   "Run once per run on MACHINE before the first RESOURCE of its class.
@@ -2550,6 +2747,27 @@ that happened to hit the wall: the whole message is in the log."
       (push (cons (oref machine name) (monk-unreachable-reason reason))
             (monk-run-unreachable monk--current-run)))))
 
+;; State of a parallel batch (see `monk--run-parallel'); nil outside one.
+(defvar monk--parallel-execs nil
+  "Alist of (RESOURCE . EXEC) while a batch runs: each prepared command's result.
+`monk--run-node-once' reads it through `monk--check-maybe-prepared'
+and `monk--repair-maybe-prepared', so the node code path stays one.")
+
+(defvar monk--parallel-phase nil
+  "`check' or `repair' while a batch phase finishes, else nil.")
+
+(defvar monk--parallel-changes nil
+  "Alist of (RESOURCE . CHANGES) found by the check phase of a batch.
+The repair phase reads it instead of checking again.")
+
+(defvar monk--parallel-defer-repairs nil
+  "Non-nil while batch checks run: a node needing a repair stops before it.
+Its result status is the marker `monk-deferred-repair' and its changes
+go to `monk--parallel-changes'; the repair phase runs it again.")
+
+(defvar monk--parallel-elapsed nil
+  "Alist of (NODE . SECONDS): check-phase durations of deferred batch nodes.")
+
 (defun monk--run-node (node nodes dry-run)
   "Check and repair NODE.  Return a `monk-result'.
 NODES carries the results of earlier nodes for requisites.  When
@@ -2565,7 +2783,8 @@ execution model."
                                      :type (monk-resource-type resource)
                                      :scope (monk-resource-scope resource)
                                      :origin (oref resource origin))))
-    (monk-progress 'node-start :node node)
+    (unless (eq monk--parallel-phase 'repair)
+      (monk--deliver node 'progress 'node-start :node node))
     (pcase-let ((`(,verdict . ,detail)
                  (let* ((mock (and monk--current-run (monk-run-mock monk--current-run)))
                         (dark (monk--machine-unreachable-p machine))
@@ -2612,13 +2831,22 @@ execution model."
        (t
         (monk--class-init-once resource machine)
         (monk--run-node-with-retry resource machine result verdict detail dry-run))))
-    (when (oref resource no-log)
-      (monk-result-censor result))
-    (setf (monk-result-duration result) (- (float-time) start)
-          (monk-node-result node) result)
-    (monk-progress 'node-end :node node :result result)
-    (monk--run-result-functions result)
+    (if (eq (monk-result-status result) 'monk-deferred-repair)
+        ;; a batch node between its check and its repair: not a result
+        ;; yet, nobody hears about it until the repair phase ran
+        (setf (monk-result-duration result) (- (float-time) start))
+      (when (oref resource no-log)
+        (monk-result-censor result))
+      (setf (monk-result-duration result) (+ (- (float-time) start)
+                                             (or (monk--parallel-elapsed node) 0))
+            (monk-node-result node) result)
+      (monk--deliver node 'progress 'node-end :node node :result result)
+      (monk--deliver node 'result result))
     result))
+
+(defun monk--parallel-elapsed (node)
+  "Return the seconds NODE's check phase took in a batch, or nil."
+  (cdr (assq node monk--parallel-elapsed)))
 
 (defun monk--run-result-functions (result)
   "Call `monk-result-functions' with RESULT and the current run."
@@ -2677,6 +2905,7 @@ pass through."
                       (oref machine name) (oref resource name) attempt attempts waited))))
       (monk--run-node-once resource machine result verdict detail dry-run)
       (setq done (or dry-run
+                     (eq (monk-result-status result) 'monk-deferred-repair)
                      (eq (monk-result-status result) monk-status-unreachable)
                      (pcase until
                        ('failure (monk-result-failed-p result))
@@ -2704,10 +2933,13 @@ VERDICT and DETAIL come from `monk--requisite-verdict'.  With DRY-RUN,
 report only.  After a repair, `monk-resource-verify' can still fail it."
   (condition-case err
       (let* ((monk--check-evidence nil)
-             (changes (monk-check resource machine))
+             (resumed (and (eq monk--parallel-phase 'repair)
+                           (assq resource monk--parallel-changes)))
+             ;; the repair phase of a batch has the changes already
+             (changes (if resumed (cdr resumed) (monk--check-maybe-prepared resource machine)))
              (evidence monk--check-evidence)
              (degree (or (plist-get changes :degree) 0.0)))
-        (when evidence
+        (when (and evidence (not resumed))
           (setq changes (plist-put (copy-sequence changes) :evidence evidence)))
         (cond
          ((and (null (monk--changes-without-evidence changes)) (eq verdict 'watch))
@@ -2717,6 +2949,11 @@ report only.  After a repair, `monk-resource-verify' can still fail it."
                 (monk-result-degree result) monk-degree-satisfied
                 (monk-result-comment result) nil
                 (monk-result-changes result) (and evidence (list :evidence evidence))))
+         ;; batch check phase: stop here, the repair runs with the others
+         ((and monk--parallel-defer-repairs (not dry-run))
+          (push (cons resource changes) monk--parallel-changes)
+          (setf (monk-result-status result) 'monk-deferred-repair
+                (monk-result-changes result) changes))
          (dry-run
           (setf (monk-result-status result) monk-status-would-repair
                 (monk-result-degree result) degree
@@ -2728,7 +2965,7 @@ report only.  After a repair, `monk-resource-verify' can still fail it."
                 (and monk-show-diffs (monk-diff resource machine changes))
                 (monk-result-degree result) degree)
           (condition-case unchanged
-              (setf (monk-result-comment result) (monk-repair resource machine changes)
+              (setf (monk-result-comment result) (monk--repair-maybe-prepared resource machine changes)
                     (monk-result-status result) monk-status-repaired
                     (monk-result-degree result) monk-degree-satisfied
                     (monk-result-changes result) changes)
@@ -2816,6 +3053,38 @@ DETAIL names the changed ref.  With DRY-RUN, report only."
 (defconst monk-skip-fatal "an earlier :fatal resource failed on this machine"
   "Skip comment on nodes left after a :fatal failure on their machine.")
 
+(defun monk--parallel-batches (items)
+  "Fold runs of parallel-safe nodes in ITEMS into (parallel NODE...) entries.
+ITEMS is what `monk--aggregate-groups' returns: nodes and node lists.
+A run is consecutive single nodes on one machine whose resources say
+`monk-resource-parallel-p' and that name none of each other in a
+requisite; `monk-schedule' put dependents after dependencies, so such
+a run is safe to overlap.  A run of one stays a plain node."
+  (let (out (i 0) (n (length items)))
+    (while (< i n)
+      (let ((item (nth i items)))
+        (if (or (listp item)
+                (not (monk-resource-parallel-p (monk-node-resource item)))
+                (not (monk-check-prepare-p (monk-node-resource item))))
+            (progn (push item out) (cl-incf i))
+          (let ((m (monk-node-machine item))
+                (batch (list item))
+                (j (1+ i)))
+            (while (and (< j n)
+                        (let ((other (nth j items)))
+                          (and (not (listp other))
+                               (eq (monk-node-machine other) m)
+                               (monk-resource-parallel-p (monk-node-resource other))
+                               (monk-check-prepare-p (monk-node-resource other))
+                               (not (monk--refs-among-p (cons other batch))))))
+              (push (nth j items) batch)
+              (cl-incf j))
+            (setq batch (nreverse batch))
+            (if (cdr batch)
+                (progn (push (cons 'parallel batch) out) (setq i j))
+              (push item out) (cl-incf i))))))
+    (nreverse out)))
+
 (defun monk--aggregate-groups (nodes)
   "Return NODES with aggregatable runs folded: a list of nodes and node lists.
 A group is consecutive ready nodes on one machine whose resources
@@ -2869,7 +3138,7 @@ With DRY-RUN, report only."
          (members (mapcar #'monk-node-resource group))
          (aggregate (monk-resource-aggregate (car members) (cdr members) m))
          (start (float-time)))
-    (dolist (node group) (monk-progress 'node-start :node node))
+    (dolist (node group) (monk--deliver node 'progress 'node-start :node node))
     (let* ((mock (and monk--current-run (monk-run-mock monk--current-run)))
            (unavailable (and (not mock) (monk-resource-available-p aggregate m)))
            (skips (mapcar (lambda (node)
@@ -2922,10 +3191,95 @@ With DRY-RUN, report only."
            (when (oref r no-log)
              (monk-result-censor result))
            (setf (monk-node-result node) result)
-           (monk-progress 'node-end :node node :result result)
-           (monk--run-result-functions result)
+           (monk--deliver node 'progress 'node-end :node node :result result)
+           (monk--deliver node 'result result)
            result))
        group skips))))
+
+(defun monk--item-first-node (item)
+  "Return the first node of ITEM from `monk--parallel-batches'."
+  (cond ((and (consp item) (eq (car item) 'parallel)) (cadr item))
+        ((listp item) (car item))
+        (t item)))
+
+;;;; Running a parallel batch
+
+(defun monk--check-maybe-prepared (resource machine)
+  "Return RESOURCE's changes on MACHINE, from its batch result when there is one."
+  (let ((exec (and (eq monk--parallel-phase 'check) (cdr (assq resource monk--parallel-execs)))))
+    (if exec
+        (monk-check-finish resource machine exec)
+      (monk-check resource machine))))
+
+(defun monk--repair-maybe-prepared (resource machine changes)
+  "Repair CHANGES of RESOURCE on MACHINE, from its batch result when there is one."
+  (let ((exec (and (eq monk--parallel-phase 'repair) (cdr (assq resource monk--parallel-execs)))))
+    (if exec
+        (monk-repair-finish resource machine changes exec)
+      (monk-repair resource machine changes))))
+
+(defun monk--run-parallel (batch nodes dry-run)
+  "Run BATCH, parallel-safe nodes on one machine, overlapping their commands.
+Return the results in BATCH order.  Two phases.  Checks: every node's
+`monk-check-prepare' command runs together through `monk-exec-batch',
+then each node runs `monk--run-node' with its result in hand; a node
+that needs no repair, or is a dry run, is done there.  Repairs: the
+nodes left prepare their repair commands, those run together, and
+each node runs `monk--run-node' once more to finish.  NODES and
+DRY-RUN are as for `monk--run-node'.  Requisites, retries, progress
+events, evidence, verify, and the fatal rule are the node's own; a
+node whose prepare returns nil runs its plain check or repair inside
+the same step.  A failure in one node is that node's result only."
+  (let* ((m (monk-node-machine (car batch)))
+         (resources (mapcar #'monk-node-resource batch))
+         (monk--parallel-changes nil)
+         (monk--parallel-elapsed nil)
+         (results (make-vector (length batch) nil)))
+    ;; Phase 1: checks together.
+    (let* ((specs (mapcar (lambda (r) (monk--prepare-safely #'monk-check-prepare r m)) resources))
+           (execs (monk--exec-batch-sparse m specs))
+           (monk--parallel-execs (cl-mapcar #'cons resources execs))
+           (monk--parallel-phase 'check)
+           (monk--parallel-defer-repairs (not dry-run)))
+      (cl-loop for node in batch for i from 0
+               do (let ((r (monk--run-node node nodes dry-run)))
+                    (when (eq (monk-result-status r) 'monk-deferred-repair)
+                      (push (cons node (monk-result-duration r)) monk--parallel-elapsed))
+                    (aset results i r))))
+    ;; Phase 2: the deferred repairs together, then finish those nodes.
+    (let ((deferred (seq-filter (lambda (i) (eq (monk-result-status (aref results i)) 'monk-deferred-repair))
+                                (number-sequence 0 (1- (length batch))))))
+      (when deferred
+        (let* ((pairs (mapcar (lambda (i) (cons (nth i resources)
+                                                (cdr (assq (nth i resources) monk--parallel-changes))))
+                              deferred))
+               (specs (mapcar (lambda (p) (monk--prepare-safely #'monk-repair-prepare (car p) m (cdr p))) pairs))
+               (execs (monk--exec-batch-sparse m specs))
+               (monk--parallel-execs (cl-mapcar (lambda (p e) (cons (car p) e)) pairs execs))
+               (monk--parallel-phase 'repair)
+               (monk--parallel-defer-repairs nil))
+          (dolist (i deferred)
+            (aset results i (monk--run-node (nth i batch) nodes dry-run))))))
+    (append results nil)))
+
+(defun monk--prepare-safely (prepare resource machine &rest more)
+  "Call PREPARE on RESOURCE, MACHINE, and MORE; nil when it signals.
+A prepare that fails leaves the node to its plain path, which reports
+the error as that node's own."
+  (condition-case nil
+      (apply prepare resource machine more)
+    (error nil)))
+
+(defun monk--exec-batch-sparse (m specs)
+  "Run the non-nil commands in SPECS for M together.
+Return the results aligned to SPECS.
+A nil spec gets nil back."
+  (let* ((real (delq nil (copy-sequence specs)))
+         (done (and real (monk-exec-batch m real)))
+         (out nil))
+    (dolist (spec specs)
+      (push (and spec (pop done)) out))
+    (nreverse out)))
 
 (defvar monk--batch-machines nil
   "Machines the current batch acts on, or nil for all.
@@ -2936,49 +3290,342 @@ result of their own batch, so requisites across batches resolve.")
   "Return non-nil when NODE's machine acts in the current batch."
   (or (null monk--batch-machines) (memq (monk-node-machine node) monk--batch-machines)))
 
+;;;; Waves and the job pool
+
+(defun monk--pass-items (nodes)
+  "Return the work items of a pass over NODES, in run order.
+An item is a node, an aggregate group (a node list), or a parallel
+batch `(parallel NODE...)' of prepared-command nodes; see
+`monk--aggregate-groups' and `monk--parallel-batches'.  Only nodes in
+the current batch of machines are included."
+  (seq-filter (lambda (item) (monk--in-batch-p (monk--item-first-node item)))
+              (monk--parallel-batches (monk--aggregate-groups nodes))))
+
+(defun monk--item-nodes (item)
+  "Return the nodes ITEM stands for."
+  (cond ((and (consp item) (eq (car item) 'parallel)) (cdr item))
+        ((listp item) item)
+        (t (list item))))
+
+(defun monk--paths-overlap-p (paths other)
+  "Return non-nil when a path in PATHS is, holds, or lies under one in OTHER.
+Paths are target-side strings as `monk-resource-paths' gives them; a
+`#fragment' suffix (a line in a file) names the file before it."
+  (cl-flet ((bare (p) (file-name-as-directory (car (split-string p "#")))))
+    (seq-some (lambda (a)
+                (let ((a (bare a)))
+                  (seq-some (lambda (b)
+                              (let ((b (bare b)))
+                                (or (string-prefix-p a b) (string-prefix-p b a))))
+                            other)))
+              paths)))
+
+(defun monk--item-implicit-dependencies (item items)
+  "Return the earlier ITEMS that ITEM must follow although no requisite says so.
+Policy order carries meaning between resources that touch the same
+path on one machine: a file and a line in it, a directory and a file
+under it, two edits of one crontab.  Running them side by side would
+race; running them out of order would change the outcome the serial
+engine gave.  An earlier `:fatal' resource on the machine comes
+first too, since its failure decides whether the rest runs."
+  (let* ((mine (monk--item-nodes item))
+         (m (monk-node-machine (car mine)))
+         (paths (mapcan (lambda (n) (copy-sequence (monk-resource-paths (monk-node-resource n)))) mine))
+         ;; a guard is code that looks at the machine.  It must see
+         ;; what the policy put before it and not what comes after,
+         ;; as when passes were serial: a guarded item keeps its place
+         ;; against every other item on its machine, on both sides
+         (guarded (seq-some (lambda (n) (monk--resource-guarded-p (monk-node-resource n))) mine))
+         (before nil))
+    (catch 'done
+      (dolist (other items)
+        (when (eq other item) (throw 'done nil))
+        (let ((theirs (monk--item-nodes other)))
+          (when (and (eq (monk-node-machine (car theirs)) m)
+                     (or guarded
+                         (seq-some (lambda (n) (monk--resource-guarded-p (monk-node-resource n))) theirs)
+                         (seq-some (lambda (n) (oref (monk-node-resource n) fatal)) theirs)
+                         (and paths
+                              (monk--paths-overlap-p
+                               paths
+                               (mapcan (lambda (n) (copy-sequence (monk-resource-paths (monk-node-resource n)))) theirs)))))
+            (push other before)))))
+    before))
+
+(defun monk--resource-guarded-p (resource)
+  "Return non-nil when RESOURCE has a guard that reads the machine's state.
+`:only-if', `:not-if', and `:when' run arbitrary code or CELL against
+the machine; `:classes' does not, it reads the compiled class list."
+  (or (oref resource only-if) (oref resource not-if) (oref resource when)))
+
+(defun monk--item-dependencies (item nodes &optional items)
+  "Return the nodes outside ITEM that must finish before ITEM runs.
+Requisites among NODES, and with ITEMS, the implicit order of
+`monk--item-implicit-dependencies' as well."
+  (let ((mine (monk--item-nodes item)) (deps nil))
+    (dolist (node mine)
+      (dolist (dep (monk--node-dependencies node nodes))
+        (unless (memq dep mine) (cl-pushnew dep deps))))
+    (when items
+      (dolist (other (monk--item-implicit-dependencies item items))
+        (dolist (node (monk--item-nodes other))
+          (cl-pushnew node deps))))
+    deps))
+
+(defun monk--waves (items nodes)
+  "Split ITEMS into waves, lists of items whose dependencies ran earlier.
+The first wave holds every item with no dependency among NODES still
+to run; the next, those whose dependencies are all in the first; and
+so on.  Items keep their order inside a wave, so results and events
+come out in policy order.  ITEMS is already topologically ordered by
+`monk-schedule', so each wave is one scan."
+  (let ((done (make-hash-table :test #'eq))
+        (all items)
+        (waves nil))
+    (dolist (node nodes)
+      (unless (monk--in-batch-p node) (puthash node t done)))
+    (while items
+      (let ((wave nil) (rest nil))
+        (dolist (item items)
+          (if (cl-every (lambda (dep) (gethash dep done)) (monk--item-dependencies item nodes all))
+              (push item wave)
+            (push item rest)))
+        (when (null wave)
+          (signal 'monk-requisite-error
+                  (list "Requisite cycle among" (mapcar (lambda (i) (mapcar #'monk-node-key (monk--item-nodes i))) rest))))
+        (setq wave (nreverse wave))
+        (dolist (item wave)
+          (dolist (node (monk--item-nodes item)) (puthash node t done)))
+        (push wave waves)
+        (setq items (nreverse rest))))
+    (nreverse waves)))
+
+(defvar monk--deferred-events nil
+  "Progress events and result hooks a worker queued for the main thread.
+Each entry is (NODE KIND . ARGS); `monk--flush-deferred-events' plays
+them in item order once the wave is done.  Nil outside a wave.")
+
+(defvar monk--in-worker nil
+  "Non-nil in a job that runs beside others: events are queued, not sent.")
+
+(defun monk--deliver (node kind &rest args)
+  "Send event KIND with ARGS for NODE now, or queue it in a worker."
+  (if monk--in-worker
+      (push (cons node (cons kind args)) monk--deferred-events)
+    (pcase kind
+      ('progress (apply #'monk-progress args))
+      ('result (monk--run-result-functions (car args))))))
+
+(defun monk--flush-deferred-events (items)
+  "Play the queued events of ITEMS in item order, then forget them."
+  (let ((queued (nreverse monk--deferred-events)))
+    (setq monk--deferred-events nil)
+    (dolist (item items)
+      (dolist (node (monk--item-nodes item))
+        (dolist (entry queued)
+          (when (eq (car entry) node)
+            (pcase (cadr entry)
+              ('progress (apply #'monk-progress (cddr entry)))
+              ('result (monk--run-result-functions (caddr entry))))))))))
+
+(defconst monk-pool-inherited-variables
+  '(process-environment exec-path default-directory temporary-file-directory
+    coding-system-for-read coding-system-for-write inhibit-message
+    noninteractive)
+  "Emacs variables a job thread takes from the thread that starts it.
+A new Lisp thread starts from the global values, not the parent's
+`let' bindings; the caller's environment (a test's MONK_HOME, a
+policy's `default-directory') must travel with the job.")
+
+(defun monk-pool--captured-bindings ()
+  "Return an alist of (SYMBOL . VALUE) a job thread must see.
+Every bound `monk-' special variable and `monk-pool-inherited-variables':
+a snapshot of the calling thread's dynamic environment."
+  (let (out)
+    (mapatoms (lambda (sym)
+                (when (and (string-prefix-p "monk-" (symbol-name sym))
+                           (special-variable-p sym)
+                           (boundp sym))
+                  (push (cons sym (symbol-value sym)) out))))
+    (dolist (sym monk-pool-inherited-variables)
+      (when (boundp sym) (push (cons sym (symbol-value sym)) out)))
+    out))
+
+(defun monk-pool--with-bindings (bindings function)
+  "Call FUNCTION with BINDINGS, an alist of (SYMBOL . VALUE), in effect."
+  (cl-progv (mapcar #'car bindings) (mapcar #'cdr bindings)
+    (funcall function)))
+
+(defun monk-pool-run (jobs limit)
+  "Run JOBS, functions of no arguments, up to LIMIT at a time.
+Return their values in order.
+With Lisp threads, each job runs in its own thread and the main thread
+waits in `accept-process-output', so processes started by `monk-exec'
+in the jobs overlap and `monk-exec-yield-functions' (the agent's
+socket) still run here between waits.  Without threads, or with LIMIT
+1, the jobs run one after another.  A job that signals returns the
+error condition as its value; the caller decides what that means."
+  (let ((jobs (append jobs nil)))
+    ;; Serial jobs run bare, as the engine always ran them: an error
+    ;; that escapes a node (a progress hook that signals, a quit) stops
+    ;; the converge, and `monk--run-nodes' sends run-end on the way out.
+    ;; A thread cannot propagate a signal to the main thread, so there
+    ;; the error becomes the job's value and the wave re-signals it
+    ;; after the other jobs finished (`monk--pass').
+    (cl-flet ((guarded (job) (lambda () (condition-case err (funcall job) (error (cons 'monk-job-error err))))))
+      (if (or (<= limit 1) (not (monk-parallel-threads-p)) (<= (length jobs) 1))
+          (mapcar #'funcall jobs)
+        (let* ((n (length jobs))
+               (values (make-vector n nil))
+               (started 0) (finished 0)
+               (threads nil)
+               (bindings (monk-pool--captured-bindings)))
+          (while (< finished n)
+            (while (and (< started n) (< (- started finished) limit))
+              (let ((i started))
+                (push (make-thread (lambda ()
+                                     (monk-pool--with-bindings
+                                      bindings
+                                      (lambda ()
+                                        (let ((monk--in-worker t)
+                                              (monk--deferred-events nil))
+                                          (aset values i (funcall (guarded (nth i jobs))))
+                                          ;; hand the worker's queue to the pass
+                                          (aset values i (cons (aref values i) monk--deferred-events))))))
+                                   (format "monk-job-%d" i))
+                      threads))
+              (cl-incf started))
+            ;; let the workers run; their process waits yield the lock
+            (accept-process-output nil monk-exec-poll-seconds)
+            (run-hooks 'monk-exec-yield-functions)
+            (setq finished (- started (cl-count-if #'thread-live-p threads))))
+          (mapc #'thread-join threads)
+          ;; each value is (RESULT . QUEUED-EVENTS); merge the queues
+          ;; into the pass's own, in job order, and return the results
+          ;; `monk--deferred-events' is newest first, as each worker's
+          ;; queue is; the flush plays per node, so order across
+          ;; workers does not matter, order within one does
+          (let (out)
+            (dotimes (i n)
+              (let ((cell (aref values i)))
+                (setq monk--deferred-events (append (cdr cell) monk--deferred-events))
+                (push (car cell) out)))
+            (nreverse out)))))))
+
+(defun monk--run-item (item nodes dry-run)
+  "Run ITEM, a node, group, or parallel batch; return its node results.
+NODES and DRY-RUN are as for `monk--run-node'."
+  (cond
+   ((and (consp item) (eq (car item) 'parallel)) (monk--run-parallel (cdr item) nodes dry-run))
+   ((listp item) (monk--run-group item nodes dry-run))
+   (t (list (monk--run-node item nodes dry-run)))))
+
+(defun monk--skip-after-fatal (node)
+  "Return and record NODE's skipped result after a :fatal failure on its machine."
+  (let ((r (monk-node-resource node)) (m (monk-node-machine node)))
+    (setf (monk-node-result node)
+          (monk-result-create :machine (oref m name) :name (oref r name)
+                              :type (monk-resource-type r) :scope (monk-resource-scope r)
+                              :origin (oref r origin)
+                              :status monk-status-skipped :comment monk-skip-fatal))))
+
+(defun monk--item-serial-p (item)
+  "Return non-nil when ITEM must run alone: a class that does not run in parallel."
+  (let ((node (car (monk--item-nodes item))))
+    (not (monk-resource-parallel-p (monk-node-resource node)))))
+
+(defun monk--wave-lanes (wave)
+  "Split WAVE into lanes that may run together, each a list of items.
+Items of one class on one machine beyond that class's limit go to a
+later lane, so a class limit of 1 serializes that class while other
+classes still run beside it.  A class that does not run in parallel
+at all (`monk-resource-parallel-p' nil: sudo) is a lane of its own,
+not beside anything.  Each lane runs through the pool with
+`monk-parallel-jobs' as its width; the class and machine limits are
+already in the lane shape."
+  (let ((lanes nil) (counts (make-hash-table :test #'equal)) (alone nil))
+    (dolist (item wave)
+      (if (monk--item-serial-p item)
+          (push (list item) alone)
+        (let* ((node (car (monk--item-nodes item)))
+               (r (monk-node-resource node)) (m (monk-node-machine node))
+               (key (list (oref m name) (monk-resource-type r)))
+               (host-key (list (oref m name)))
+               (host-limit (let ((v (monk-machine-var m monk-parallel-machine-var)))
+                             (if (natnump v) (max 1 v) most-positive-fixnum)))
+               (limit (monk-parallel-limit r m))
+               (lane (gethash key counts 0))
+               (host-lane (gethash host-key counts 0)))
+          (puthash key (1+ lane) counts)
+          (puthash host-key (1+ host-lane) counts)
+          ;; the later of the class slot and the machine slot
+          (let ((index (max (/ lane limit) (/ host-lane host-limit))))
+            (while (<= (length lanes) index) (setq lanes (append lanes (list nil))))
+            (setf (nth index lanes) (append (nth index lanes) (list item)))))))
+    (append lanes (nreverse alone))))
+
 (defun monk--pass (nodes dry-run)
-  "Run one pass over NODES in order.  Return a `monk-pass'.
+  "Run one pass over NODES.  Return a `monk-pass'.
 Results from earlier passes are cleared first so requisites read this
-pass only.  When DRY-RUN is non-nil, report only.  Every node runs:
-a failure never stops the pass, except after a :fatal failure, which
-ends the pass on that machine only.  Nodes outside the current batch
-are left as they are."
+pass only.  When DRY-RUN is non-nil, report only.  Work is grouped
+into waves (`monk--waves'): everything in a wave has its dependencies
+done, so the items of a wave run together through `monk-pool-run',
+within the limits of `monk-parallel-limit'; events and result hooks
+from the workers are played back in policy order after each wave.
+Every node runs: a failure never stops the pass, except after a
+:fatal failure, which skips the rest of that machine.  Nodes outside
+the current batch are left as they are."
   (dolist (node nodes)
     (when (monk--in-batch-p node)
       (setf (monk-node-result node) nil)))
-  (let (results (repaired 0) (repaired-keys nil) (fatal-machines nil))
-    (dolist (item (seq-filter (lambda (item) (monk--in-batch-p (if (listp item) (car item) item)))
-                              (monk--aggregate-groups nodes)))
-      (let* ((group (if (listp item) item (list item)))
-             (m (monk-node-machine (car group)))
-             (group-results
-              (if (memq m fatal-machines)
-                  (mapcar (lambda (node)
-                            (let ((r (monk-node-resource node)))
-                              (setf (monk-node-result node)
-                                    (monk-result-create :machine (oref m name)
-                                                        :name (oref r name)
-                                                        :type (monk-resource-type r)
-                                                        :scope (monk-resource-scope r)
-                                                        :origin (oref r origin)
-                                                        :status monk-status-skipped
-                                                        :comment monk-skip-fatal))))
-                          group)
-                (if (listp item)
-                    (monk--run-group group nodes dry-run)
-                  (list (monk--run-node item nodes dry-run))))))
-        (cl-mapc (lambda (node result)
-                   (push result results)
-                   (when (monk-result-changed-p result)
-                     (cl-incf repaired)
-                     (push (monk-result-key result) repaired-keys))
-                   (when (and (monk-result-failed-p result)
-                              (oref (monk-node-resource node) fatal)
-                              (not dry-run))
-                     (monk-log 'warn "%s: %s failed and is :fatal; the rest of this machine is skipped"
-                               (oref m name) (monk-result-name result))
-                     (cl-pushnew m fatal-machines)))
-                 group group-results)))
+  (let ((results nil) (repaired 0) (repaired-keys nil) (fatal-machines nil)
+        (items (monk--pass-items nodes)))
+    (dolist (wave (monk--waves items nodes))
+      (dolist (lane (monk--wave-lanes wave))
+        (let* ((live (seq-remove (lambda (item) (memq (monk-node-machine (car (monk--item-nodes item))) fatal-machines)) lane))
+               (dead (seq-difference lane live))
+               (monk--deferred-events nil)
+               (values (monk-pool-run (mapcar (lambda (item) (lambda () (monk--run-item item nodes dry-run))) live)
+                                      (max 1 monk-parallel-jobs))))
+          (monk--flush-deferred-events live)
+          (dolist (item dead)
+            (dolist (node (monk--item-nodes item))
+              (push (monk--skip-after-fatal node) results)))
+          (cl-mapc
+           (lambda (item value)
+             (let ((item-results
+                    (cond
+                     ((not (and (consp value) (eq (car value) 'monk-job-error)))
+                      value)
+                     ;; the item's own code signalled past the node
+                     ;; runner.  A Monk error (a prepare, an aggregate,
+                     ;; a requisite) fails the item's nodes; anything
+                     ;; else is the engine's problem and escapes as it
+                     ;; would have serially
+                     ((not (memq 'monk-error (get (car (cdr value)) 'error-conditions)))
+                      (signal (car (cdr value)) (cdr (cdr value))))
+                     (t
+                      (mapcar (lambda (node)
+                                (let ((r (monk-node-resource node)) (m (monk-node-machine node)))
+                                  (setf (monk-node-result node)
+                                        (monk-result-create :machine (oref m name) :name (oref r name)
+                                                            :type (monk-resource-type r) :scope (monk-resource-scope r)
+                                                            :origin (oref r origin) :status monk-status-failed
+                                                            :comment (error-message-string (cdr value))))))
+                              (monk--item-nodes item))))))
+               (cl-mapc (lambda (node result)
+                          (push result results)
+                          (when (monk-result-changed-p result)
+                            (cl-incf repaired)
+                            (push (monk-result-key result) repaired-keys))
+                          (when (and (monk-result-failed-p result)
+                                     (oref (monk-node-resource node) fatal)
+                                     (not dry-run))
+                            (monk-log 'warn "%s: %s failed and is :fatal; the rest of this machine is skipped"
+                                      (oref (monk-node-machine node) name) (monk-result-name result))
+                            (cl-pushnew (monk-node-machine node) fatal-machines)))
+                        (monk--item-nodes item) item-results)))
+           live values))))
     (monk-pass-create :results (nreverse results)
                       :repaired repaired
                       :repaired-keys (nreverse repaired-keys))))
@@ -3616,7 +4263,6 @@ also report :selected, the keys tag selection would run.  Ansible's
     (buffer-string)))
 
 ;;;; Batch entry point
-
 
 (defun monk-batch-check (policy-file &rest machine-args)
   "Load POLICY-FILE and compile it for the local machine, with no run.

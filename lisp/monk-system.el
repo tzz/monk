@@ -179,6 +179,17 @@ not a commit; one such banner once became `:behind \"**\"'."
 (cl-defgeneric monk--git (resource machine &rest args)
   "Run git with ARGS inside the checkout of RESOURCE on MACHINE.")
 
+(defun monk--git-describe-commit (resource machine commit)
+  "Return COMMIT of RESOURCE on MACHINE as `abcdef12 (title)'.
+The title is the commit's subject line, after a fetch brought the
+object in; without it, the short id alone."
+  (let ((title (condition-case nil
+                   (monk--git resource machine "log" "-1" "--format=%s" commit)
+                 (error nil))))
+    (if (and title (not (string-empty-p title)))
+        (format "%s (%s)" (substring commit 0 8) (truncate-string-to-width title 60 nil nil "…"))
+      (substring commit 0 8))))
+
 (cl-defmethod monk--git ((r monk-git-resource) (m monk-machine) &rest args)
   (apply #'monk--git-in (monk-machine-path m (oref r name) (oref r sudo)) args))
 
@@ -251,8 +262,92 @@ When stale tracking refs block the fetch, prune origin and fetch once more."
       (monk--git-fetch r m)
       (monk--git r m "merge" "--quiet" "--ff-only" (format "origin/%s" branch))
       (push (format "fast-forwarded to %s"
-                    (substring (plist-get changes :behind) 0 8))
+                    (monk--git-describe-commit r m (plist-get changes :behind)))
             notes))
+    (string-join (nreverse notes) ", ")))
+
+;; Parallel checkouts.  The slow part of a git resource is the network:
+;; `ls-remote' in the check, `fetch' in the repair.  Both are one
+;; command with no shared state, so independent checkouts on one
+;; machine run them together (`monk-resource-parallel-p').  The local
+;; parts (rev-parse, the merge) stay in the finish methods.
+
+(cl-defmethod monk-resource-parallel-p ((_r monk-git-resource))
+  t)
+
+(cl-defmethod monk-check-prepare-p ((_r monk-git-resource))
+  t)
+
+(cl-defgeneric monk--git-local-state (resource machine)
+  "Return the local facts of RESOURCE's checkout on MACHINE; see the git method.")
+
+(cl-defmethod monk--git-local-state ((r monk-git-resource) (m monk-machine))
+  "Return (FULL BRANCH CURRENT-BRANCH LOCAL-HEAD) for R on M.
+Without a checkout, (FULL BRANCH).  Signal when the directory is not
+empty and not a checkout."
+  (let ((full (monk-machine-path m (oref r name) (oref r sudo)))
+        (branch (or (oref r branch) monk-git-default-branch)))
+    (if (file-directory-p (expand-file-name ".git" full))
+        (list full branch
+              (monk--git r m "rev-parse" "--abbrev-ref" "HEAD")
+              (monk--git r m "rev-parse" "HEAD"))
+      (when (and (file-exists-p full)
+                 (directory-files full nil directory-files-no-dot-files-regexp))
+        (signal 'monk-resource-error
+                (list (format "%s exists, is not empty, and is not a git checkout"
+                              (oref r name)))))
+      (list full branch))))
+
+(cl-defmethod monk-check-prepare ((r monk-git-resource) (m monk-machine))
+  "The `ls-remote' for R on M when the checkout exists and has :update."
+  (pcase-let ((`(,full ,branch . ,cloned) (monk--git-local-state r m)))
+    (and cloned (oref r update)
+         (list vc-git-program "ls-remote" "origin" (format "refs/heads/%s" branch)
+               :directory (monk-machine-local-path full)))))
+
+(cl-defmethod monk-check-finish ((r monk-git-resource) (m monk-machine) exec)
+  "Changes of R on M from EXEC, its `ls-remote'.
+The local state is read again here, after the batch."
+  (pcase-let ((`(,_full ,branch ,current-branch ,local-head) (monk--git-local-state r m)))
+    (unless (monk-exec-ok-p exec)
+      (signal 'monk-exec-error
+              (list (oref m name) (monk-exec-command exec) (monk-exec-exit-code exec)
+                    (string-trim (monk-exec-output exec)))))
+    (let ((changes nil)
+          (remote-head (monk--git-remote-head (monk-exec-output exec) branch)))
+      (unless (equal current-branch branch)
+        (setq changes (plist-put changes :checkout (list current-branch branch))))
+      (when (and remote-head (not (equal remote-head local-head)))
+        (setq changes (plist-put changes :behind remote-head)))
+      changes)))
+
+(cl-defmethod monk-repair-prepare ((r monk-git-resource) (m monk-machine) changes)
+  "The `fetch' of R on M when CHANGES say it is behind.
+Nil for a clone or a branch switch, which `monk-repair' does."
+  (and (plist-get changes :behind)
+       (not (plist-get changes :clone))
+       (list vc-git-program "fetch" "--quiet" "origin"
+             :directory (monk-machine-local-path
+                         (monk-machine-path m (oref r name) (oref r sudo))))))
+
+(cl-defmethod monk-repair-finish ((r monk-git-resource) (m monk-machine) changes exec)
+  "Merge for R on M after EXEC, the `fetch', with CHANGES from the check.
+When stale tracking refs blocked the fetch, prune origin and fetch
+again first."
+  (let ((branch (or (oref r branch) monk-git-default-branch))
+        (notes nil))
+    (unless (monk-exec-ok-p exec)
+      (if (string-match-p monk-git-stale-ref-regexp (monk-exec-output exec))
+          (progn (monk--git r m "remote" "prune" "origin")
+                 (monk--git r m "fetch" "--quiet" "origin"))
+        (signal 'monk-exec-error
+                (list (oref m name) (monk-exec-command exec) (monk-exec-exit-code exec)
+                      (string-trim (monk-exec-output exec))))))
+    (when (plist-get changes :checkout)
+      (monk--git r m "checkout" "--quiet" branch)
+      (push (format "checked out %s" branch) notes))
+    (monk--git r m "merge" "--quiet" "--ff-only" (format "origin/%s" branch))
+    (push (format "fast-forwarded to %s" (monk--git-describe-commit r m (plist-get changes :behind))) notes)
     (string-join (nreverse notes) ", ")))
 
 (cl-defmethod monk-resource-paths ((r monk-git-resource))

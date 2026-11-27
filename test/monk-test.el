@@ -688,6 +688,278 @@ This is the Salt execution model.  Only dependents skip."
         (should (eq 'kept (monk-test-status run "u")))
         (should (eq 'kept (monk-test-status run "bare")))))))
 
+(ert-deftest monk-test-exec-batch-overlaps-and-keeps-order ()
+  "`monk-exec-batch' runs its commands together: four 0.6 s sleeps finish in
+about one, results come back in command order with each one's own exit
+and output, a timeout stops only its command, a missing program is exit
+127, and the yield hook runs while they wait."
+  (let* ((m (monk-local-machine))
+         (yields 0)
+         (monk-exec-yield-functions (list (lambda () (cl-incf yields))))
+         (monk-parallel-jobs 4)
+         (start (float-time))
+         (results (monk-exec-batch m (list '("sh" "-c" "sleep 0.6; echo one")
+                                           '("sh" "-c" "sleep 0.6; echo two; exit 2")
+                                           '("sleep" "30" :timeout 1)
+                                           '("no-such-program-xyz")
+                                           '("sh" "-c" "sleep 0.6; echo five"))))
+         (elapsed (- (float-time) start)))
+    (should (= 5 (length results)))
+    (should (equal '(0 2 124 127 0) (mapcar #'monk-exec-exit-code results)))
+    (should (string-match-p "one" (monk-exec-output (nth 0 results))))
+    (should (string-match-p "two" (monk-exec-output (nth 1 results))))
+    (should (string-match-p "stopped after 1s" (monk-exec-output (nth 2 results))))
+    (should (string-match-p "five" (monk-exec-output (nth 4 results))))
+    ;; three sleeps of 0.6 and one of 1: serial would be 2.8 s or more
+    (should (< elapsed 2.0))
+    (should (> yields 2))
+    ;; jobs=1 is serial: the same three sleeps take their sum
+    (let* ((monk-parallel-jobs 1)
+           (t0 (float-time)))
+      (monk-exec-batch m (list '("sleep" "0.3") '("sleep" "0.3") '("sleep" "0.3")))
+      (should (>= (- (float-time) t0) 0.85)))))
+
+(ert-deftest monk-test-parallel-batches-fold-independent-git-nodes ()
+  "Consecutive git nodes on one machine with no requisite among them become one
+(parallel ...) entry; a requisite between two splits them; a non-parallel
+resource in between ends the run."
+  (let* ((m (monk-test-machine))
+         (nodes (monk--nodes-for
+                 (list m)
+                 (lambda (_m)
+                   (monk-git "~/a" "x") (monk-git "~/b" "x") (monk-git "~/c" "x" :require '("~/b"))
+                   (monk-directory "~/d")
+                   (monk-git "~/e" "x") (monk-git "~/f" "x")
+                   (monk-git "~/g" "x" :require '("~/d")))))
+         (items (monk--parallel-batches (monk--aggregate-groups (monk-schedule nodes))))
+         (shape (mapcar (lambda (item)
+                          (cond ((and (consp item) (eq (car item) 'parallel))
+                                 (cons 'parallel (mapcar (lambda (n) (oref (monk-node-resource n) name)) (cdr item))))
+                                ((listp item) (cons 'group (mapcar (lambda (n) (oref (monk-node-resource n) name)) item)))
+                                (t (oref (monk-node-resource item) name))))
+                        items)))
+    ;; ~/c requires ~/b, so it cannot sit in the same batch as ~/b; it
+    ;; and ~/a could, but policy order is kept: a+b, then c alone
+    (should (equal '((parallel "~/a" "~/b") "~/c" "~/d" (parallel "~/e" "~/f" "~/g")) shape))))
+
+(ert-deftest monk-test-parallel-git-checkouts-converge-together ()
+  "Three independent checkouts behind their origins fast-forward in one batch:
+results in policy order, each with its own commit; a fourth whose remote
+is gone fails alone; a resource that requires one of them waits for the
+real result; node events fire once per node; a dry run plans all four."
+  (skip-unless (executable-find "git"))
+  (require 'monk-system)
+  (monk-test-with-tmpdir dir
+    (let* ((process-environment (append '("GIT_AUTHOR_NAME=t" "GIT_AUTHOR_EMAIL=t@t"
+                                           "GIT_COMMITTER_NAME=t" "GIT_COMMITTER_EMAIL=t@t")
+                                         process-environment))
+           (names '("one" "two" "three" "gone"))
+           (origins (mapcar (lambda (n) (concat dir "origin-" n)) names))
+           (clones (mapcar (lambda (n) (concat dir "clone-" n)) names))
+           (events nil)
+           (monk-progress-functions (list (lambda (event data)
+                                            (when (memq event '(node-start node-end))
+                                              (push (cons event (oref (monk-node-resource (plist-get data :node)) name)) events)))))
+           (monk-log-level nil)
+           (policy (lambda (_m)
+                     (cl-loop for c in clones for o in origins
+                              do (monk-git c o :branch "main"))
+                     (monk-directory (concat dir "after") :require (list (nth 0 clones))))))
+      ;; seed: each origin has one commit and a clone of it
+      (cl-loop for o in origins for c in clones
+               do (make-directory o)
+               (let ((default-directory o))
+                 (call-process "git" nil nil nil "init" "-q" "-b" "main")
+                 (with-temp-file "f" (insert "1"))
+                 (call-process "git" nil nil nil "add" "f")
+                 (call-process "git" nil nil nil "commit" "-q" "-m" "one"))
+               (call-process "git" nil nil nil "clone" "-q" o c))
+      ;; all kept, in one batch
+      (let ((run (monk-test-converge policy)))
+        (should (cl-every (lambda (c) (eq 'kept (monk-test-status run c))) clones)))
+      ;; move three origins; break the fourth's remote
+      (dolist (o (seq-take origins 3))
+        (let ((default-directory o))
+          (with-temp-file "f" (insert (file-name-nondirectory o)))
+          (call-process "git" nil nil nil "commit" "-q" "-am" "two")))
+      (delete-directory (nth 3 origins) t)
+      (setq events nil)
+      (let* ((plan (let ((monk-log-level nil)) (monk-plan (monk-test-machine) policy)))
+             (_ (setq events nil))
+             (run (monk-test-converge policy))
+             (order (mapcar #'monk-result-name (monk-run-results run))))
+        ;; dry run: three would fast-forward, the broken one fails on its own
+        (should (cl-every (lambda (c) (eq 'would-repair (monk-test-status plan c))) (seq-take clones 3)))
+        (should (eq 'failed (monk-test-status plan (nth 3 clones))))
+        ;; real run: policy order kept across the batch
+        (should (equal (append clones (list (concat dir "after"))) order))
+        (dolist (c (seq-take clones 3))
+          (should (eq 'repaired (monk-test-status run c)))
+          ;; the short id and the commit's title
+          (should (string-match-p "fast-forwarded to [0-9a-f]\\{8\\} (two)" (monk-result-comment (monk-test-result run c))))
+          (should (equal (file-name-nondirectory (nth (cl-position c clones :test #'equal) origins))
+                         (with-temp-buffer (insert-file-contents (concat c "/f")) (buffer-string)))))
+        (should (eq 'failed (monk-test-status run (nth 3 clones))))
+        ;; the dependent (made by the first converge, so kept now) ran
+        ;; after every batch node had ended: its :require saw real results
+        (should (eq 'kept (monk-test-status run (concat dir "after"))))
+        (let* ((ordered (reverse events))
+               (after-start (cl-position (cons 'node-start (concat dir "after")) ordered :test #'equal)))
+          (dolist (c clones)
+            (should (< (cl-position (cons 'node-end c) ordered :test #'equal) after-start))))
+        ;; a converge is two passes (repair, confirm): two starts and two
+        ;; ends per node, never a third from the batch's second phase
+        (should (= 2 (monk-run-passes run)))
+        (dolist (c clones)
+          (should (= 2 (cl-count (cons 'node-start c) events :test #'equal)))
+          (should (= 2 (cl-count (cons 'node-end c) events :test #'equal))))
+        ;; evidence of the batch: durations exist and the run converged
+        (should (monk-run-converged-p run))
+        (should-not (monk-run-flapping run))))))
+
+(ert-deftest monk-test-waves-follow-requisites-paths-and-guards ()
+  "A pass is split into waves: items whose dependencies ran earlier.
+Requisites order waves; so does an implicit dependency: two resources
+on one path (a file and a line in it), a guarded resource (its guard
+reads the machine), a :fatal resource.  Unrelated resources on one
+machine share a wave; different machines always can."
+  (monk-test-with-tmpdir dir
+    (let* ((ms (monk-test-machines "a" "b"))
+           (nodes (monk-schedule
+                   (monk--nodes-for
+                    ms
+                    (lambda (_m)
+                      (monk-directory (concat dir "one"))
+                      (monk-directory (concat dir "two"))
+                      (monk-file (concat dir "f") :content "x\n")
+                      (monk-line-in-file (concat dir "f") "y" :create t)
+                      (monk-directory (concat dir "three") :require (list (concat dir "one")))
+                      (monk-directory (concat dir "four") :only-if (lambda (_m) t))
+                      (monk-directory (concat dir "five"))))))
+           (items (monk--pass-items nodes))
+           (waves (monk--waves items nodes)))
+      (cl-flet ((names (wave) (mapcar (lambda (item)
+                                        (let ((n (car (monk--item-nodes item))))
+                                          (format "%s:%s" (oref (monk-node-machine n) name)
+                                                  (file-name-nondirectory (oref (monk-node-resource n) name)))))
+                                      wave)))
+        (let ((shape (mapcar #'names waves)))
+          ;; wave 1: one, two, f on both machines (no dependency among them)
+          (should (equal '("a:one" "a:two" "a:f" "b:one" "b:two" "b:f") (nth 0 shape)))
+          ;; wave 2: the line in f (same path as f) and three (requires one)
+          (should (equal '("a:f#y" "a:three" "b:f#y" "b:three") (nth 1 shape)))
+          ;; wave 3: four is guarded, so it waits for everything before it
+          (should (equal '("a:four" "b:four") (nth 2 shape)))
+          ;; wave 4: five comes after the guarded four
+          (should (equal '("a:five" "b:five") (nth 3 shape)))
+          (should (= 4 (length shape))))))))
+
+(ert-deftest monk-test-parallel-limits-and-lanes ()
+  "`monk-parallel-limit' is the lowest of the global, class, and machine
+limits, 1 for a class that does not run in parallel or a sudo resource;
+`monk--wave-lanes' puts resources past their class limit in later lanes."
+  (let* ((m (monk-local-machine :name "box"))
+         (capped (monk-local-machine :name "pi")))
+    (oset capped vars '((parallel . 1)))
+    (let ((monk-parallel-jobs 4)
+          (monk-parallel-class-limits '(("brew" . 1) ("directory" . 2))))
+      (should (= 2 (monk-parallel-limit (monk-directory-resource :name "~/d") m)))
+      (should (= 4 (monk-parallel-limit (monk-symlink-resource :name "~/l" :target "x") m)))
+      (should (= 1 (monk-parallel-limit (monk-directory-resource :name "~/d") capped)))
+      (should (= 1 (monk-parallel-limit (monk-directory-resource :name "~/d" :sudo t) m)))
+      (should (= 1 (monk-parallel-limit (monk-brew-resource :name "b" :packages '("x")) m)))
+      (let ((monk-parallel-jobs 1))
+        (should (= 1 (monk-parallel-limit (monk-symlink-resource :name "~/l" :target "x") m)))))
+    ;; lanes: three directories at class limit 2 -> lanes of 2 and 1; a
+    ;; symlink (limit 4) rides in the first lane; a sudo one is alone, last
+    (let* ((monk-parallel-jobs 4)
+           (monk-parallel-class-limits '(("directory" . 2)))
+           (nodes (mapcar (lambda (r) (monk-node-create :machine m :resource r :index 0))
+                          (list (monk-directory-resource :name "~/a") (monk-directory-resource :name "~/b")
+                                (monk-directory-resource :name "~/c") (monk-symlink-resource :name "~/l" :target "x")
+                                (monk-directory-resource :name "/etc/x" :sudo t))))
+           (lanes (monk--wave-lanes nodes)))
+      (should (equal '(("~/a" "~/b" "~/l") ("~/c") ("/etc/x"))
+                     (mapcar (lambda (lane) (mapcar (lambda (n) (oref (monk-node-resource n) name)) lane)) lanes))))
+    ;; a machine with (parallel . 1): one item per lane whatever the class
+    (let* ((monk-parallel-jobs 4)
+           (monk-parallel-class-limits nil)
+           (nodes (mapcar (lambda (r) (monk-node-create :machine capped :resource r :index 0))
+                          (list (monk-directory-resource :name "~/a") (monk-symlink-resource :name "~/l" :target "x")
+                                (monk-directory-resource :name "~/b"))))
+           (lanes (monk--wave-lanes nodes)))
+      (should (equal '(("~/a") ("~/l") ("~/b"))
+                     (mapcar (lambda (lane) (mapcar (lambda (n) (oref (monk-node-resource n) name)) lane)) lanes))))))
+
+(ert-deftest monk-test-pool-runs-jobs-in-threads ()
+  "With threads, `monk-pool-run' overlaps jobs that wait on processes, keeps
+their order, hands errors back as values, and honors the limit."
+  (skip-unless (monk-parallel-threads-p))
+  (let* ((m (monk-local-machine))
+         (job (lambda (tag) (lambda () (monk-exec m "sh" "-c" (format "sleep 0.5; echo %s" tag)) tag)))
+         (t0 (float-time))
+         (values (monk-pool-run (mapcar job '("a" "b" "c" "d")) 4))
+         (elapsed (- (float-time) t0)))
+    (should (equal '("a" "b" "c" "d") values))
+    (should (< elapsed 1.5))
+    ;; limit 2: two rounds of 0.5
+    (let ((t0 (float-time)))
+      (monk-pool-run (mapcar job '("a" "b" "c" "d")) 2)
+      (should (>= (- (float-time) t0) 0.9)))
+    ;; an error is the job's value, the others still finish
+    (let ((values (monk-pool-run (list (funcall job "x") (lambda () (error "boom")) (funcall job "z")) 3)))
+      (should (equal "x" (nth 0 values)))
+      (should (eq 'monk-job-error (car (nth 1 values))))
+      (should (equal "z" (nth 2 values))))
+    ;; a let-bound monk- variable is visible in the job
+    (let ((monk-exec-timeout 4242))
+      (should (equal '(4242 4242) (monk-pool-run (list (lambda () monk-exec-timeout) (lambda () monk-exec-timeout)) 2))))))
+
+(ert-deftest monk-test-parallel-converge-matches-serial ()
+  "A policy of independent slow commands converges to the same results with
+threads and without, and the threaded run is faster.  Events arrive once
+per node, in policy order, on the main thread."
+  (skip-unless (monk-parallel-threads-p))
+  (monk-test-with-tmpdir dir
+    (let* ((names '("p" "q" "r" "s"))
+           (policy (lambda (_m)
+                     (dolist (n names)
+                       (monk-command n "sh" :args (list "-c" (format "sleep 0.4; touch %s%s" dir n))
+                                     :creates (concat dir n)))
+                     (monk-directory (concat dir "after") :require names)))
+           (events nil)
+           (monk-progress-functions
+            (list (lambda (event data)
+                    (when (memq event '(node-start node-end))
+                      (push (cons event (monk-result-name-or-node data)) events)))))
+           (monk-parallel-class-limits nil)
+           (monk-log-level nil))
+      (cl-flet ((run-with (threads)
+                  (dolist (n (cons "after" names)) (ignore-errors (delete-file (concat dir n))) (ignore-errors (delete-directory (concat dir n))))
+                  (setq events nil)
+                  (let* ((monk-parallel-threads threads)
+                         (t0 (float-time))
+                         (run (monk-converge (monk-test-machine) policy))
+                         (secs (- (float-time) t0)))
+                    (list (mapcar (lambda (r) (cons (monk-result-name r) (monk-result-status r))) (monk-run-results run))
+                          secs
+                          (reverse events)
+                          (monk-run-passes run)))))
+        (let ((serial (run-with nil))
+              (parallel (run-with t)))
+          (should (equal (nth 0 serial) (nth 0 parallel)))
+          (should (equal '(("p" . repaired) ("q" . repaired) ("r" . repaired) ("s" . repaired)) (seq-take (nth 0 parallel) 4)))
+          (should (= (nth 3 serial) (nth 3 parallel)))
+          ;; four 0.4 s commands: serial >= 1.6 s per pass, parallel well under
+          (should (> (nth 1 serial) 1.5))
+          (should (< (nth 1 parallel) (* 0.6 (nth 1 serial))))
+          ;; events: same multiset, policy order within each pass
+          (should (equal (nth 2 serial) (nth 2 parallel))))))))
+
+(defun monk-result-name-or-node (data)
+  "Return the resource name from a node event's DATA plist."
+  (oref (monk-node-resource (plist-get data :node)) name))
+
 (ert-deftest monk-test-git-remote-head-ignores-banners ()
   "Only a `SHA<TAB>refs/heads/BRANCH' line is a remote head.  An ssh warning
 in the same stream (OpenSSH's post-quantum notice, 2026-11-25) made the
