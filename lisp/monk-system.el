@@ -20,7 +20,8 @@
 ;;; Commentary:
 
 ;; Resources: `monk-cron', `monk-git', `monk-user-group',
-;; `monk-sysctl', `monk-systemd-unit', `monk-command'.
+;; `monk-sysctl', `monk-systemd-unit', `monk-launchd', `monk-app',
+;; `monk-command'.  Fact helper: `monk-process-running-p'.
 
 ;;; Code:
 
@@ -694,6 +695,97 @@ keys; keys the other manager does not take are dropped.  Ansible's
       (_ (apply #'monk-unsupported name
                 (format "service: no supported service manager (service-mgr is %s)" manager)
                 (monk--common-initargs args))))))
+
+;;;; processes
+
+(defconst monk-pgrep-program "pgrep"
+  "The process finder.  procps on Linux, BSD pgrep on macOS; the flags
+used here (-x, -f, -u) mean the same on both.")
+
+(cl-defun monk-process-running-p (m pattern &key exact user)
+  "Return non-nil when a process matching PATTERN runs on M.
+PATTERN is a regexp over the full command line (`pgrep -f'), so a
+path or an argument selects one program among several with the same
+name.  With EXACT, PATTERN must equal the process name (`pgrep -x').
+USER limits the search to that user's processes.  Salt's `ps.pgrep'."
+  (let ((args (append (and exact '("-x"))
+                      (and (not exact) '("-f"))
+                      (and user (list "-u" user))
+                      (list "--" pattern))))
+    (monk-exec-ok-p (apply #'monk-exec m monk-pgrep-program args))))
+
+;;;; app: a macOS application bundle, running or not
+
+(defconst monk-app-directory "/Applications/"
+  "Where a bundle named NAME.app is looked for when no path is given.")
+
+(defclass monk-app-resource (monk-resource)
+  ((state :initarg :state
+          :initform 'running
+          :documentation "`running' or `stopped'.")
+   (path :initarg :path
+         :initform nil
+         :documentation "The bundle; nil means `monk-app-directory'/NAME.app.")
+   (background :initarg :background
+               :initform t
+               :documentation "Open without taking focus (`open -g')."))
+  "A macOS application NAME, running or stopped.
+Running is decided by a process whose command line starts inside the
+bundle, so helpers of another app with the same binary name do not
+count.  Repair opens the bundle with `open' or quits it with
+`osascript', which lets the app save its state.")
+
+(defun monk-app-bundle (r)
+  "Return the bundle path of app R."
+  (or (oref r path) (format "%s%s.app" monk-app-directory (oref r name))))
+
+(defun monk-app-running-p (r m)
+  "Non-nil when a process of app R's bundle runs on M."
+  (monk-process-running-p m (concat "^" (regexp-quote (monk-app-bundle r)) "/")))
+
+(cl-defmethod monk-resource-skip-reason ((r monk-app-resource) (m monk-machine))
+  "An app that is not installed is skipped, not failed: brew may bring
+it later in the same run, and the next pass finds it."
+  (or (cl-call-next-method)
+      (and (not (file-directory-p (monk-machine-path m (monk-app-bundle r))))
+           (format "%s is not installed" (monk-app-bundle r)))))
+
+(cl-defmethod monk-check ((r monk-app-resource) (m monk-machine))
+  (let ((running (monk-app-running-p r m)))
+    (pcase (oref r state)
+      ('running (and (not running) (list :open (monk-app-bundle r))))
+      ('stopped (and running (list :quit (oref r name))))
+      (other (signal 'monk-resource-error
+                     (list (format "app %s: :state must be running or stopped, not %S"
+                                   (oref r name) other)))))))
+
+(cl-defmethod monk-repair ((r monk-app-resource) (m monk-machine) changes)
+  (cond
+   ((plist-get changes :open)
+    (let ((exec (apply #'monk-exec m "open"
+                       (append (and (oref r background) '("-g"))
+                               (list (plist-get changes :open))))))
+      (unless (monk-exec-ok-p exec)
+        (signal 'monk-exec-error
+                (list (oref m name) (monk-exec-command exec) (monk-exec-exit-code exec)
+                      (string-trim (monk-exec-output exec)))))
+      (format "opened %s" (plist-get changes :open))))
+   ((plist-get changes :quit)
+    (let ((exec (monk-exec m "osascript" "-e"
+                           (format "quit app %S" (plist-get changes :quit)))))
+      (unless (monk-exec-ok-p exec)
+        (signal 'monk-exec-error
+                (list (oref m name) (monk-exec-command exec) (monk-exec-exit-code exec)
+                      (string-trim (monk-exec-output exec)))))
+      (format "quit %s" (plist-get changes :quit))))))
+
+(monk-define-resource monk-app monk-app-resource
+  "Ensure the macOS application NAME is running or stopped."
+  ((name :type string :doc "The application, as in NAME.app."))
+  ((state :type symbol :default running :choices (running stopped))
+   (path :type path :doc "The bundle, when it is not /Applications/NAME.app.")
+   (background :type boolean :default t :doc "Open without taking focus."))
+  :classes (darwin))
 
 ;;;; command
 

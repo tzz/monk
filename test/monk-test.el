@@ -3310,6 +3310,78 @@ inside a walked tree is dropped, and ~ itself is never walked."
             (should-not (member "bootout" (mapcar #'cadr calls)))
             (should-not (member "bootstrap" (mapcar #'cadr calls)))))))))
 
+(ert-deftest monk-test-process-running-p-builds-pgrep ()
+  "The helper picks -f for a pattern, -x for an exact name, -u for a user,
+and the answer is pgrep's exit code."
+  (let ((m (monk-test-machine)) (calls nil) (found t))
+    (cl-letf (((symbol-function 'monk-exec)
+               (lambda (_m program &rest args)
+                 (push (cons program (seq-take-while #'stringp args)) calls)
+                 (monk-exec-create :exit-code (if found 0 1) :output ""))))
+      (should (monk-process-running-p m "/Applications/X.app/"))
+      (should (equal '("pgrep" "-f" "--" "/Applications/X.app/") (car calls)))
+      (should (monk-process-running-p m "sshd" :exact t :user "root"))
+      (should (equal '("pgrep" "-x" "-u" "root" "--" "sshd") (car calls)))
+      (setq found nil)
+      (should-not (monk-process-running-p m "nothing")))))
+
+(ert-deftest monk-test-app-check-and-repair ()
+  "An app is running when a process runs from inside its bundle; repair
+opens it in the background or quits it through osascript; a missing
+bundle is a skip, not a failure."
+  (monk-test-with-tmpdir dir
+    (let* ((darwin (monk-test-machine `((kernel . "Darwin") (os-family . "Darwin") (home . ,dir))))
+           (monk-app-directory (concat dir "Applications/"))
+           (bundle (concat monk-app-directory "Thing.app"))
+           (running nil) (calls nil)
+           (r (monk-app-resource :name "Thing"))
+           (stop (monk-app-resource :name "Thing" :state 'stopped)))
+      (cl-letf (((symbol-function 'monk-exec)
+                 (lambda (_m program &rest args)
+                   (push (cons program (seq-take-while #'stringp args)) calls)
+                   (pcase program
+                     ("pgrep" (monk-exec-create :exit-code (if running 0 1) :output ""))
+                     ("open" (setq running t) (monk-exec-create :exit-code 0 :output ""))
+                     ("osascript" (setq running nil) (monk-exec-create :exit-code 0 :output ""))
+                     (_ (monk-exec-create :exit-code 0 :output ""))))))
+        ;; not installed: skipped with the reason, no pgrep run
+        (should (string-match-p "not installed" (monk-resource-skip-reason r darwin)))
+        (should-not (member "pgrep" (mapcar #'car calls)))
+        (make-directory bundle t)
+        (should-not (monk-resource-skip-reason r darwin))
+        ;; the pattern anchors on the bundle path, so a same-named
+        ;; binary elsewhere does not count
+        (should (equal (list :open bundle) (monk-check r darwin)))
+        (should (equal (list "pgrep" "-f" "--" (concat "^" (regexp-quote bundle) "/"))
+                       (car calls)))
+        (should (equal (format "opened %s" bundle) (monk-repair r darwin (monk-check r darwin))))
+        (should (equal (list "open" "-g" bundle) (car calls)))
+        (should-not (monk-check r darwin))
+        ;; stopped: quit through osascript, by app name
+        (should (equal '(:quit "Thing") (monk-check stop darwin)))
+        (should (equal "quit Thing" (monk-repair stop darwin (monk-check stop darwin))))
+        (should (equal '("osascript" "-e" "quit app \"Thing\"") (car calls)))
+        (should-not (monk-check stop darwin))
+        ;; foreground open drops -g
+        (let ((fg (monk-app-resource :name "Thing" :background nil)))
+          (monk-repair fg darwin (list :open bundle))
+          (should (equal (list "open" bundle) (car calls))))
+        ;; a bad state is a resource error, not a silent kept
+        (should-error (monk-check (monk-app-resource :name "Thing" :state 'paused) darwin)
+                      :type 'monk-resource-error)))))
+
+(ert-deftest monk-test-app-is-darwin-only ()
+  "On Linux the app resource is skipped by class; pgrep never runs."
+  (let* ((linux (monk-test-machine))
+         (monk-log-level nil)
+         (calls nil))
+    (cl-letf (((symbol-function 'monk-exec)
+               (lambda (_m program &rest _) (push program calls)
+                 (monk-exec-create :exit-code 0 :output ""))))
+      (let ((run (monk-converge linux (lambda (_m) (monk-app "X")))))
+        (should (= 1 (monk-run-count run 'skipped)))
+        (should-not (member "pgrep" calls))))))
+
 (ert-deftest monk-test-agent-launchd-job ()
   (require 'monk-agent)
   (let* ((monk-agent-emacs "/opt/homebrew/bin/emacs")
