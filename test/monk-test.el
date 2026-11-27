@@ -894,8 +894,9 @@ limits, 1 for a class that does not run in parallel or a sudo resource;
 (ert-deftest monk-test-pool-runs-jobs-in-threads ()
   "With threads, `monk-pool-run' overlaps jobs that wait on processes, keeps
 their order, hands errors back as values, and honors the limit."
-  (skip-unless (monk-parallel-threads-p))
-  (let* ((m (monk-local-machine))
+  (skip-unless (and (featurep 'threads) (fboundp 'make-thread)))
+  (let* ((monk-parallel-threads t)
+         (m (monk-local-machine))
          (job (lambda (tag) (lambda () (monk-exec m "sh" "-c" (format "sleep 0.5; echo %s" tag)) tag)))
          (t0 (float-time))
          (values (monk-pool-run (mapcar job '("a" "b" "c" "d")) 4))
@@ -919,7 +920,7 @@ their order, hands errors back as values, and honors the limit."
   "A policy of independent slow commands converges to the same results with
 threads and without, and the threaded run is faster.  Events arrive once
 per node, in policy order, on the main thread."
-  (skip-unless (monk-parallel-threads-p))
+  (skip-unless (and (featurep 'threads) (fboundp 'make-thread)))
   (monk-test-with-tmpdir dir
     (let* ((names '("p" "q" "r" "s"))
            (policy (lambda (_m)
@@ -1563,6 +1564,274 @@ answers, consumed in order.  The log is stored in the symbol property
                                           (list "trust" '(1 "Error: Unknown command: trust"))))))
       (should (equal "tapped" (monk-repair r m '(:tap "a/b")))))))
 
+;;;; Package managers: one protocol, eight subclasses
+
+(defun monk-test-fake-package-manager (answers)
+  "Return a fake `monk-exec' that answers from ANSWERS and logs every call.
+ANSWERS is an alist of (WORDS . OUTPUT): a call whose leading words
+\(program and arguments, keywords dropped) start with WORDS gets
+OUTPUT with exit 0; the longest match wins; an unknown call gets exit
+0 and no output.  The log is the symbol property `calls' of
+`monk-test-fake-package-manager', newest first, each entry the words
+followed by the :sudo value when it was given."
+  (put 'monk-test-fake-package-manager 'calls nil)
+  (lambda (_m program &rest args)
+    (let* ((sudo (plist-get (seq-drop-while (lambda (a) (not (keywordp a))) args) :sudo))
+           (words (cons program (seq-take-while (lambda (a) (not (keywordp a))) args)))
+           (hit (car (seq-sort-by (lambda (a) (length (car a))) #'>
+                                  (seq-filter (lambda (a) (equal (car a) (seq-take words (length (car a)))))
+                                              answers)))))
+      (push (if sudo (append words (list :sudo t)) words)
+            (get 'monk-test-fake-package-manager 'calls))
+      (monk-exec-create :command words :exit-code 0 :output (or (cdr hit) "")))))
+
+(defun monk-test-package-calls ()
+  "Return the fake package manager's calls, oldest first."
+  (reverse (get 'monk-test-fake-package-manager 'calls)))
+
+(defconst monk-test-package-managers
+  ;; CLASS, ANSWERS: installed a and c (c outdated), b missing, a held;
+  ;; then the expected words of install, upgrade, remove, hold, unhold
+  `((monk-apt-resource
+     ((("dpkg-query") . "a installed\nc installed\nz not-installed\n")
+      (("apt-get" "-s" "upgrade") . "Reading...\nInst c [1.0] (2.0 Debian:stable)\nConf c\n")
+      (("apt-mark" "showhold") . "a\n"))
+     ("apt-get" "install" "-y" "-q" "b") ("apt-get" "install" "--only-upgrade" "-y" "-q" "c")
+     ("apt-get" "remove" "-y" "-q" "a") ("apt-mark" "hold" "c") ("apt-mark" "unhold" "a"))
+    (monk-dnf-resource
+     ((("dnf" "repoquery") . "a\nc\n")
+      (("dnf" "check-update") . "\nc.x86_64   2.0-1.fc40   updates\nObsoleting Packages\n")
+      (("dnf" "versionlock" "list") . "a-0:1.0-1.fc40.*\n"))
+     ("dnf" "install" "-y" "-q" "b") ("dnf" "upgrade" "-y" "-q" "c")
+     ("dnf" "remove" "-y" "-q" "a") ("dnf" "versionlock" "add" "c") ("dnf" "versionlock" "delete" "a"))
+    (monk-yum-resource
+     ((("yum" "list" "installed") . "Installed Packages\na.x86_64  1.0  @base\nc.noarch  1.0  @base\n")
+      (("yum" "check-update") . "\nc.noarch  2.0  updates\n"))
+     ("yum" "install" "-y" "-q" "b") ("yum" "update" "-y" "-q" "c") ("yum" "remove" "-y" "-q" "a") nil nil)
+    (monk-pacman-resource
+     ((("pacman" "-Qq") . "a\nc\n") (("pacman" "-Qu") . "c 1.0 -> 2.0\n"))
+     ("pacman" "-S" "--noconfirm" "--needed" "b") ("pacman" "-S" "--noconfirm" "c")
+     ("pacman" "-R" "--noconfirm" "a") nil nil)
+    (monk-zypper-resource
+     ((("zypper" "--quiet" "search") . "S | Name | Summary | Type\n--+------+---------+--------\ni | a    | A       | package\ni | c    | C       | package\n")
+      (("zypper" "--quiet" "list-updates") . "S | Repository | Name | Current | Available | Arch\n--+------------+------+---------+-----------+-------\nv | main       | c    | 1.0     | 2.0       | x86_64\n")
+      (("zypper" "--quiet" "locks") . "# | Name | Type    | Repository\n--+------+---------+-----------\n1 | a    | package | (any)\n"))
+     ("zypper" "--non-interactive" "install" "b") ("zypper" "--non-interactive" "update" "c")
+     ("zypper" "--non-interactive" "remove" "a") ("zypper" "--non-interactive" "addlock" "c")
+     ("zypper" "--non-interactive" "removelock" "a"))
+    (monk-apk-resource
+     ((("apk" "info") . "a\nc\n") (("apk" "version" "-l" "<") . "Installed:   Available:\nc-1.0-r0  < 2.0-r0\n"))
+     ("apk" "add" "-q" "b") ("apk" "upgrade" "-q" "c") ("apk" "del" "-q" "a") nil nil)
+    (monk-pkg-resource
+     ((("pkg" "query") . "a\nc\n") (("pkg" "version" "-l" "<") . "c-1.0_2  <\n")
+      (("pkg" "query" "-e") . "a\n"))
+     ("pkg" "install" "-y" "-q" "b") ("pkg" "upgrade" "-y" "-q" "c") ("pkg" "delete" "-y" "-q" "a")
+     ("pkg" "lock" "-y" "c") ("pkg" "unlock" "-y" "a")))
+  "Per manager: the class, fake answers, and the five expected command lines.")
+
+(ert-deftest monk-test-package-managers-check-and-repair ()
+  "Every manager answers the protocol: installed, outdated, and held names
+from its own output; present, latest, absent, and hold through its own
+verbs; the commands run with sudo and the installed cache clears."
+  (let ((m (monk-test-machine)))
+    (pcase-dolist (`(,class ,answers ,install ,upgrade ,remove ,hold ,unhold) monk-test-package-managers)
+      (ert-info ((format "%s" class))
+        (cl-letf (((symbol-function 'monk-exec) (monk-test-fake-package-manager answers)))
+          ;; present: b is missing, the rest is there
+          (let ((r (funcall class :name "set" :packages '("a" "b" "c"))))
+            (should (equal '(:install ("b")) (seq-take (monk-check r m) 2)))
+            (should (< (abs (- (/ 2.0 3) (plist-get (monk-check r m) :degree))) 1e-9))
+            (should (equal "installed b" (monk-repair r m (monk-check r m))))
+            (should (equal (append install '(:sudo t)) (car (last (monk-test-package-calls))))))
+          ;; latest: c has an update
+          (let* ((r (funcall class :name "set" :packages '("a" "c") :state 'latest))
+                 (changes (monk-check r m)))
+            (should (equal '("c") (plist-get changes :upgrade)))
+            (should-not (plist-get changes :install))
+            (should (equal "upgraded c" (monk-repair r m changes)))
+            (should (equal (append upgrade '(:sudo t)) (car (last (monk-test-package-calls))))))
+          ;; absent: a is there, b is not
+          (let* ((r (funcall class :name "set" :packages '("a" "b") :state 'absent))
+                 (changes (monk-check r m)))
+            (should (equal '("a") (plist-get changes :remove)))
+            (should (equal "removed a" (monk-repair r m changes)))
+            (should (equal (append remove '(:sudo t)) (car (last (monk-test-package-calls))))))
+          ;; hold: a is held, c is not
+          (let ((r (funcall class :name "set" :packages '("a" "c") :hold t))
+                (monk-log-level nil))
+            (if (null hold)
+                ;; no holds in this manager: nothing to do and no error
+                (should-not (monk-check r m))
+              (should (equal '("c") (plist-get (monk-check r m) :hold)))
+              (should (equal "held c" (monk-repair r m (monk-check r m))))
+              (should (equal (append hold '(:sudo t)) (car (last (monk-test-package-calls)))))))
+          (when unhold
+            (let ((r (funcall class :name "set" :packages '("a" "c") :hold 'release)))
+              (should (equal '("a") (plist-get (monk-check r m) :unhold)))
+              (should (equal "released a" (monk-repair r m (monk-check r m))))
+              (should (equal (append unhold '(:sudo t)) (car (last (monk-test-package-calls)))))))
+          ;; nothing wrong: no changes
+          (should-not (monk-check (funcall class :name "set" :packages '("a" "c")) m)))))))
+
+(ert-deftest monk-test-package-installed-names-cached-per-run-and-cleared-by-repair ()
+  "The installed list is read once per run per manager class; a repair
+forgets it so the next pass asks again."
+  (let ((m (monk-test-machine))
+        (monk-log-level nil)
+        (monk-apt-update nil))
+    (cl-letf (((symbol-function 'monk-exec)
+               (monk-test-fake-package-manager '((("dpkg-query") . "a installed\n")))))
+      (let ((run (monk-converge m (lambda (_m)
+                                    (monk-apt "one" '("a") :classes nil)
+                                    (monk-apt "two" '("a") :classes nil :require '("one"))
+                                    (monk-dnf "three" '("a") :classes nil :require '("two")))
+                               :passes 1)))
+        (should (eq 'kept (monk-test-status run "one")))
+        (should (eq 'kept (monk-test-status run "two")))
+        ;; one dpkg-query for both apt sets; dnf reads its own list once
+        ;; and installs, since the fake answers nothing for repoquery
+        (should (= 1 (seq-count (lambda (c) (equal "dpkg-query" (car c))) (monk-test-package-calls))))
+        (should (equal '(("dnf" "repoquery" "--installed" "--qf" "%{name}")
+                         ("dnf" "install" "-y" "-q" "a" :sudo t))
+                       (seq-filter (lambda (c) (equal "dnf" (car c))) (monk-test-package-calls))))
+        (should (eq 'repaired (monk-test-status run "three")))))
+    ;; a repair clears the cache: the second pass reads again
+    (cl-letf (((symbol-function 'monk-exec)
+               (monk-test-fake-package-manager '((("dpkg-query") . "a installed\n")))))
+      (monk-converge m (lambda (_m) (monk-apt "one" '("a" "b") :classes nil)) :passes 2)
+      (should (= 2 (seq-count (lambda (c) (equal "dpkg-query" (car c))) (monk-test-package-calls)))))))
+
+(ert-deftest monk-test-package-unsupported-state-and-unknown-operation ()
+  "A manager that cannot do an operation fails the resource with a reason
+instead of running something else; an unknown state is an error."
+  (let ((m (monk-test-machine)))
+    (cl-letf (((symbol-function 'monk-exec)
+               (monk-test-fake-package-manager '((("pacman" "-Qq") . "a\n")))))
+      (let ((err (should-error (monk-repair (monk-pacman-resource :name "p" :packages '("a") :hold t)
+                                            m '(:hold ("a")))
+                               :type 'monk-resource-error)))
+        (should (string-match-p "cannot hold" (cadr err))))
+      (should-error (monk-check (monk-pacman-resource :name "p" :packages '("a") :state 'newest) m)
+                    :type 'monk-resource-error))))
+
+(ert-deftest monk-test-brew-state-latest-absent-and-pin ()
+  "Brew answers the shared protocol: outdated through `brew outdated',
+holds through pin and unpin, casks through --cask, and removal through
+uninstall; a cask set cannot be pinned."
+  (let ((m (monk-test-machine))
+        (answers `((("brew" "info" "--json=v2" "--installed")
+                    . ,(monk-test-brew-info-json '(("jq" "jq" ()) ("ripgrep" "ripgrep" ("rg"))) '(("swiftbar" "swiftbar" ()))))
+                   (("brew" "outdated" "--quiet" "--formula") . "jq\n")
+                   (("brew" "outdated" "--quiet" "--cask") . "swiftbar\n")
+                   (("brew" "list" "--pinned") . "ripgrep\n"))))
+    (cl-letf (((symbol-function 'monk-exec) (monk-test-fake-package-manager answers)))
+      (let ((r (monk-brew-resource :name "b" :packages '("jq" "rg" "fd") :state 'latest :hold t)))
+        (let ((changes (monk-check r m)))
+          (should (equal '("fd") (plist-get changes :install)))
+          (should (equal '("jq") (plist-get changes :upgrade)))
+          ;; rg is installed as ripgrep and pinned under that name: brew
+          ;; pin lists the formula name, so the alias reads as not held
+          (should (equal '("jq" "rg") (plist-get changes :hold)))
+          (should (equal "installed fd; upgraded jq; held jq rg" (monk-repair r m changes)))
+          (should (equal '(("brew" "install" "fd") ("brew" "upgrade" "jq") ("brew" "pin" "jq" "rg"))
+                         (last (monk-test-package-calls) 3)))))
+      (let ((c (monk-brew-resource :name "c" :packages '("swiftbar") :cask t :state 'latest)))
+        (should (equal '("swiftbar") (plist-get (monk-check c m) :upgrade)))
+        (monk-repair c m (monk-check c m))
+        (should (equal '("brew" "upgrade" "--cask" "swiftbar") (car (last (monk-test-package-calls))))))
+      (let ((a (monk-brew-resource :name "a" :packages '("jq" "nothere") :state 'absent)))
+        (should (equal '("jq") (plist-get (monk-check a m) :remove)))
+        (should (equal "removed jq" (monk-repair a m (monk-check a m))))
+        (should (equal '("brew" "uninstall" "jq") (car (last (monk-test-package-calls))))))
+      (should-error (monk-repair (monk-brew-resource :name "c" :packages '("swiftbar") :cask t :hold t)
+                                 m '(:hold ("swiftbar")))
+                    :type 'monk-resource-error))))
+
+(ert-deftest monk-test-package-aggregates-by-class-state-and-hold ()
+  "Package sets merge when class, state, and hold agree, and the merged
+repair splits back per member; different states stay apart."
+  (let ((m (monk-test-machine))
+        (monk-log-level nil)
+        (monk-apt-update nil))
+    (cl-letf (((symbol-function 'monk-exec)
+               (monk-test-fake-package-manager '((("dpkg-query") . "a installed\nx installed\n")
+                                                 (("apt-mark" "showhold") . "")))))
+      (let ((run (monk-converge m (lambda (_m)
+                                    (monk-apt "one" '("a" "b") :classes nil)
+                                    (monk-apt "two" '("c") :classes nil)
+                                    (monk-apt "gone" '("x") :classes nil :state 'absent)
+                                    (monk-apt "held" '("a") :classes nil :hold t))
+                               :passes 1))
+            (installs (seq-filter (lambda (c) (member "install" c)) (monk-test-package-calls))))
+        ;; one install for one+two; gone and held are their own commands
+        (should (= 1 (length installs)))
+        (should (equal '("b" "c") (sort (seq-filter (lambda (w) (member w '("a" "b" "c"))) (car installs)) #'string<)))
+        (should (equal '(:install ("b") :degree 0.5) (monk-result-changes (monk-test-result run "one"))))
+        (should (equal '(:install ("c") :degree 0.0) (monk-result-changes (monk-test-result run "two"))))
+        (should (string-match-p "aggregated with 1 other" (monk-result-comment (monk-test-result run "two"))))
+        (should (eq 'repaired (monk-test-status run "gone")))
+        (should (equal '("apt-get" "remove" "-y" "-q" "x" :sudo t)
+                       (seq-find (lambda (c) (member "remove" c)) (monk-test-package-calls))))
+        (should (eq 'repaired (monk-test-status run "held")))
+        (should (equal '("apt-mark" "hold" "a" :sudo t)
+                       (seq-find (lambda (c) (member "hold" c)) (monk-test-package-calls))))))))
+
+(ert-deftest monk-test-package-names-for-and-dispatch ()
+  "`monk-package' picks the subclass from pkg-mgr and spells each name as
+that manager does; `:MANAGER nil' drops the package there, and a set with
+no names left or no manager is an unsupported placeholder."
+  (let* ((specs '("jq" ("ripgrep" :brew "rg" :apt "ripgrep") ("fd" :apt "fd-find" :pacman nil) ("mas" :apt nil :dnf nil)))
+         (policy (lambda (_m) (monk-package "tools" specs :cask nil)))
+         (compile-with (lambda (manager)
+                         (monk-compile (monk-test-machine (append (list (cons 'pkg-mgr manager)) monk-test-fake-facts))
+                                       policy))))
+    (should (equal '("jq" "rg" "fd" "mas") (monk-package-names-for specs "homebrew")))
+    (should (equal '("jq" "ripgrep" "fd-find") (monk-package-names-for specs "apt")))
+    (should (equal '("jq" "ripgrep" "mas") (monk-package-names-for specs "pacman")))
+    (should (equal '("jq" "ripgrep" "fd" "mas") (monk-package-names-for specs "zypper")))
+    (should-error (monk-package-names-for '((42)) "apt") :type 'monk-argument-error)
+    (pcase-dolist (`(,manager ,class ,names)
+                   '(("homebrew" monk-brew-resource ("jq" "rg" "fd" "mas"))
+                     ("apt" monk-apt-resource ("jq" "ripgrep" "fd-find"))
+                     ("dnf" monk-dnf-resource ("jq" "ripgrep" "fd"))
+                     ("yum" monk-yum-resource ("jq" "ripgrep" "fd" "mas"))
+                     ("pacman" monk-pacman-resource ("jq" "ripgrep" "mas"))
+                     ("zypper" monk-zypper-resource ("jq" "ripgrep" "fd" "mas"))
+                     ("apk" monk-apk-resource ("jq" "ripgrep" "fd" "mas"))
+                     ("pkg" monk-pkg-resource ("jq" "ripgrep" "fd" "mas"))))
+      (let ((r (car (funcall compile-with manager))))
+        (should (eq class (eieio-object-class-name r)))
+        (should (equal names (oref r packages)))
+        (should (eq 'present (oref r state)))))
+    ;; no manager, or nothing named for it
+    (let ((r (car (funcall compile-with nil))))
+      (should (eq 'monk-unsupported-resource (eieio-object-class-name r)))
+      (should (string-match-p "no supported package manager" (oref r reason))))
+    (let ((r (car (monk-compile (monk-test-machine (append '((pkg-mgr . "apt")) monk-test-fake-facts))
+                                (lambda (_m) (monk-package "mac-only" '(("mas" :apt nil))))))))
+      (should (eq 'monk-unsupported-resource (eieio-object-class-name r)))
+      (should (string-match-p "none of the packages are named for apt" (oref r reason))))
+    ;; state, hold, and cask reach the subclass; cask only brew
+    (let ((mac (car (monk-compile (monk-test-machine (append '((pkg-mgr . "homebrew")) monk-test-fake-facts))
+                                  (lambda (_m) (monk-package "p" '("x") :state 'latest :hold t :cask t)))))
+          (deb (car (monk-compile (monk-test-machine (append '((pkg-mgr . "apt")) monk-test-fake-facts))
+                                  (lambda (_m) (monk-package "p" '("x") :state 'latest :hold t :cask t))))))
+      (should (eq t (oref mac cask)))
+      (should (eq 'latest (oref mac state)))
+      (should (eq t (oref deb hold)))
+      (should (eq 'latest (oref deb state))))))
+
+(ert-deftest monk-test-package-resources-run-one-at-a-time ()
+  "Every package manager class is held to one resource at a time on a
+machine, whatever `monk-parallel-class-limits' lists by type name."
+  (let ((m (monk-test-machine))
+        (monk-parallel-class-limits nil)
+        (monk-parallel-jobs 8))
+    (dolist (class '(monk-brew-resource monk-apt-resource monk-dnf-resource monk-yum-resource
+                     monk-pacman-resource monk-zypper-resource monk-apk-resource monk-pkg-resource))
+      (should (= 1 (monk-parallel-limit (funcall class :name "p" :packages '("a")) m))))
+    (should (= 8 (monk-parallel-limit (monk-directory-resource :name "/tmp/x") m)))))
+
 ;;;; Inventory
 
 (defconst monk-test-inventory
@@ -1940,8 +2209,10 @@ behaviour."
                 ((symbol-function 'monk-run-report) (lambda (run &rest _) (push run reports) run)))
         ;; abort: exit 3
         (let ((monk-agent-unknown-host 'abort) (exited nil))
-          (cl-letf (((symbol-function 'kill-emacs) (lambda (&optional code) (setq exited code) (signal 'quit nil))))
-            (should-error (monk-agent--settle-unknown-host (monk-local-machine)) :type 'quit)
+          ;; `should-error' catches `error' conditions only, so the stub
+          ;; must not signal `quit': ERT would record the test as QUIT
+          (cl-letf (((symbol-function 'kill-emacs) (lambda (&optional code) (setq exited code) (error "kill-emacs %s" code))))
+            (should-error (monk-agent--settle-unknown-host (monk-local-machine)))
             (should (= 3 exited))))
         ;; run: the bare machine, nothing enrolled
         (let ((monk-agent-unknown-host 'run))

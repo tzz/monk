@@ -5,7 +5,7 @@
 ;; Author: Teodor Zlatanov <tzz@lifelogs.com>
 ;; Keywords: tools, unix, files, processes, comm
 ;; Package-Requires: ((emacs "29.1"))
-;; Version: 0.12.0
+;; Version: 0.13.0
 ;; URL: https://github.com/tzz/monk
 
 ;; Licensed under the Apache License, Version 2.0 (the "License");
@@ -82,12 +82,12 @@
 
 ;;;; Version
 
-(defconst monk-version "0.12.0"
+(defconst monk-version "0.13.0"
   "Monk's version.  Patch for small work, minor for a large ask.
 When the drive report shows a number older than what you were told,
 the Emacs runs old code.")
 
-(defconst monk-build "2026-11-26.2"
+(defconst monk-build "2026-11-27.1"
   "The build tag: the date of the last change and a counter.
 Finer than `monk-version' so a report can tell two edits on one day
 apart.  Bumped with every change that reaches a hand-over.")
@@ -1104,12 +1104,19 @@ variable lower the count for a class or a host.  1 is serial, the
 old behaviour."
   :type 'natnum)
 
-(defcustom monk-parallel-threads t
+(defcustom monk-parallel-threads nil
   "When non-nil, run a wave's resources in Lisp threads where Emacs has them.
-Nil keeps every resource on the main thread; classes that prepare
-their commands (git) still overlap through `monk-exec-batch', the
-rest run one after another.  Turn it off to rule threads out when
-something misbehaves; the results are the same either way."
+Nil, the default, keeps every resource on the main thread; classes
+that prepare their commands (git) still overlap through
+`monk-exec-batch', the rest run one after another.
+
+Threads are off because Emacs (through 32.0.50) can abort when two
+threads wait on subprocesses at once: the thread that leaves a wait
+reaps every exited process, including another thread's, and closes
+its pipe while that thread is still inside `select' on it.  `select'
+then fails with EBADF and Emacs calls `emacs_abort'.  A Monk agent
+died that way on 2026-11-26.  Turn this on only to experiment; the
+results are the same either way."
   :type 'boolean)
 
 (defun monk-parallel-threads-p ()
@@ -1134,12 +1141,14 @@ a time whatever the policy and the global setting say.")
 
 (defun monk-parallel-limit (resource machine)
   "Return how many resources like RESOURCE may run at once on MACHINE.
-The lowest of `monk-parallel-jobs', the class limit, and the
-machine's `parallel' variable; 1 when the class does not run in
-parallel at all (`monk-resource-parallel-p')."
+The lowest of `monk-parallel-jobs', the class limit (the class's own
+`monk-resource-class-limit', else `monk-parallel-class-limits' by type
+name), and the machine's `parallel' variable; 1 when the class does
+not run in parallel at all (`monk-resource-parallel-p')."
   (if (not (monk-resource-parallel-p resource))
       1
-    (let* ((class (cdr (assoc (monk-resource-type resource) monk-parallel-class-limits)))
+    (let* ((class (or (monk-resource-class-limit resource)
+                      (cdr (assoc (monk-resource-type resource) monk-parallel-class-limits))))
            (host (monk-machine-var machine monk-parallel-machine-var))
            (limits (delq nil (list monk-parallel-jobs
                                    (and (natnump class) class)
@@ -1715,6 +1724,16 @@ file written inside it cannot change.  Treating it as a subtree made
 every scratch file under ~/.ssh a drift event (2026-10-01).")
 
 (cl-defmethod monk-resource-owns-subtree-p ((_r monk-resource))
+  nil)
+
+(cl-defgeneric monk-resource-class-limit (resource)
+  "Return the number of resources like RESOURCE that may run at once, or nil.
+Nil defers to `monk-parallel-class-limits' and `monk-parallel-jobs'.
+A class whose members share one lock whatever their type name
+(every package manager) answers 1 here, so a user's alist need not
+list each one.")
+
+(cl-defmethod monk-resource-class-limit ((_r monk-resource))
   nil)
 
 (cl-defgeneric monk-resource-parallel-p (resource)
@@ -3090,7 +3109,10 @@ a run is safe to overlap.  A run of one stays a plain node."
 A group is consecutive ready nodes on one machine whose resources
 `monk-resource-aggregate' merges and that have no requisite between
 them.  `monk-schedule' already put dependents after dependencies, so
-consecutive same-class nodes with no refs among them are safe."
+consecutive same-class nodes with no refs among them are safe.  The
+run stops at the first node the leader does not merge with (a brew
+cask after formulae, an absent set after present ones), so a mixed
+run still folds its head instead of nothing."
   (let (out (i 0) (n (length nodes)))
     (while (< i n)
       (let* ((node (nth i nodes))
@@ -3105,7 +3127,8 @@ consecutive same-class nodes with no refs among them are safe."
                            (eq (eieio-object-class-name ro) (eieio-object-class-name r))
                            (monk-node-selected other)
                            (monk-node-selected node)
-                           (not (monk--refs-among-p (cons other group))))))
+                           (not (monk--refs-among-p (cons other group)))
+                           (monk-resource-aggregate r (list ro) m))))
           (push (nth j nodes) group)
           (cl-incf j))
         (setq group (nreverse group))
