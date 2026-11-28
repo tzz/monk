@@ -117,6 +117,18 @@ dependencies ahead of dependents."
                   (symbol-file feature 'provide))))
     (and file (file-name-sans-extension file))))
 
+(defun monk-reload--source-file (feature)
+  "The .el source of FEATURE, or nil.
+`load' of a bare name prefers a byte- or native-compiled copy when one
+looks newer; with native compilation the old source's .eln in the cache
+won that race after a `git pull', so a reload ran the old code and
+reported the old version (nngmail, 2026-11-27).  Naming the .el leaves
+no choice."
+  (when-let* ((base (monk-reload--library-file feature))
+              (el (concat base ".el"))
+              ((file-exists-p el)))
+    el))
+
 (defun monk-reload-keymap-variables ()
   "Return the bound `monk-...-map' variables that hold keymaps."
   (let (out)
@@ -214,10 +226,10 @@ active watch is stopped and started again on the new code.  See the
 Commentary for what survives a reload and what needs a restart."
   (interactive "P")
   (if (and (not monk-reload--self-reloaded)
-           (monk-reload--library-file 'monk-reload))
+           (monk-reload--source-file 'monk-reload))
       (let ((monk-reload--self-reloaded t)
             (load-prefer-newer t))
-        (load (monk-reload--library-file 'monk-reload) nil t)
+        (load (monk-reload--source-file 'monk-reload) nil t)
         (funcall 'monk-reload verbose))
     (monk-reload--run verbose)))
 
@@ -245,9 +257,10 @@ With VERBOSE, list each file as it loads."
       (makunbound sym))
     (monk-reload--forget-after-load-forms)
     (dolist (feature (monk-reload-features))
-      (let ((file (monk-reload--library-file feature)))
+      ;; the .el by name: a bare name could hand `load' a stale .eln
+      (let ((file (monk-reload--source-file feature)))
         (if (null file)
-            (push (cons feature "no file found") failed)
+            (push (cons feature "no .el found") failed)
           (condition-case err
               (progn
                 (load file nil (not verbose))
